@@ -1,0 +1,28 @@
+syntax = "proto3";
+
+// The config of the Redis Stream runtime. It keeps the package of the runtime protos of
+// `temporalio-streams`, so the message keeps its full name. Field numbers are part of the contract
+// with every SDK, and the memory runtime's config shares the numbers of the fields both have.
+package temporal.sdk.streams.v1;
+
+import "google/protobuf/duration.proto";
+
+// The settings of the Redis Stream runtime. Lang builds it from the backend options.
+message RedisStreamConfig {
+    // One URL, or the seed URLs of a cluster. Credentials and TLS come from the URL.
+    repeated string urls = 1;
+    bool cluster = 2;
+    // Empty is `temporal-streams`.
+    string key_prefix = 3;
+    // The default Retention of a new Stream. Empty is 7 days.
+    google.protobuf.Duration retention = 4;
+    // How long an open Workflow-owned Stream stays after its last write. Empty is 90 days.
+    google.protobuf.Duration safety_ttl = 5;
+    // Zero is 256.
+    int32 blocking_reads_per_node = 8;
+    // Empty is 5 s.
+    google.protobuf.Duration response_timeout = 9;
+    // The backend name that lang registered this runtime under. The crate sets it on each
+    // StreamRef that it builds, such as the one in a create response.
+    string backend = 10;
+}
