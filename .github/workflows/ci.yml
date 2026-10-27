@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: fmt and clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.0
+        with:
+          components: clippy, rustfmt
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: Swatinem/rust-cache@v2
+      - run: scripts/patch-sdk-rust.sh
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --tests -- -D warnings
+      - run: >-
+          cargo clippy --workspace --no-default-features --features tls-aws-lc --tests
+          -- -D warnings
+
+  test:
+    name: unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: Swatinem/rust-cache@v2
+      - run: scripts/patch-sdk-rust.sh
+      - run: cargo test --workspace
+
+  fips:
+    name: FIPS build takes no ring
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: Swatinem/rust-cache@v2
+      - run: scripts/patch-sdk-rust.sh
+      - run: cargo build --workspace --no-default-features --features fips
+      # Normal and build edges only, since the tests' own dependencies may depend on `ring`.
+      - run: |
+          tree=$(cargo tree -e normal,build --no-default-features --features fips \
+            -i ring --target all 2>/dev/null || true)
+          if [ -n "$tree" ]; then echo "$tree"; exit 1; fi
+
+  redis:
+    name: Redis Store tests (standalone and cluster)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: Swatinem/rust-cache@v2
+      - run: scripts/patch-sdk-rust.sh
+      - name: Install Redis from the Redis apt repo
+        run: |
+          curl -fsSL https://packages.redis.io/gpg \
+            | sudo gpg --dearmor -o /usr/share/keyrings/redis-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/redis-archive-keyring.gpg]" \
+            "https://packages.redis.io/deb $(lsb_release -cs) main" \
+            | sudo tee /etc/apt/sources.list.d/redis.list
+          sudo apt-get update && sudo apt-get install -y redis
+      - run: crates/streams-redis/scripts/redis-test-servers.sh >> "$GITHUB_ENV"
+      - run: cargo test -p temporalio-streams-redis -- --test-threads=8
+        env:
+          STREAMS_REQUIRE: redis
+
+  redis-7-0:
+    name: Redis 7.0 Store tests (standalone)
+    runs-on: ubuntu-latest
+    # The oldest Redis that `connect` accepts.
+    services:
+      redis:
+        image: redis:7.0
+        ports:
+          - 6379:6379
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: Swatinem/rust-cache@v2
+      - run: scripts/patch-sdk-rust.sh
+      - run: cargo test -p temporalio-streams-redis -- --test-threads=8
+        env:
+          STREAMS_REDIS_URL: redis://localhost:6379/0
