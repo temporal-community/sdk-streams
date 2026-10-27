@@ -13,8 +13,5 @@ async fn the_redis_store_says_what_it_can_do() {
     let redis = RedisStore::connect(RedisStoreOptions::new(url))
         .await
         .unwrap();
-    assert_eq!(
-        Store::capabilities(&redis),
-        Capabilities::ALL.without(Capabilities::RUN_FENCE)
-    );
+    assert_eq!(Store::capabilities(&redis), Capabilities::ALL);
 }
