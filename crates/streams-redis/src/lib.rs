@@ -7,6 +7,7 @@
 //! bridge builds the runtime with [RedisStreamRuntime] and calls it as `temporalio-streams`
 //! describes.
 
+mod error;
 mod protos;
 mod redis;
 mod runtime;
@@ -15,6 +16,7 @@ mod server {
     include!("../tests/support/server.rs");
 }
 
+pub use error::{RedisStoreError, RedisStoreResult};
 pub use redis::{RedisStore, RedisStoreOptions};
 pub use runtime::{REDIS_RUNTIME_NAME, RedisStreamRuntime, RuntimeOptions};
 

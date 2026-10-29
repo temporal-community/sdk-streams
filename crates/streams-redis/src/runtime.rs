@@ -1,10 +1,12 @@
 //! The Stream runtime on Redis.
 
-use crate::{RedisStore, RedisStoreOptions, proto::RedisStreamConfig};
+use crate::{
+    RedisStore, RedisStoreError, RedisStoreOptions, RedisStoreResult, proto::RedisStreamConfig,
+};
 use prost::Message;
 use std::{sync::Arc, time::Duration};
 use temporalio_common::telemetry::metrics::TemporalMeter;
-use temporalio_streams::{StoreFactory, StreamError, StreamResult, StreamRuntime, store::Store};
+use temporalio_streams::{StoreFactory, StreamResult, StreamRuntime, store::Store};
 
 /// The name of the Redis runtime, for logs and for a bridge that selects a runtime by name.
 pub const REDIS_RUNTIME_NAME: &str = "temporalio-streams-redis";
@@ -20,9 +22,11 @@ pub struct RuntimeOptions {
 
 impl RuntimeOptions {
     /// The options from the backend's config message.
-    pub fn from_config(config: RedisStreamConfig) -> StreamResult<Self> {
+    pub fn from_config(config: RedisStreamConfig) -> RedisStoreResult<Self> {
         let Some(seed) = config.urls.first() else {
-            return Err(StreamError::invalid("The Redis Stream backend needs a URL"));
+            return Err(RedisStoreError::invalid(
+                "The Redis Stream backend needs a URL",
+            ));
         };
         let mut store = RedisStoreOptions::new(seed.clone());
         store.urls = config.urls;
@@ -93,9 +97,9 @@ impl RedisStreamRuntime {
     pub fn from_config_bytes(
         config: &[u8],
         meter: Option<TemporalMeter>,
-    ) -> StreamResult<Arc<StreamRuntime>> {
+    ) -> RedisStoreResult<Arc<StreamRuntime>> {
         let config = RedisStreamConfig::decode(config)
-            .map_err(|error| StreamError::invalid(format!("The config is bad: {error}")))?;
+            .map_err(|error| RedisStoreError::invalid(format!("The config is bad: {error}")))?;
         Ok(Self::create(RuntimeOptions::from_config(config)?, meter))
     }
 }
