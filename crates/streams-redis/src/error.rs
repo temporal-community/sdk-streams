@@ -1,11 +1,55 @@
-//! Turns Redis client errors into Stream errors, so no Redis error reaches lang.
+//! The errors of the Redis Store. Each one becomes a Stream error at the `Store` trait, with the
+//! reason that lang turns into an error class, so a caller gets the same classes on every backend.
 
 use redis::RedisError;
 use temporalio_streams::{Reason, StreamError};
 
+/// An error of the Redis Store or of its runtime.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum RedisStoreError {
+    /// Redis failed the call, or a Stream script refused it.
+    #[error(transparent)]
+    Redis(#[from] RedisError),
+    /// The options are wrong or Redis is too old, so a retry can't fix it.
+    #[error("{0}")]
+    Invalid(String),
+    /// Redis gave an answer that the Store doesn't expect, or too few replicas acknowledged a
+    /// write. A retry may fix it.
+    #[error("{0}")]
+    Storage(String),
+    /// A rule of the Stream runtime refused a value that Redis keeps.
+    #[error(transparent)]
+    Stream(#[from] StreamError),
+}
+
+/// The result of a Redis Store call.
+pub type RedisStoreResult<T> = Result<T, RedisStoreError>;
+
+impl RedisStoreError {
+    pub(crate) fn invalid(message: impl Into<String>) -> Self {
+        Self::Invalid(message.into())
+    }
+
+    pub(crate) fn storage(message: impl Into<String>) -> Self {
+        Self::Storage(message.into())
+    }
+}
+
+impl From<RedisStoreError> for StreamError {
+    fn from(error: RedisStoreError) -> Self {
+        match error {
+            RedisStoreError::Redis(error) => from_redis(&error),
+            RedisStoreError::Invalid(message) => StreamError::invalid(message),
+            RedisStoreError::Storage(message) => StreamError::storage(message),
+            RedisStoreError::Stream(error) => error,
+        }
+    }
+}
+
 /// The Stream error of a Redis error. Scripts name their refusals with a `STREAM_` code. A refusal
 /// that a retry can't fix is invalid, and any other failure is a Store failure that may be retried.
-pub(crate) fn stream_error(error: &RedisError) -> StreamError {
+fn from_redis(error: &RedisError) -> StreamError {
     let detail = error.detail().unwrap_or_default().to_string();
     let reason = match error.code() {
         Some("STREAM_NOT_FOUND") => Reason::NotFound,
@@ -35,27 +79,17 @@ pub(crate) fn stream_error(error: &RedisError) -> StreamError {
     StreamError::new(reason, detail)
 }
 
-/// Maps a Redis result.
-pub(crate) trait Mapped<T> {
-    fn mapped(self) -> Result<T, StreamError>;
-}
-
-impl<T> Mapped<T> for Result<T, RedisError> {
-    fn mapped(self) -> Result<T, StreamError> {
-        self.map_err(|error| stream_error(&error))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn server(code: &str, detail: &str) -> RedisError {
+    fn server(code: &str, detail: &str) -> StreamError {
         // Parse it as a wire reply, so that the code and the detail split as in a real reply.
-        redis::parse_redis_value(format!("-{code} {detail}\r\n").as_bytes())
+        let error = redis::parse_redis_value(format!("-{code} {detail}\r\n").as_bytes())
             .unwrap()
             .extract_error()
-            .unwrap_err()
+            .unwrap_err();
+        RedisStoreError::from(error).into()
     }
 
     #[test]
@@ -71,14 +105,14 @@ mod tests {
             ("STREAM_FORMAT_TOO_NEW", Reason::FormatTooNew),
             ("STREAM_INVALID", Reason::Invalid),
         ] {
-            let error = stream_error(&server(code, "why it refused"));
+            let error = server(code, "why it refused");
             assert_eq!(
                 (error.reason, error.message.as_str()),
                 (reason, "why it refused")
             );
         }
         for code in ["READONLY", "OOM", "LOADING", "BUSY", "TRYAGAIN"] {
-            let error = stream_error(&server(code, "x"));
+            let error = server(code, "x");
             assert_eq!(error.reason, Reason::Storage, "{code}");
             assert!(error.message.contains(code), "{error}");
         }
@@ -96,11 +130,11 @@ mod tests {
                 "value is not an integer script: 86f9, on @user_script:59.",
             ),
         ] {
-            let error = stream_error(&server(code, detail));
+            let error = server(code, detail);
             assert_eq!(error.reason, Reason::Invalid, "{code}");
             assert!(error.message.contains(detail), "{error}");
         }
-        let other = stream_error(&server("ERR", "max number of clients reached"));
+        let other = server("ERR", "max number of clients reached");
         assert_eq!(other.reason, Reason::Storage);
     }
 }
