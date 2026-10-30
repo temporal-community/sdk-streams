@@ -110,6 +110,12 @@ impl TestBackend for RedisBackend {
                 seconds: WAIT_TIMEOUT.as_secs() as i64,
                 nanos: 0,
             }),
+            // The writer cases leave megabytes of Records, which a local server keeps for the
+            // Retention.
+            retention: Some(prost_types::Duration {
+                seconds: 300,
+                nanos: 0,
+            }),
             ..Default::default()
         };
         RedisStreamRuntime::from_config_bytes(&config.encode_to_vec(), None).unwrap()
