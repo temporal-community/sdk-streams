@@ -8,7 +8,7 @@ use std::{sync::Arc, time::Duration};
 use temporalio_common::telemetry::metrics::TemporalMeter;
 use temporalio_streams::{StoreFactory, StreamResult, StreamRuntime, store::Store};
 
-/// The name of the Redis runtime, for logs and for a bridge that selects a runtime by name.
+/// The name that [StreamRuntime::name] gives for a Redis runtime.
 pub const REDIS_RUNTIME_NAME: &str = "temporalio-streams-redis";
 
 /// The options of a Stream runtime on Redis.

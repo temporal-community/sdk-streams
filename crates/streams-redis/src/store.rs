@@ -133,11 +133,6 @@ impl RedisStore {
         })
     }
 
-    /// The Retention of a Stream whose create sets none.
-    pub fn default_retention(&self) -> Duration {
-        self.retention
-    }
-
     fn keys(&self, namespace: &str, stream_id: &str) -> StreamKeys {
         StreamKeys::new(&self.prefix, namespace, stream_id)
     }
@@ -398,10 +393,6 @@ impl Store for RedisStore {
     // Every rule but the run fence is in the Lua scripts.
     fn capabilities(&self) -> Capabilities {
         Capabilities::ALL.without(Capabilities::RUN_FENCE)
-    }
-
-    fn default_retention(&self) -> Duration {
-        self.retention
     }
 
     async fn create(
