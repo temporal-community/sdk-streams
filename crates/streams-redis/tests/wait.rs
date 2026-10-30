@@ -6,7 +6,7 @@ mod support;
 use std::time::{Duration, Instant};
 use support::server_url;
 use temporalio_streams::{
-    Reason,
+    Reason, StreamError,
     proto::{Producer, ProducerEpoch, StreamProducerKind, StreamRef},
     store::{Batch, CreateOutcome, Owner, Withdrawal},
 };
@@ -141,7 +141,7 @@ async fn a_write_that_too_few_replicas_have_fails_and_its_retry_finds_it() {
         } else {
             let _: () = flush.query_async(&mut admin(&url).await).await.unwrap();
         }
-        let refused = create(&waits).await.unwrap_err();
+        let refused = StreamError::from(create(&waits).await.unwrap_err());
         assert_eq!(refused.reason, Reason::Storage, "{refused}");
         let plain = store(&url, cluster, 0, SHORT).await;
         assert_eq!(create(&plain).await.unwrap().outcome, CreateOutcome::Exists);
@@ -230,7 +230,10 @@ async fn a_call_that_finds_its_write_waits_for_the_replicas() {
         .map(|_| ());
     resume(&replicas).await;
     for result in [resent, closed, found] {
-        assert_eq!(result.unwrap_err().reason, Reason::Storage);
+        assert_eq!(
+            StreamError::from(result.unwrap_err()).reason,
+            Reason::Storage
+        );
     }
     let enough = store(&url, false, replicas.len(), LONG).await;
     let resent = enough.append(&namespace, &stream.id, &batch).await.unwrap();
@@ -290,7 +293,10 @@ async fn writes_wait_for_their_replicas_at_once() {
         });
     }
     for result in writes.join_all().await {
-        assert_eq!(result.unwrap_err().reason, Reason::Storage);
+        assert_eq!(
+            StreamError::from(result.unwrap_err()).reason,
+            Reason::Storage
+        );
     }
     // One after the other, the four writes take four timeouts.
     assert!(start.elapsed() < timeout * 3, "{:?}", start.elapsed());
