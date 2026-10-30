@@ -45,6 +45,10 @@ strings.
 a Producer's last batch then writes the batch again, and a lower epoch of the Producer is accepted.
 So the fence lasts one Retention after the last append.
 
+An append with sequence 0 takes the sequence after the one in `d` when `d` has the batch's epoch
+key, and 1 otherwise. The script reads `d` and writes the batch in one step, so two such batches
+never get the same sequence. Nothing dedupes such a batch, so its retry writes it again.
+
 ## Log entries
 
 - `r` is the encoded `StreamRecord`, with no offset.
