@@ -5,7 +5,7 @@ mod conn;
 mod scripts;
 
 use crate::{RedisStoreError, RedisStoreResult};
-use conn::{BlockingPool, Shared, WaitPool};
+use conn::{BlockingPool, Endpoint, SharedConnection, WaitPool};
 use redis::{Cmd, ErrorKind, RedisResult, Script, ServerErrorKind, Value};
 use std::{sync::Arc, time::Duration};
 use temporalio_streams::{
@@ -75,7 +75,7 @@ struct Wait {
 /// The Redis Store.
 #[derive(Clone)]
 pub struct RedisStore {
-    shared: Shared,
+    shared: SharedConnection,
     wait: Option<Arc<Wait>>,
     blocking: Arc<BlockingPool>,
     prefix: String,
@@ -101,28 +101,22 @@ impl RedisStore {
     /// Connects to Redis and checks that it is Redis 7.0 or later.
     pub async fn connect(options: RedisStoreOptions) -> RedisStoreResult<Self> {
         check_options(&options)?;
-        let connect = || Shared::connect(&options.urls, options.cluster, options.response_timeout);
-        let shared = connect().await?;
+        let endpoint = Arc::new(Endpoint::parse(
+            &options.urls,
+            options.cluster,
+            options.response_timeout,
+        )?);
+        let shared = endpoint.open().await?;
         check_server(&shared).await?;
         let wait = match options.wait_replicas {
             0 => None,
             replicas => Some(Arc::new(Wait {
                 replicas,
                 timeout: options.wait_timeout,
-                pool: WaitPool::new(
-                    connect().await?,
-                    &options.urls,
-                    options.cluster,
-                    options.response_timeout,
-                ),
+                pool: WaitPool::new(endpoint.open().await?, endpoint.clone()),
             })),
         };
-        let blocking = BlockingPool::new(
-            &options.urls,
-            options.blocking_reads_per_node,
-            options.cluster,
-            options.response_timeout,
-        )?;
+        let blocking = BlockingPool::new(endpoint, options.blocking_reads_per_node);
         Ok(Self {
             shared,
             wait,
@@ -282,10 +276,11 @@ impl RedisStore {
                 "Every connection for writes with WAIT stayed busy for the response timeout",
             ));
         };
-        let reply = Self::write_and_wait(wait, script, cmd, &mut lease.conn).await;
-        // After a transport error, the `WAIT` can still block the connection, so the pool drops it.
+        let reply = Self::write_and_wait(wait, script, cmd, lease.conn()).await;
+        // After a transport error the `WAIT` can still block the connection, so only a write that
+        // got its answers gives it back.
         if reply.is_ok() {
-            lease.release();
+            lease.keep();
         }
         reply?
     }
@@ -300,7 +295,7 @@ impl RedisStore {
         wait: &Wait,
         script: &Script,
         cmd: &Cmd,
-        conn: &mut Shared,
+        conn: &mut SharedConnection,
     ) -> RedisResult<RedisStoreResult<Value>> {
         let mut pipe = redis::pipe();
         pipe.ignore_errors()
@@ -498,7 +493,7 @@ fn no_script(error: &redis::RedisError) -> bool {
 }
 
 /// Runs a script call, and loads the script when Redis lacks it.
-async fn run_script(script: &Script, cmd: &Cmd, conn: &mut Shared) -> RedisResult<Value> {
+async fn run_script(script: &Script, cmd: &Cmd, conn: &mut SharedConnection) -> RedisResult<Value> {
     match cmd.query_async(conn).await {
         Err(error) if no_script(&error) => {
             script.load_async(conn).await?;
@@ -660,7 +655,7 @@ fn check_options(options: &RedisStoreOptions) -> RedisStoreResult<()> {
 }
 
 /// Refuses a server older than Redis 7.0, and warns about one that may evict Stream keys.
-async fn check_server(shared: &Shared) -> RedisStoreResult<()> {
+async fn check_server(shared: &SharedConnection) -> RedisStoreResult<()> {
     let mut info = redis::cmd("INFO");
     info.arg("server");
     match shared.on_each_primary(info).await {
