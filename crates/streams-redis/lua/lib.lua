@@ -140,6 +140,72 @@ local function prune(meta, producers, now)
   end
 end
 
+local function words(text)
+  local list = {}
+  if text then
+    for word in string.gmatch(text, '%S+') do
+      table.insert(list, word)
+    end
+  end
+  return list
+end
+
+local function contains(list, value)
+  for _, item in ipairs(list) do
+    if item == value then
+      return true
+    end
+  end
+  return false
+end
+
+local function started(key)
+  return tonumber(string.sub(key, 1, 16), 16)
+end
+
+-- The form of `task_key` in `temporalio-streams`. A script refuses task facts of another form
+-- before its first write, since `orphan_tasks` raises on them.
+local TASK_KEY = '^' .. string.rep('%x', 16) .. '%.' .. string.rep('%x', 8) .. '%.' ..
+  string.rep('%x', 16) .. '%.' .. string.rep('%x', 8) .. '$'
+
+local function task_key(text)
+  return string.match(text, TASK_KEY) ~= nil
+end
+
+-- A task at or before c that the rule doesn't withdraw completed, so `oa` drops it.
+-- `docs/redis.md` has the rule.
+local function orphan_tasks(open, t, c, failed)
+  local failed_set = {}
+  for _, id in ipairs(words(failed)) do
+    failed_set[tonumber(id)] = true
+  end
+  local ts = started(t)
+  local cs = 0
+  if c ~= '' then
+    cs = started(c)
+  end
+  local withdrawn, kept = {}, {}
+  for _, key in ipairs(open) do
+    local s = started(key)
+    if failed_set[s] or (cs < s and s < ts) or (s == ts and key < t)
+        or (c ~= '' and s == cs and key < c) then
+      table.insert(withdrawn, key)
+    elseif c == '' or key > c then
+      table.insert(kept, key)
+    end
+  end
+  return withdrawn, kept
+end
+
+-- A run that never wrote here needs the fence but no Superseded item.
+local function withdraw_run(meta, run)
+  if run == '' or redis.call('HGET', meta, 'wr|' .. run) then
+    return false
+  end
+  redis.call('HSET', meta, 'wr|' .. run, '1')
+  return redis.call('HGET', meta, 'run|' .. run) ~= false
+end
+
 -- The id of the script's next entry. A script numbers its entries itself, in one millisecond,
 -- since `XADD *` on Redis 7.0 can cross a millisecond inside one script.
 local next_ms, next_seq = 0, 0

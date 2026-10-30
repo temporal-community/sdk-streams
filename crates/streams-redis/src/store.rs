@@ -10,10 +10,10 @@ use redis::{Cmd, ErrorKind, RedisResult, Script, ServerErrorKind, Value};
 use std::{sync::Arc, time::Duration};
 use temporalio_streams::{
     StreamError, StreamResult,
-    epoch::epoch_key,
+    epoch::{epoch_key, task_key, task_of},
     ids::{StreamKeys, encode_part},
     offset::{entry_id_of_offset, offset_of_entry_id},
-    proto::{Producer, StreamRef},
+    proto::{Producer, StreamProducerKind, StreamRef},
     store::{
         Appended, Batch, Capabilities, Closed, CreateOutcome, Created, DEFAULT_RETENTION,
         DEFAULT_SAFETY_TTL, Entry, FORMAT_VERSION, MAX_TTL, Owner, Store, StreamState, TOMBSTONE,
@@ -131,15 +131,15 @@ impl RedisStore {
         StreamKeys::new(&self.prefix, namespace, stream_id)
     }
 
-    /// Creates a Stream, or finds it. A Workflow-owned Stream stores its ref's run chain, which
-    /// later creates and closes must name.
+    /// Creates a Stream, or finds it. A retry run's create withdraws its previous run. A
+    /// Workflow-owned Stream stores its ref's run chain, which later creates and closes must name.
     pub async fn create(
         &self,
         namespace: &str,
         stream: &StreamRef,
         retention: Option<Duration>,
         owner: Owner,
-        _withdrawal: &Withdrawal<'_>,
+        withdrawal: &Withdrawal<'_>,
     ) -> RedisStoreResult<Created> {
         let keys = self.keys(namespace, &stream.id);
         let retention = retention.filter(|r| !r.is_zero()).unwrap_or(self.retention);
@@ -153,10 +153,12 @@ impl RedisStore {
             .arg(owner)
             .arg(millis(self.safety_ttl))
             .arg(millis(TOMBSTONE))
+            .arg(encode_part(withdrawal.withdraw_run))
+            .arg(withdrawal.supersession)
             .arg(chain)
             .arg(self.wait_flag());
         let reply = self.write(&scripts::CREATE_SCRIPT, &cmd).await?;
-        let [outcome, stored] = strings::<2>(reply, "create")?;
+        let [outcome, stored, flag] = strings::<3>(reply, "create")?;
         let outcome = match outcome.as_str() {
             "created" => CreateOutcome::Created,
             "exists" => CreateOutcome::Exists,
@@ -166,7 +168,7 @@ impl RedisStore {
         Ok(Created {
             outcome,
             retention: Duration::from_millis(stored),
-            flagged: false,
+            flagged: flag == "1",
         })
     }
 
@@ -185,11 +187,17 @@ impl RedisStore {
         cmd.arg(FORMAT_VERSION)
             .arg(producer.kind)
             .arg(&producer.id)
+            .arg(encode_part(&producer.run_id))
             .arg(epoch_key(&epoch))
             .arg(batch.sequence)
+            .arg(encode_part(withdrawal.withdraw_run))
             .arg(withdrawal.supersession)
             .arg(millis(self.safety_ttl))
             .arg(millis(TOMBSTONE))
+            .arg(local_activity_task(producer))
+            .arg(completed_arg(withdrawal))
+            .arg(failed_list(withdrawal))
+            .arg(withdrawal.tasks.map_or(&[][..], |tasks| tasks.supersession))
             .arg(batch.digest)
             .arg(self.wait_flag());
         for record in batch.records {
@@ -223,6 +231,7 @@ impl RedisStore {
         cmd.arg(FORMAT_VERSION)
             .arg(producer.kind)
             .arg(&producer.id)
+            .arg(encode_part(&producer.run_id))
             .arg(epoch_key(&epoch))
             .arg(millis(TOMBSTONE))
             .arg(record)
@@ -385,9 +394,9 @@ impl RedisStore {
 // Each method turns the crate's error into one at this boundary.
 #[async_trait::async_trait]
 impl Store for RedisStore {
-    // Every rule but the run fence is in the Lua scripts.
+    // Every rule is in the Lua scripts.
     fn capabilities(&self) -> Capabilities {
-        Capabilities::ALL.without(Capabilities::RUN_FENCE)
+        Capabilities::ALL
     }
 
     async fn create(
@@ -501,6 +510,31 @@ async fn run_script(script: &Script, cmd: &Cmd, conn: &mut SharedConnection) -> 
         }
         result => result,
     }
+}
+
+/// The task key of a Local Activity's dispatching Workflow Task, empty for any other kind.
+fn local_activity_task(producer: &Producer) -> String {
+    if producer.kind != StreamProducerKind::LocalActivity as i32 {
+        return String::new();
+    }
+    task_key(&task_of(&producer.epoch.unwrap_or_default()))
+}
+
+/// The run's last completed task key, `-` when the batch gives no task facts.
+fn completed_arg(withdrawal: &Withdrawal<'_>) -> String {
+    match &withdrawal.tasks {
+        None => "-".to_string(),
+        Some(tasks) => tasks.completed.map(task_key).unwrap_or_default(),
+    }
+}
+
+fn failed_list(withdrawal: &Withdrawal<'_>) -> String {
+    let failed = withdrawal.tasks.map_or(&[][..], |tasks| tasks.failed_tasks);
+    failed
+        .iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn bad_reply(call: &str, reply: impl std::fmt::Debug) -> RedisStoreError {
@@ -797,5 +831,67 @@ mod tests {
             state.retained_from(),
             (9000 << temporalio_streams::offset::SEQ_BITS) + 1
         );
+    }
+
+    #[tokio::test]
+    async fn bad_task_facts_are_refused_before_the_first_write() {
+        let Some(url) = crate::server::server_url("STREAMS_REDIS_URL") else {
+            return;
+        };
+        let mut options = RedisStoreOptions::new(url);
+        options.key_prefix = "streams-unit".to_string();
+        let store = RedisStore::connect(options).await.unwrap();
+        let namespace = format!("ns-{}", std::process::id());
+        let task = task_key(&Default::default());
+        for (i, (task, failed)) in [("zz", "1"), (task.as_str(), "x")].into_iter().enumerate() {
+            let stream = StreamRef {
+                id: format!("s{i}"),
+                ..Default::default()
+            };
+            let none = Withdrawal::default();
+            store
+                .create(&namespace, &stream, None, Owner::Client, &none)
+                .await
+                .unwrap();
+            let keys = store.keys(&namespace, &stream.id);
+            let mut shared = store.shared.clone();
+            let set: RedisResult<()> = redis::cmd("HSET")
+                .arg(keys.meta())
+                .arg("run|r0")
+                .arg("1")
+                .query_async(&mut shared)
+                .await;
+            set.unwrap();
+            // A Local Activity of run r1 that withdraws r0, with one malformed task fact.
+            let mut cmd = script_cmd("EVALSHA", &scripts::APPEND_SCRIPT, &keys);
+            cmd.arg(FORMAT_VERSION)
+                .arg(StreamProducerKind::LocalActivity as i32)
+                .arg("la")
+                .arg("r1")
+                .arg(epoch_key(&Default::default()))
+                .arg(1)
+                .arg("r0")
+                .arg(b"")
+                .arg(millis(DEFAULT_SAFETY_TTL))
+                .arg(millis(TOMBSTONE))
+                .arg(task)
+                .arg("")
+                .arg(failed)
+                .arg(b"")
+                .arg("d")
+                .arg("")
+                .arg(b"r");
+            let error = run_script(&scripts::APPEND_SCRIPT, &cmd, &mut shared)
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), Some("STREAM_INVALID"), "{error}");
+            let fence: Option<String> = redis::cmd("HGET")
+                .arg(keys.meta())
+                .arg("wr|r0")
+                .query_async(&mut shared)
+                .await
+                .unwrap();
+            assert_eq!(fence, None);
+        }
     }
 }
