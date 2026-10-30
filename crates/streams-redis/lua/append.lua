@@ -1,7 +1,8 @@
 -- Appends one batch of one Producer.
 --
--- ARGV: format version, kind, Producer id, epoch key, sequence, Supersession bytes, safety TTL ms,
--- Tombstone ms, the batch digest, `1` when a `WAIT` follows, then one Record per argument.
+-- ARGV: format version, kind, Producer id, epoch key, sequence (0 takes the next one),
+-- Supersession bytes, safety TTL ms, Tombstone ms, the batch digest, `1` when a `WAIT` follows,
+-- then one Record per argument.
 --
 -- Returns {'ok' or 'resend', first id, last id, '1' when flagged}.
 local meta, log, producers = KEYS[1], KEYS[2], KEYS[3]
@@ -13,6 +14,17 @@ local safety, tombstone = tonumber(ARGV[7]), tonumber(ARGV[8])
 local digest, wait = ARGV[9], ARGV[10]
 local records = #ARGV - 10
 
+-- The script reads the dedupe entry and writes the batch in one step, so no other batch takes the
+-- same number.
+if sequence_text == '0' then
+  local last = redis.call('HGET', meta, 'd|' .. kind .. '|' .. producer) or ''
+  local last_epoch, last_sequence = string.match(last, '^([^|]*)|(%d+)|')
+  sequence_text = '1'
+  if last_epoch == epoch then
+    sequence_text = string.format('%.0f', tonumber(last_sequence) + 1)
+  end
+  sequence = tonumber(sequence_text)
+end
 -- A Lua number past 2^53 - 1 loses digits, so the dedupe entry keeps the sequence as sent.
 if not string.match(sequence_text, '^[1-9]%d*$') or sequence > 9007199254740991 then
   return refuse('INVALID', 'the sequence must be from 1 to 2^53 - 1')
