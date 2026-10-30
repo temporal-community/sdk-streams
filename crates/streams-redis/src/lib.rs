@@ -9,16 +9,16 @@
 
 mod error;
 mod protos;
-mod redis;
 mod runtime;
+mod store;
 #[cfg(test)]
 mod server {
     include!("../tests/support/server.rs");
 }
 
 pub use error::{RedisStoreError, RedisStoreResult};
-pub use redis::{RedisStore, RedisStoreOptions};
 pub use runtime::{REDIS_RUNTIME_NAME, RedisStreamRuntime, RuntimeOptions};
+pub use store::{RedisStore, RedisStoreOptions};
 
 /// The config that lang builds for the Redis runtime.
 pub mod proto {
