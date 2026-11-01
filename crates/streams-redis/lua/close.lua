@@ -1,7 +1,7 @@
 -- Closes the Stream with one close Record.
 --
 -- ARGV: format version, kind, Producer id, epoch key, Tombstone ms, close Record, the run chain
--- that the close's ref names as `<workflow id>:<first run id>` with each part encoded (empty for
+-- that the close's handle names as `<workflow id>:<first run id>` with each part encoded (empty for
 -- none), `1` when a `WAIT` follows.
 --
 -- Returns {'closed' or 'already', close id}.

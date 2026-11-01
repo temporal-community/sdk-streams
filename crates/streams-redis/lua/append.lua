@@ -1,7 +1,7 @@
 -- Appends one batch of one Producer.
 --
 -- ARGV: format version, kind, Producer id, epoch key, sequence (0 takes the next one),
--- Supersession bytes, safety TTL ms, Tombstone ms, the batch digest, `1` when a `WAIT` follows,
+-- Superseded facts, safety TTL ms, Tombstone ms, the batch digest, `1` when a `WAIT` follows,
 -- then one Record per argument.
 --
 -- Returns {'ok' or 'resend', first id, last id, '1' when flagged}.
@@ -9,7 +9,7 @@ local meta, log, producers = KEYS[1], KEYS[2], KEYS[3]
 local version, kind, producer = tonumber(ARGV[1]), ARGV[2], ARGV[3]
 local epoch, sequence_text = ARGV[4], ARGV[5]
 local sequence = tonumber(sequence_text)
-local supersession = ARGV[6]
+local superseded = ARGV[6]
 local safety, tombstone = tonumber(ARGV[7]), tonumber(ARGV[8])
 local digest, wait = ARGV[9], ARGV[10]
 local records = #ARGV - 10
@@ -79,7 +79,7 @@ prune(meta, producers, now)
 trim(meta, log, now)
 local first_id, last_id = '', ''
 if records == 0 and flagged then
-  last_id = add(log, {'s', supersession})
+  last_id = add(log, {'s', superseded})
   if first_id == '' then
     first_id = last_id
   end
@@ -87,7 +87,7 @@ end
 for i = 11, #ARGV do
   local fields = {'r', ARGV[i]}
   if i == 11 and flagged then
-    fields = {'s', supersession, 'r', ARGV[i]}
+    fields = {'s', superseded, 'r', ARGV[i]}
   end
   last_id = add(log, fields)
   if first_id == '' then
