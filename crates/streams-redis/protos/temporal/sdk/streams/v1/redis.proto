@@ -23,7 +23,7 @@ message RedisStreamConfig {
     // Empty is 5 s.
     google.protobuf.Duration response_timeout = 9;
     // The backend name that lang registered this runtime under. The crate sets it on each
-    // StreamRef that it builds, such as the one in a create response.
+    // StreamHandle that it builds, such as the one in a create response.
     string backend = 10;
     // How many replicas must have each write before it answers. Zero sends no WAIT.
     int32 wait_replicas = 11;

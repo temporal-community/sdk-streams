@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use support::server_url;
 use temporalio_streams::{
     Reason, StreamError,
-    proto::{Producer, ProducerEpoch, StreamProducerKind, StreamRef},
+    proto::{Producer, ProducerEpoch, StreamHandle, StreamProducerKind},
     store::{Batch, CreateOutcome, Owner, Withdrawal},
 };
 use temporalio_streams_redis::{RedisStore, RedisStoreOptions};
@@ -111,18 +111,18 @@ async fn a_write_that_too_few_replicas_have_fails_and_its_retry_finds_it() {
         let Some(url) = server_url(variable) else {
             continue;
         };
-        let stream = StreamRef {
+        let handle = StreamHandle {
             id: format!("s-{}", std::process::id()),
             ..Default::default()
         };
         let namespace = unique("ns");
         let create = |store: &RedisStore| {
-            let (store, namespace, stream) = (store.clone(), namespace.clone(), stream.clone());
+            let (store, namespace, handle) = (store.clone(), namespace.clone(), handle.clone());
             async move {
                 store
                     .create(
                         &namespace,
-                        &stream,
+                        &handle,
                         None,
                         Owner::Client,
                         &Withdrawal::default(),
@@ -175,9 +175,9 @@ async fn a_call_that_finds_its_write_waits_for_the_replicas() {
         eprintln!("give the server at STREAMS_REDIS_URL a replica to run this case");
         return;
     }
-    let (namespace, stream) = (
+    let (namespace, handle) = (
         unique("ns"),
-        StreamRef {
+        StreamHandle {
             id: "s".to_string(),
             ..Default::default()
         },
@@ -198,26 +198,26 @@ async fn a_call_that_finds_its_write_waits_for_the_replicas() {
         digest: "d",
         withdrawal: none(),
     };
-    let other = StreamRef {
+    let other = StreamHandle {
         id: "other".to_string(),
         ..Default::default()
     };
     plain
-        .create(&namespace, &stream, None, Owner::Client, &none())
+        .create(&namespace, &handle, None, Owner::Client, &none())
         .await
         .unwrap();
     pause(&replicas).await;
-    plain.append(&namespace, &stream.id, &batch).await.unwrap();
+    plain.append(&namespace, &handle.id, &batch).await.unwrap();
     let resent = waits[0]
-        .append(&namespace, &stream.id, &batch)
+        .append(&namespace, &handle.id, &batch)
         .await
         .map(|_| ());
     plain
-        .close(&namespace, &stream, &producer, b"")
+        .close(&namespace, &handle, &producer, b"")
         .await
         .unwrap();
     let closed = waits[1]
-        .close(&namespace, &stream, &producer, b"")
+        .close(&namespace, &handle, &producer, b"")
         .await
         .map(|_| ());
     plain
@@ -236,10 +236,10 @@ async fn a_call_that_finds_its_write_waits_for_the_replicas() {
         );
     }
     let enough = store(&url, false, replicas.len(), LONG).await;
-    let resent = enough.append(&namespace, &stream.id, &batch).await.unwrap();
+    let resent = enough.append(&namespace, &handle.id, &batch).await.unwrap();
     assert!(resent.resend);
     let closed = enough
-        .close(&namespace, &stream, &producer, b"")
+        .close(&namespace, &handle, &producer, b"")
         .await
         .unwrap();
     assert!(closed.already);
@@ -262,7 +262,7 @@ async fn writes_wait_for_their_replicas_at_once() {
         .await
         .create(
             &namespace,
-            &StreamRef {
+            &StreamHandle {
                 id: "loads".to_string(),
                 ..Default::default()
             },
@@ -277,14 +277,14 @@ async fn writes_wait_for_their_replicas_at_once() {
     for i in 0..4 {
         let (waits, namespace) = (waits.clone(), namespace.clone());
         writes.spawn(async move {
-            let stream = StreamRef {
+            let handle = StreamHandle {
                 id: format!("s{i}"),
                 ..Default::default()
             };
             waits
                 .create(
                     &namespace,
-                    &stream,
+                    &handle,
                     None,
                     Owner::Client,
                     &Withdrawal::default(),

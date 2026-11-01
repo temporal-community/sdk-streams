@@ -1,8 +1,8 @@
 -- Appends one batch of one Producer.
 --
 -- ARGV: format version, kind, Producer id, encoded run id, epoch key, sequence (0 takes the next
--- one), encoded withdrawn run, Supersession bytes, safety TTL ms, Tombstone ms, task key, completed
--- task key (`-` when the write gives no task facts), failed task ids, task Supersession bytes, the
+-- one), encoded withdrawn run, Superseded facts, safety TTL ms, Tombstone ms, task key, completed
+-- task key (`-` when the write gives no task facts), failed task ids, task Superseded facts, the
 -- batch digest, `1` when a `WAIT` follows, then one Record per argument.
 --
 -- Returns {'ok' or 'resend', first id, last id, '1' when flagged}.
@@ -10,9 +10,9 @@ local meta, log, producers = KEYS[1], KEYS[2], KEYS[3]
 local version, kind, producer = tonumber(ARGV[1]), ARGV[2], ARGV[3]
 local run, epoch, sequence_text = ARGV[4], ARGV[5], ARGV[6]
 local sequence = tonumber(sequence_text)
-local withdrawn_run, supersession = ARGV[7], ARGV[8]
+local withdrawn_run, superseded = ARGV[7], ARGV[8]
 local safety, tombstone = tonumber(ARGV[9]), tonumber(ARGV[10])
-local task, completed, failed, task_supersession = ARGV[11], ARGV[12], ARGV[13], ARGV[14]
+local task, completed, failed, task_superseded = ARGV[11], ARGV[12], ARGV[13], ARGV[14]
 local digest, wait = ARGV[15], ARGV[16]
 local records = #ARGV - 16
 -- Only a Local Activity write with its run's task facts tells which tasks of the run completed.
@@ -111,11 +111,11 @@ local first_id, last_id = '', ''
 -- Superseded item.
 local orphan_id = ''
 if #withdrawn > 0 then
-  orphan_id = add(log, {'s', task_supersession})
+  orphan_id = add(log, {'s', task_superseded})
   last_id = orphan_id
 end
 if records == 0 and flagged then
-  last_id = add(log, {'s', supersession})
+  last_id = add(log, {'s', superseded})
   if first_id == '' then
     first_id = last_id
   end
@@ -123,7 +123,7 @@ end
 for i = 17, #ARGV do
   local fields = {'r', ARGV[i]}
   if i == 17 and flagged then
-    fields = {'s', supersession, 'r', ARGV[i]}
+    fields = {'s', superseded, 'r', ARGV[i]}
   end
   last_id = add(log, fields)
   if first_id == '' then
