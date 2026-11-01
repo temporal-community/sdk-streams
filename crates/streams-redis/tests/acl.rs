@@ -12,8 +12,8 @@ use temporalio_streams::{
     digest::batch_digest,
     ids::{StreamKeys, client_producer_id},
     proto::{
-        AppendRecord, Producer, ProducerEpoch, StreamData, StreamProducerKind, StreamRecord,
-        StreamRef, stream_record::Item,
+        AppendRecord, Producer, ProducerEpoch, StreamData, StreamHandle, StreamProducerKind,
+        StreamRecord, stream_record::Item,
     },
     store::{Batch, Owner, Store, Withdrawal},
 };
@@ -131,7 +131,7 @@ async fn the_documented_commands_run_every_call_of_each_role() {
     let unique = unique();
     let namespace = format!("ns-{unique}");
     let (producer_name, reader_name) = (format!("prod-{unique}"), format!("read-{unique}"));
-    let stream = StreamRef {
+    let handle = StreamHandle {
         id: "s".to_string(),
         ..Default::default()
     };
@@ -146,7 +146,7 @@ async fn the_documented_commands_run_every_call_of_each_role() {
     producer
         .create(
             &namespace,
-            &stream,
+            &handle,
             None,
             Owner::Client,
             &Withdrawal::default(),
@@ -161,7 +161,7 @@ async fn the_documented_commands_run_every_call_of_each_role() {
         digest: &digest,
         withdrawal: Withdrawal::default(),
     };
-    let appended = producer.append(&namespace, &stream, &batch).await.unwrap();
+    let appended = producer.append(&namespace, &handle, &batch).await.unwrap();
     let (first, _) = appended.offsets.unwrap();
 
     let reader = store(user(&url, &reader_name, &namespace, READER).await).await;
@@ -186,7 +186,7 @@ async fn the_documented_commands_run_every_call_of_each_role() {
     let refused = reader
         .append(
             &namespace,
-            &stream,
+            &handle,
             &Batch {
                 sequence: 2,
                 ..batch.clone()
@@ -197,13 +197,13 @@ async fn the_documented_commands_run_every_call_of_each_role() {
     assert_eq!(refused.reason, Reason::Invalid, "{refused}");
 
     producer
-        .close(&namespace, &stream, &client(), b"")
+        .close(&namespace, &handle, &client(), b"")
         .await
         .unwrap();
 
     // An append after the Retention trims the old Records and prunes the old Producers. An open
     // Workflow Stream has the safety TTL, so it doesn't expire with the Retention.
-    let short = StreamRef {
+    let short = StreamHandle {
         id: "short".to_string(),
         ..Default::default()
     };
@@ -264,7 +264,7 @@ async fn the_documented_commands_run_every_call_of_each_role() {
     let failed = waits
         .create(
             &namespace,
-            &StreamRef {
+            &StreamHandle {
                 id: "waits".to_string(),
                 ..Default::default()
             },
@@ -396,7 +396,7 @@ async fn the_documented_commands_serve_a_cluster_while_a_slot_moves() {
         unreachable!()
     };
     let keys = StreamKeys::new(PREFIX, &namespace, &stream);
-    let stream = StreamRef {
+    let handle = StreamHandle {
         id: stream,
         ..Default::default()
     };
@@ -428,11 +428,11 @@ async fn the_documented_commands_serve_a_cluster_while_a_slot_moves() {
     };
     let none = Withdrawal::default();
     producer
-        .create(&namespace, &stream, None, Owner::Client, &none)
+        .create(&namespace, &handle, None, Owner::Client, &none)
         .await
         .unwrap();
     producer
-        .append(&namespace, &stream.id, &batch(1))
+        .append(&namespace, &handle.id, &batch(1))
         .await
         .unwrap();
 
@@ -457,13 +457,13 @@ async fn the_documented_commands_serve_a_cluster_while_a_slot_moves() {
         .arg(keys.producers());
     source.run(&migrate).await;
 
-    let appended = producer.append(&namespace, &stream.id, &batch(2)).await;
-    let read = reader.read(&namespace, &stream.id, 0, 10).await;
-    let read_back = reader.read_back(&namespace, &stream.id, i64::MAX, 10).await;
+    let appended = producer.append(&namespace, &handle.id, &batch(2)).await;
+    let read = reader.read(&namespace, &handle.id, 0, 10).await;
+    let read_back = reader.read_back(&namespace, &handle.id, i64::MAX, 10).await;
     let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
-    let waited = reader.wait_after(&namespace, &stream.id, 0, deadline).await;
+    let waited = reader.wait_after(&namespace, &handle.id, 0, deadline).await;
     let closed = producer
-        .close(&namespace, &stream, &me, b"")
+        .close(&namespace, &handle, &me, b"")
         .await
         .map(|_| ());
 

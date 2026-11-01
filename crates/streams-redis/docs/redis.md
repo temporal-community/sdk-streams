@@ -52,8 +52,8 @@ never get the same sequence. Nothing dedupes such a batch, so its retry writes i
 ## Log entries
 
 - `r` is the encoded `StreamRecord`, with no offset.
-- `s` is the encoded `Supersession`, on the first entry of a batch that withdraws. An entry can have
-  only `s`.
+- `s` is the encoded `StreamSuperseded` with the withdrawal facts, on the first entry of a batch
+  that withdraws. A read builds the Superseded item from it. An entry can have only `s`.
 - An offset is the entry id `<ms>-<seq>`, packed as `ms << 20 | seq`.
 
 ## Orphaned Local Activity Records
@@ -148,6 +148,6 @@ these lists on a standalone server and on a cluster.
 - The meta keeps the `run|`, `oa|`, `ow|` and `wr|` fields of each run until the Stream expires. A
   long run chain, such as one that continues-as-new every hour, adds fields to its Stream's meta
   for as long as it writes.
-- Redis can't tie a run to its run chain. A run of another chain that holds the owner's ref, such
-  as a child Workflow with its parent's Stream, can still close it. The native server checks the
-  run.
+- Redis can't tie a run to its run chain. A run of another chain that holds the owner's handle,
+  such as a child Workflow with its parent's Stream, can still close it. The native server checks
+  the run.

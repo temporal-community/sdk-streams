@@ -16,7 +16,7 @@ pub const REDIS_RUNTIME_NAME: &str = "temporalio-streams-redis";
 pub struct RuntimeOptions {
     /// How to connect to Redis.
     pub store: RedisStoreOptions,
-    /// The backend name that lang registered the runtime under, for the refs it builds.
+    /// The backend name that lang registered the runtime under, for the handles it builds.
     pub backend: String,
 }
 

@@ -13,7 +13,7 @@ use temporalio_streams::{
     epoch::{epoch_key, task_key, task_of},
     ids::{StreamKeys, encode_part},
     offset::{entry_id_of_offset, offset_of_entry_id},
-    proto::{Producer, StreamProducerKind, StreamRef},
+    proto::{Producer, StreamHandle, StreamProducerKind},
     store::{
         Appended, Batch, Capabilities, Closed, CreateOutcome, Created, DEFAULT_RETENTION,
         DEFAULT_SAFETY_TTL, Entry, FORMAT_VERSION, MAX_TTL, Owner, Store, StreamState, TOMBSTONE,
@@ -132,19 +132,20 @@ impl RedisStore {
     }
 
     /// Creates a Stream, or finds it. A retry run's create withdraws its previous run. A
-    /// Workflow-owned Stream stores its ref's run chain, which later creates and closes must name.
+    /// Workflow-owned Stream stores its handle's run chain, which later creates and closes
+    /// must name.
     pub async fn create(
         &self,
         namespace: &str,
-        stream: &StreamRef,
+        handle: &StreamHandle,
         retention: Option<Duration>,
         owner: Owner,
         withdrawal: &Withdrawal<'_>,
     ) -> RedisStoreResult<Created> {
-        let keys = self.keys(namespace, &stream.id);
+        let keys = self.keys(namespace, &handle.id);
         let retention = retention.filter(|r| !r.is_zero()).unwrap_or(self.retention);
         let (owner, chain) = match owner {
-            Owner::Workflow => ("wf", owner_chain(stream)),
+            Owner::Workflow => ("wf", owner_chain(handle)),
             Owner::Client => ("client", String::new()),
         };
         let mut cmd = script_cmd("EVALSHA", &scripts::CREATE_SCRIPT, &keys);
@@ -191,7 +192,7 @@ impl RedisStore {
             .arg(epoch_key(&epoch))
             .arg(batch.sequence)
             .arg(encode_part(withdrawal.withdraw_run))
-            .arg(withdrawal.supersession)
+            .arg(withdrawal.superseded)
             .arg(millis(self.safety_ttl))
             .arg(millis(TOMBSTONE))
             .arg(local_activity_task(producer))
@@ -216,16 +217,16 @@ impl RedisStore {
         })
     }
 
-    /// Closes a Stream with an encoded close Record, if the Producer's kind and the ref's run
+    /// Closes a Stream with an encoded close Record, if the Producer's kind and the handle's run
     /// chain are the owner's.
     pub async fn close(
         &self,
         namespace: &str,
-        stream: &StreamRef,
+        handle: &StreamHandle,
         producer: &Producer,
         record: &[u8],
     ) -> RedisStoreResult<Closed> {
-        let keys = self.keys(namespace, &stream.id);
+        let keys = self.keys(namespace, &handle.id);
         let epoch = producer.epoch.unwrap_or_default();
         let mut cmd = script_cmd("EVALSHA", &scripts::CLOSE_SCRIPT, &keys);
         cmd.arg(FORMAT_VERSION)
@@ -235,7 +236,7 @@ impl RedisStore {
             .arg(epoch_key(&epoch))
             .arg(millis(TOMBSTONE))
             .arg(record)
-            .arg(owner_chain(stream))
+            .arg(owner_chain(handle))
             .arg(self.wait_flag());
         let reply = self.write(&scripts::CLOSE_SCRIPT, &cmd).await?;
         let [outcome, id] = strings::<2>(reply, "close")?;
@@ -402,12 +403,12 @@ impl Store for RedisStore {
     async fn create(
         &self,
         namespace: &str,
-        stream: &StreamRef,
+        handle: &StreamHandle,
         retention: Option<Duration>,
         owner: Owner,
         withdrawal: &Withdrawal<'_>,
     ) -> StreamResult<Created> {
-        RedisStore::create(self, namespace, stream, retention, owner, withdrawal)
+        RedisStore::create(self, namespace, handle, retention, owner, withdrawal)
             .await
             .map_err(StreamError::from)
     }
@@ -415,10 +416,10 @@ impl Store for RedisStore {
     async fn append(
         &self,
         namespace: &str,
-        stream: &StreamRef,
+        handle: &StreamHandle,
         batch: &Batch<'_>,
     ) -> StreamResult<Appended> {
-        RedisStore::append(self, namespace, &stream.id, batch)
+        RedisStore::append(self, namespace, &handle.id, batch)
             .await
             .map_err(StreamError::from)
     }
@@ -426,11 +427,11 @@ impl Store for RedisStore {
     async fn close(
         &self,
         namespace: &str,
-        stream: &StreamRef,
+        handle: &StreamHandle,
         producer: &Producer,
         record: &[u8],
     ) -> StreamResult<Closed> {
-        RedisStore::close(self, namespace, stream, producer, record)
+        RedisStore::close(self, namespace, handle, producer, record)
             .await
             .map_err(StreamError::from)
     }
@@ -633,7 +634,7 @@ fn entry(value: Value) -> RedisStoreResult<Entry> {
     let mut entry = Entry {
         offset: offset_of_entry_id(&id)?,
         record: None,
-        supersession: None,
+        superseded: None,
     };
     let Value::Array(fields) = fields else {
         return Err(bad_reply("read", fields));
@@ -646,7 +647,7 @@ fn entry(value: Value) -> RedisStoreResult<Entry> {
         };
         match name.as_slice() {
             b"r" => entry.record = Some(value.clone()),
-            b"s" => entry.supersession = Some(value.clone()),
+            b"s" => entry.superseded = Some(value.clone()),
             _ => {}
         }
     }
