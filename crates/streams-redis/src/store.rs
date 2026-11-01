@@ -155,7 +155,7 @@ impl RedisStore {
             .arg(millis(self.safety_ttl))
             .arg(millis(TOMBSTONE))
             .arg(encode_part(withdrawal.withdraw_run))
-            .arg(withdrawal.supersession)
+            .arg(withdrawal.superseded)
             .arg(chain)
             .arg(self.wait_flag());
         let reply = self.write(&scripts::CREATE_SCRIPT, &cmd).await?;
@@ -198,7 +198,7 @@ impl RedisStore {
             .arg(local_activity_task(producer))
             .arg(completed_arg(withdrawal))
             .arg(failed_list(withdrawal))
-            .arg(withdrawal.tasks.map_or(&[][..], |tasks| tasks.supersession))
+            .arg(withdrawal.tasks.map_or(&[][..], |tasks| tasks.superseded))
             .arg(batch.digest)
             .arg(self.wait_flag());
         for record in batch.records {
@@ -845,16 +845,16 @@ mod tests {
         let namespace = format!("ns-{}", std::process::id());
         let task = task_key(&Default::default());
         for (i, (task, failed)) in [("zz", "1"), (task.as_str(), "x")].into_iter().enumerate() {
-            let stream = StreamRef {
+            let handle = StreamHandle {
                 id: format!("s{i}"),
                 ..Default::default()
             };
             let none = Withdrawal::default();
             store
-                .create(&namespace, &stream, None, Owner::Client, &none)
+                .create(&namespace, &handle, None, Owner::Client, &none)
                 .await
                 .unwrap();
-            let keys = store.keys(&namespace, &stream.id);
+            let keys = store.keys(&namespace, &handle.id);
             let mut shared = store.shared.clone();
             let set: RedisResult<()> = redis::cmd("HSET")
                 .arg(keys.meta())

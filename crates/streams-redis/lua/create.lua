@@ -2,7 +2,7 @@
 -- owner or is closed.
 --
 -- ARGV: format version, Retention ms, owner (`wf` or `client`), safety TTL ms, Tombstone ms,
--- encoded withdrawn run, Supersession bytes, the owner's run chain as
+-- encoded withdrawn run, Superseded facts, the owner's run chain as
 -- `<workflow id>:<first run id>` with each part encoded (empty for a client), `1` when a `WAIT`
 -- follows.
 --
@@ -11,7 +11,7 @@
 local meta, log, producers = KEYS[1], KEYS[2], KEYS[3]
 local version, retention, owner = tonumber(ARGV[1]), ARGV[2], ARGV[3]
 local safety, tombstone = tonumber(ARGV[4]), tonumber(ARGV[5])
-local withdrawn_run, supersession = ARGV[6], ARGV[7]
+local withdrawn_run, superseded = ARGV[6], ARGV[7]
 local chain, wait = ARGV[8], ARGV[9]
 
 local now = now_ms()
@@ -42,7 +42,7 @@ end
 local flag = ''
 if withdraw_run(meta, withdrawn_run) then
   trim(meta, log, now)
-  local id = add(log, {'s', supersession})
+  local id = add(log, {'s', superseded})
   redis.call('HSET', meta, 'newest', id)
   refresh(meta, log, producers, now, safety, tombstone)
   flag = '1'

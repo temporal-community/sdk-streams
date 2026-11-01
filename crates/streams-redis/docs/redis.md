@@ -63,7 +63,7 @@ and failed tasks. Then the append withdraws the run's tasks in `oa` that never c
 
 - These are the tasks after the completed task and before the batch's task, the failed tasks, and
   the lower attempts of the batch's task and of the completed task.
-- One entry with only `s` withdraws them. Its `Supersession` is of the Workflow kind, with the
+- One entry with only `s` withdraws them. Its `StreamSuperseded` is of the Workflow kind, with the
   run's Workflow Producer, the batch's task, and the completed and failed tasks.
 - The append then drops the tasks at or before the completed task from `oa`, and adds the batch's
   task when the batch has Records.
