@@ -472,12 +472,41 @@ impl BlockingPool {
         }
     }
 
+    /// Waits until the Stream log at `key` has an entry after the entry id `after`, or `deadline`
+    /// passes. Returns whether an entry came. A read with no free connection, or one while the
+    /// cluster moves the key's slot, returns `false` early, and the caller reads the Stream again.
+    pub(crate) async fn wait_after(
+        &self,
+        key: &str,
+        after: &str,
+        deadline: Instant,
+    ) -> RedisResult<bool> {
+        let xread = |wait: Duration| {
+            let mut xread = redis::cmd("XREAD");
+            xread
+                .arg("COUNT")
+                .arg(1)
+                .arg("BLOCK")
+                // `BLOCK 0` waits with no end, so a read at its deadline blocks for 1 ms.
+                .arg(wait.as_millis().max(1))
+                .arg("STREAMS")
+                .arg(key)
+                .arg(after);
+            xread
+        };
+        let reply = self.query(key, deadline, xread).await?;
+        Ok(
+            matches!(reply, Some(Value::Array(ref keys)) if !keys.is_empty())
+                || matches!(reply, Some(Value::Map(ref keys)) if !keys.is_empty()),
+        )
+    }
+
     /// Runs the command that `cmd` builds for the time left to `deadline`, on a dedicated
     /// connection to the node that holds `key`. The time left can be zero.
     ///
     /// Returns `None` when no connection became free before `deadline` or within [PERMIT_WAIT], or
     /// when the cluster moves the key's slot. The caller treats it as a wait in which nothing came.
-    pub(crate) async fn query(
+    async fn query(
         &self,
         key: &str,
         deadline: Instant,

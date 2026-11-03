@@ -327,36 +327,16 @@ impl Store for RedisStore {
         deadline: Instant,
     ) -> StreamResult<bool> {
         let keys = self.keys(namespace, stream_id);
-        if deadline <= Instant::now() {
-            return Ok(false);
-        }
         let after = if after > 0 {
             entry_id_of_offset(after)
         } else {
             "0-0".to_string()
         };
-        let xread = |wait: Duration| {
-            let mut xread = redis::cmd("XREAD");
-            xread
-                .arg("COUNT")
-                .arg(1)
-                .arg("BLOCK")
-                // `BLOCK 0` waits with no end, so a read at its deadline blocks for 1 ms.
-                .arg(wait.as_millis().max(1))
-                .arg("STREAMS")
-                .arg(keys.log())
-                .arg(&after);
-            xread
-        };
-        let reply = self
+        Ok(self
             .blocking
-            .query(&keys.log(), deadline, xread)
+            .wait_after(&keys.log(), &after, deadline)
             .await
-            .map_err(RedisStoreError::from)?;
-        Ok(
-            matches!(reply, Some(Value::Array(ref keys)) if !keys.is_empty())
-                || matches!(reply, Some(Value::Map(ref keys)) if !keys.is_empty()),
-        )
+            .map_err(RedisStoreError::from)?)
     }
 }
 
