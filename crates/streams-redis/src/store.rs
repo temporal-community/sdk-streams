@@ -4,111 +4,26 @@
 mod conn;
 mod scripts;
 
-use crate::{RedisStoreError, RedisStoreResult};
+use crate::{KeyPrefix, RedisStoreError, RedisStoreOptions, RedisStoreResult};
 use conn::{BlockingPool, Endpoint, SharedConnection, WaitPool};
 use redis::{Cmd, ErrorKind, RedisResult, Script, ServerErrorKind, Value};
-use std::{sync::Arc, time::Duration};
+use std::{num::NonZeroUsize, sync::Arc, time::Duration};
 use temporalio_streams::{
     StreamError, StreamResult,
     epoch::epoch_key,
-    ids::{StreamKeys, encode_part},
+    ids::StreamKeys,
     offset::{entry_id_of_offset, offset_of_entry_id},
     proto::{Producer, StreamHandle},
     store::{
-        Appended, Batch, Capabilities, Closed, CreateOutcome, Created, DEFAULT_RETENTION,
-        DEFAULT_SAFETY_TTL, Entry, FORMAT_VERSION, MAX_TTL, Owner, Store, StreamState, TOMBSTONE,
-        Withdrawal, owner_chain,
+        Appended, Batch, Capabilities, Closed, CreateOutcome, Created, Entry, FORMAT_VERSION,
+        MAX_TTL, Owner, Store, StreamState, TOMBSTONE, Withdrawal, owner_chain,
     },
 };
 use tokio::time::Instant;
 
-/// The Redis connection options and the Stream TTLs.
-#[derive(Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct RedisStoreOptions {
-    /// One `redis://` or `rediss://` URL, or the seed nodes of a cluster. Credentials and TLS
-    /// come from the URL.
-    pub urls: Vec<String>,
-    /// Whether `urls` are the seeds of a Redis Cluster.
-    pub cluster: bool,
-    /// The prefix of every key, so that Streams can share a Redis with other data. It has only
-    /// letters, digits, `-`, `.`, `_` and `~`.
-    pub key_prefix: String,
-    /// The Retention of a Stream whose create sets none.
-    pub retention: Duration,
-    /// How long an open Workflow-owned Stream stays after its last write.
-    pub safety_ttl: Duration,
-    /// How many blocking reads may wait on one node at once. Each has a connection of its own.
-    pub blocking_reads_per_node: usize,
-    /// How long a short call waits for its answer.
-    pub response_timeout: Duration,
-    /// How many replicas must have each create, append and close before it answers, with `WAIT`.
-    /// Zero sends none. A write that fewer replicas have in `wait_timeout` is a Store failure.
-    pub wait_replicas: usize,
-    /// How long a write waits for its replicas. It must be at most half of `response_timeout`.
-    pub wait_timeout: Duration,
-}
-
-impl RedisStoreOptions {
-    /// The defaults for one Redis at `url`.
-    pub fn new(url: impl Into<String>) -> Self {
-        Self {
-            urls: vec![url.into()],
-            ..Self::default()
-        }
-    }
-}
-
-/// The defaults with no URL. A Store needs at least one before it connects.
-impl Default for RedisStoreOptions {
-    fn default() -> Self {
-        Self {
-            urls: Vec::new(),
-            cluster: false,
-            key_prefix: temporalio_streams::ids::DEFAULT_KEY_PREFIX.to_string(),
-            retention: DEFAULT_RETENTION,
-            safety_ttl: DEFAULT_SAFETY_TTL,
-            blocking_reads_per_node: 256,
-            response_timeout: Duration::from_secs(5),
-            wait_replicas: 0,
-            wait_timeout: Duration::from_secs(1),
-        }
-    }
-}
-
-// The URLs can hold a password, so the debug form shows them with no user info.
-impl std::fmt::Debug for RedisStoreOptions {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let urls: Vec<String> = self.urls.iter().map(|url| without_user_info(url)).collect();
-        f.debug_struct("RedisStoreOptions")
-            .field("urls", &urls)
-            .field("cluster", &self.cluster)
-            .field("key_prefix", &self.key_prefix)
-            .field("retention", &self.retention)
-            .field("safety_ttl", &self.safety_ttl)
-            .field("blocking_reads_per_node", &self.blocking_reads_per_node)
-            .field("response_timeout", &self.response_timeout)
-            .field("wait_replicas", &self.wait_replicas)
-            .field("wait_timeout", &self.wait_timeout)
-            .finish()
-    }
-}
-
-/// The URL with `***` in place of its user and password, if it has them.
-fn without_user_info(url: &str) -> String {
-    let start = url.find("://").map_or(0, |scheme| scheme + 3);
-    let authority = url[start..]
-        .find('/')
-        .map_or(url.len(), |path| start + path);
-    match url[start..authority].rfind('@') {
-        Some(at) => format!("{}***{}", &url[..start], &url[start + at..]),
-        None => url.to_string(),
-    }
-}
-
 /// The replicas that each write waits for, for how long, and the connections of those writes.
 struct Wait {
-    replicas: usize,
+    replicas: NonZeroUsize,
     timeout: Duration,
     pool: WaitPool,
 }
@@ -119,7 +34,7 @@ pub struct RedisStore {
     shared: SharedConnection,
     wait: Option<Arc<Wait>>,
     blocking: Arc<BlockingPool>,
-    prefix: String,
+    prefix: KeyPrefix,
     retention: Duration,
     safety_ttl: Duration,
 }
@@ -145,11 +60,11 @@ impl RedisStore {
         let endpoint = Arc::new(endpoint);
         let shared = endpoint.open().await?;
         check_server(&shared).await?;
-        let wait = match options.wait_replicas {
-            0 => None,
-            replicas => Some(Arc::new(Wait {
-                replicas,
-                timeout: options.wait_timeout,
+        let wait = match options.wait {
+            None => None,
+            Some(wait) => Some(Arc::new(Wait {
+                replicas: wait.replicas,
+                timeout: wait.timeout,
                 pool: WaitPool::new(endpoint.open().await?, endpoint.clone()),
             })),
         };
@@ -165,7 +80,7 @@ impl RedisStore {
     }
 
     fn keys(&self, namespace: &str, stream_id: &str) -> StreamKeys {
-        StreamKeys::new(&self.prefix, namespace, stream_id)
+        StreamKeys::new(self.prefix.as_str(), namespace, stream_id)
     }
 
     /// Creates a Stream, or finds it. A Workflow-owned Stream stores its handle's run chain, which
@@ -522,7 +437,7 @@ fn script_cmd(name: &str, script: &Script, keys: &StreamKeys) -> Cmd {
 fn acknowledged(wait: &Wait, acked: Value) -> RedisStoreResult<()> {
     let acked: usize = redis::from_redis_value(acked.extract_error()?)
         .map_err(|error| bad_reply("WAIT", error))?;
-    if acked < wait.replicas {
+    if acked < wait.replicas.get() {
         return Err(RedisStoreError::storage(format!(
             "{acked} of {} replicas had the write after {:?}. A failover can lose it, and a retry \
              writes it once",
@@ -671,16 +586,6 @@ fn check_options(options: &RedisStoreOptions) -> RedisStoreResult<()> {
     if options.urls.is_empty() {
         return Err(RedisStoreError::invalid("The Redis Store needs a URL"));
     }
-    if options.key_prefix.is_empty() {
-        return Err(RedisStoreError::invalid("The key prefix must not be empty"));
-    }
-    // The keys hold the prefix percent-encoded, but the ACL key patterns of `docs/redis.md` name
-    // it as written, so a prefix that encoding changes could widen or miss a pattern.
-    if encode_part(&options.key_prefix) != options.key_prefix {
-        return Err(RedisStoreError::invalid(
-            "The key prefix must have only letters, digits, '-', '.', '_' and '~'",
-        ));
-    }
     let ttls = [options.retention, options.safety_ttl];
     if ttls.iter().any(|ttl| ttl.is_zero() || *ttl > MAX_TTL) {
         return Err(RedisStoreError::invalid(format!(
@@ -690,9 +595,8 @@ fn check_options(options: &RedisStoreOptions) -> RedisStoreResult<()> {
     }
     // A `WAIT` with a zero timeout waits for the replicas forever. The script and the round trip
     // need the other half of the response timeout, or too few replicas looks like a lost answer.
-    if options.wait_replicas > 0
-        && (options.wait_timeout.as_millis() == 0
-            || options.wait_timeout > options.response_timeout / 2)
+    if let Some(wait) = &options.wait
+        && (wait.timeout.as_millis() == 0 || wait.timeout > options.response_timeout / 2)
     {
         return Err(RedisStoreError::invalid(
             "The wait timeout must be at least 1 ms and at most half the response timeout",
@@ -790,43 +694,13 @@ mod tests {
     }
 
     #[test]
-    fn the_debug_form_hides_the_user_info_of_a_url() {
-        let options = RedisStoreOptions::new("rediss://user:p@ss@redis.example:6380/0");
-        let debug = format!("{options:?}");
-        assert!(
-            !debug.contains("user") && !debug.contains("p@ss"),
-            "{debug}"
-        );
-        assert!(
-            debug.contains("rediss://***@redis.example:6380/0"),
-            "{debug}"
-        );
-        assert_eq!(without_user_info("redis://h:1/0"), "redis://h:1/0");
-    }
-
-    #[test]
-    fn a_key_prefix_has_only_the_characters_that_encoding_keeps() {
-        let check = |prefix: &str| {
-            let mut options = RedisStoreOptions::new("redis://127.0.0.1:1");
-            options.key_prefix = prefix.to_string();
-            check_options(&options)
-        };
-        for prefix in ["app:streams", "app*", "app{x}", "app}", "a?", "a[b]", "a b"] {
-            assert!(
-                matches!(check(prefix), Err(RedisStoreError::Invalid(_))),
-                "{prefix}"
-            );
-        }
-        check("temporal-streams").unwrap();
-        check("App.streams_2~x").unwrap();
-    }
-
-    #[test]
     fn a_wait_timeout_must_leave_half_the_response_timeout() {
         let check = |timeout: Duration| {
             let mut options = RedisStoreOptions::new("redis://127.0.0.1:1");
-            options.wait_replicas = 1;
-            options.wait_timeout = timeout;
+            options.wait = Some(crate::WaitOptions {
+                replicas: NonZeroUsize::MIN,
+                timeout,
+            });
             check_options(&options)
         };
         for timeout in [Duration::ZERO, Duration::from_millis(2501)] {

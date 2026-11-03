@@ -9,7 +9,7 @@ pub(crate) use server::server_url;
 
 use prost::Message;
 use redis::AsyncCommands;
-use std::{sync::Arc, time::Duration};
+use std::{num::NonZeroUsize, sync::Arc, time::Duration};
 use temporalio_streams::{
     StreamRuntime,
     ids::StreamKeys,
@@ -17,7 +17,7 @@ use temporalio_streams::{
     testing::{Needs, RawKeys, TestBackend},
 };
 use temporalio_streams_redis::{
-    RedisStore, RedisStoreOptions, RedisStreamRuntime, proto::RedisStreamConfig,
+    RedisStore, RedisStoreOptions, RedisStreamRuntime, WaitOptions, proto::RedisStreamConfig,
 };
 
 /// The key prefix of the tests, so that they never touch other data on the server.
@@ -76,9 +76,11 @@ impl RedisBackend {
     fn options(&self) -> RedisStoreOptions {
         let mut options = RedisStoreOptions::new(self.url.clone());
         options.cluster = self.cluster;
-        options.key_prefix = PREFIX.to_string();
-        options.wait_replicas = self.wait_replicas;
-        options.wait_timeout = WAIT_TIMEOUT;
+        options.key_prefix = PREFIX.parse().unwrap();
+        options.wait = NonZeroUsize::new(self.wait_replicas).map(|replicas| WaitOptions {
+            replicas,
+            timeout: WAIT_TIMEOUT,
+        });
         options
     }
 }

@@ -4,7 +4,10 @@
 mod support;
 
 use prost::Message;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{
+    num::NonZeroUsize,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 use support::server_url;
 use temporalio_common::protos::temporal::api::common::v1::Payload;
 use temporalio_streams::{
@@ -17,7 +20,7 @@ use temporalio_streams::{
     },
     store::{Batch, Owner, Store, Withdrawal},
 };
-use temporalio_streams_redis::{RedisStore, RedisStoreOptions};
+use temporalio_streams_redis::{RedisStore, RedisStoreOptions, WaitOptions};
 
 const PREFIX: &str = "streams-acl";
 
@@ -78,7 +81,7 @@ async fn store(url: String) -> Box<dyn Store> {
 }
 
 async fn store_with(mut options: RedisStoreOptions) -> Box<dyn Store> {
-    options.key_prefix = PREFIX.to_string();
+    options.key_prefix = PREFIX.parse().unwrap();
     Box::new(RedisStore::connect(options).await.unwrap())
 }
 
@@ -261,8 +264,10 @@ async fn the_documented_commands_run_every_call_of_each_role() {
     // With `+wait`, too few replicas is a Store failure, not a refusal.
     let mut options =
         RedisStoreOptions::new(user(&url, &producer_name, &namespace, PRODUCER).await);
-    options.wait_replicas = 16;
-    options.wait_timeout = Duration::from_millis(50);
+    options.wait = Some(WaitOptions {
+        replicas: NonZeroUsize::new(16).unwrap(),
+        timeout: Duration::from_millis(50),
+    });
     let waits = store_with(options).await;
     let failed = waits
         .create(
@@ -416,7 +421,7 @@ async fn the_documented_commands_serve_a_cluster_while_a_slot_moves() {
     let connect = |name: &str| {
         let mut options = RedisStoreOptions::new(login(&url, name));
         options.cluster = true;
-        options.key_prefix = PREFIX.to_string();
+        options.key_prefix = PREFIX.parse().unwrap();
         RedisStore::connect(options)
     };
     let producer = connect(&producer_name).await.unwrap();

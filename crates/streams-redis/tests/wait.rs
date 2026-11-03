@@ -3,14 +3,14 @@
 
 mod support;
 
-use std::time::Duration;
+use std::{num::NonZeroUsize, time::Duration};
 use support::server_url;
 use temporalio_streams::{
     Reason, StreamError,
     proto::{Producer, ProducerEpoch, StreamHandle, StreamProducerKind},
     store::{Batch, CreateOutcome, Owner, Withdrawal},
 };
-use temporalio_streams_redis::{RedisStore, RedisStoreOptions};
+use temporalio_streams_redis::{RedisStore, RedisStoreOptions, WaitOptions};
 
 const PREFIX: &str = "streams-wait";
 
@@ -25,9 +25,9 @@ const LONG: Duration = Duration::from_secs(1);
 async fn store(url: &str, cluster: bool, wait_replicas: usize, timeout: Duration) -> RedisStore {
     let mut options = RedisStoreOptions::new(url);
     options.cluster = cluster;
-    options.key_prefix = PREFIX.to_string();
-    options.wait_replicas = wait_replicas;
-    options.wait_timeout = timeout;
+    options.key_prefix = PREFIX.parse().unwrap();
+    options.wait =
+        NonZeroUsize::new(wait_replicas).map(|replicas| WaitOptions { replicas, timeout });
     RedisStore::connect(options).await.unwrap()
 }
 
@@ -255,10 +255,12 @@ async fn writes_wait_for_their_replicas_at_once() {
     };
     // No test server has this many replicas, so each `WAIT` blocks until the case unblocks it.
     let mut options = RedisStoreOptions::new(&url);
-    options.key_prefix = PREFIX.to_string();
-    options.wait_replicas = 16;
+    options.key_prefix = PREFIX.parse().unwrap();
     options.response_timeout = Duration::from_secs(60);
-    options.wait_timeout = Duration::from_secs(30);
+    options.wait = Some(WaitOptions {
+        replicas: NonZeroUsize::new(16).unwrap(),
+        timeout: Duration::from_secs(30),
+    });
     let waits = RedisStore::connect(options).await.unwrap();
     let namespace = unique("ns");
     // A write that finds no script runs its `WAIT` twice, so load the script first.

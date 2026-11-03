@@ -1,10 +1,11 @@
 //! The Stream runtime on Redis.
 
 use crate::{
-    RedisStore, RedisStoreError, RedisStoreOptions, RedisStoreResult, proto::RedisStreamConfig,
+    KeyPrefix, RedisStore, RedisStoreError, RedisStoreOptions, RedisStoreResult, WaitOptions,
+    proto::RedisStreamConfig,
 };
 use prost::Message;
-use std::{sync::Arc, time::Duration};
+use std::{num::NonZeroUsize, sync::Arc, time::Duration};
 use temporalio_common::telemetry::metrics::TemporalMeter;
 use temporalio_streams::{StoreFactory, StreamResult, StreamRuntime, store::Store};
 
@@ -32,12 +33,22 @@ impl TryFrom<RedisStreamConfig> for RuntimeOptions {
             ));
         }
         let defaults = RedisStoreOptions::default();
+        let wait = match count("wait_replicas", config.wait_replicas)? {
+            None => None,
+            Some(replicas) => Some(WaitOptions {
+                replicas,
+                timeout: duration("wait_timeout", config.wait_timeout)?
+                    .unwrap_or(WaitOptions::DEFAULT_TIMEOUT),
+            }),
+        };
+        let key_prefix = match config.key_prefix.as_str() {
+            "" => defaults.key_prefix,
+            _ => KeyPrefix::try_from(config.key_prefix)?,
+        };
         let store = RedisStoreOptions {
             urls: config.urls,
             cluster: config.cluster,
-            key_prefix: Some(config.key_prefix)
-                .filter(|prefix| !prefix.is_empty())
-                .unwrap_or(defaults.key_prefix),
+            key_prefix,
             retention: duration("retention", config.retention)?.unwrap_or(defaults.retention),
             safety_ttl: duration("safety_ttl", config.safety_ttl)?.unwrap_or(defaults.safety_ttl),
             blocking_reads_per_node: count(
@@ -47,10 +58,7 @@ impl TryFrom<RedisStreamConfig> for RuntimeOptions {
             .unwrap_or(defaults.blocking_reads_per_node),
             response_timeout: duration("response_timeout", config.response_timeout)?
                 .unwrap_or(defaults.response_timeout),
-            wait_replicas: count("wait_replicas", config.wait_replicas)?
-                .unwrap_or(defaults.wait_replicas),
-            wait_timeout: duration("wait_timeout", config.wait_timeout)?
-                .unwrap_or(defaults.wait_timeout),
+            wait,
         };
         Ok(Self {
             store,
@@ -73,10 +81,10 @@ fn duration(
     Ok((!duration.is_zero()).then_some(duration))
 }
 
-fn count(field: &str, value: i32) -> RedisStoreResult<Option<usize>> {
+fn count(field: &str, value: i32) -> RedisStoreResult<Option<NonZeroUsize>> {
     let count = usize::try_from(value)
         .map_err(|_| RedisStoreError::invalid(format!("The config's {field} is negative")))?;
-    Ok((count > 0).then_some(count))
+    Ok(NonZeroUsize::new(count))
 }
 
 /// Connects to Redis on the runtime's first call that needs Redis.
@@ -144,8 +152,11 @@ mod tests {
         })
         .unwrap();
         assert_eq!(
-            (waits.store.wait_replicas, waits.store.wait_timeout),
-            (2, Duration::from_millis(250))
+            waits.store.wait,
+            Some(WaitOptions {
+                replicas: NonZeroUsize::new(2).unwrap(),
+                timeout: Duration::from_millis(250),
+            })
         );
         let negative = RuntimeOptions::try_from(RedisStreamConfig {
             urls: vec!["redis://x:1".to_string()],

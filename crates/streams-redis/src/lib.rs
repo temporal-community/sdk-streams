@@ -8,6 +8,7 @@
 //! describes.
 
 mod error;
+mod options;
 mod protos;
 mod runtime;
 mod store;
@@ -17,8 +18,9 @@ mod server {
 }
 
 pub use error::{RedisStoreError, RedisStoreResult};
+pub use options::{KeyPrefix, RedisStoreOptions, WaitOptions};
 pub use runtime::{REDIS_RUNTIME_NAME, RedisStreamRuntime, RuntimeOptions};
-pub use store::{RedisStore, RedisStoreOptions};
+pub use store::RedisStore;
 
 /// The config that lang builds for the Redis runtime.
 pub mod proto {

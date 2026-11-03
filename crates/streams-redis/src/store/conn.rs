@@ -19,6 +19,7 @@ use redis::{
 use std::{
     collections::HashMap,
     future::Future,
+    num::NonZeroUsize,
     str::FromStr,
     sync::{Arc, Mutex},
     time::Duration,
@@ -37,7 +38,10 @@ const PERMIT_WAIT: Duration = Duration::from_secs(1);
 const RESHARD_WAIT: Duration = Duration::from_millis(100);
 
 /// The most writes with `WAIT` that one Store runs at once, so its connections per node stay few.
-const WAIT_CONNECTIONS: usize = 8;
+const WAIT_CONNECTIONS: NonZeroUsize = match NonZeroUsize::new(8) {
+    Some(count) => count,
+    None => panic!("the count is above zero"),
+};
 
 /// Where the Store's Redis is, parsed once from the URLs of the options.
 pub(crate) struct Endpoint {
@@ -207,9 +211,9 @@ struct Pool<C> {
 }
 
 impl<C> Pool<C> {
-    fn new(size: usize, idle: Vec<C>) -> Self {
+    fn new(size: NonZeroUsize, idle: Vec<C>) -> Self {
         Self {
-            permits: Arc::new(Semaphore::new(size.max(1))),
+            permits: Arc::new(Semaphore::new(size.get())),
             idle: Arc::new(Mutex::new(idle)),
         }
     }
@@ -448,7 +452,7 @@ fn classify(error: &RedisError, attempt: Attempt) -> Step {
 /// Dedicated connections for blocking reads, a bounded number per node.
 pub(crate) struct BlockingPool {
     endpoint: Arc<Endpoint>,
-    per_node: usize,
+    per_node: NonZeroUsize,
     nodes: Mutex<HashMap<Node, Arc<NodePool>>>,
     slots: SlotCache,
 }
@@ -459,7 +463,7 @@ struct NodePool {
 }
 
 impl BlockingPool {
-    pub(crate) fn new(endpoint: Arc<Endpoint>, per_node: usize) -> Self {
+    pub(crate) fn new(endpoint: Arc<Endpoint>, per_node: NonZeroUsize) -> Self {
         Self {
             endpoint,
             per_node,
@@ -743,7 +747,7 @@ mod tests {
         };
         // A standalone server answers every slot, so the seed serves the read once the dead
         // node is dropped.
-        let pool = BlockingPool::new(endpoint(&[&url], true), 1);
+        let pool = BlockingPool::new(endpoint(&[&url], true), NonZeroUsize::MIN);
         let key = "test:{dead-node}:log";
         pool.slots.learn(slot(key), node("127.0.0.1", dead_port()));
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -785,7 +789,7 @@ mod tests {
     // jump past a connect.
     #[tokio::test]
     async fn the_block_time_starts_when_the_read_has_a_connection() {
-        let pool = BlockingPool::new(endpoint(&[&nil_server()], false), 1);
+        let pool = BlockingPool::new(endpoint(&[&nil_server()], false), NonZeroUsize::MIN);
         let seed = Node::of(pool.endpoint.first());
         let held = pool
             .lease(&seed, Instant::now() + Duration::from_secs(1))
@@ -811,7 +815,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_read_with_no_free_connection_ends_after_the_permit_wait() {
-        let pool = BlockingPool::new(endpoint(&[&nil_server()], false), 1);
+        let pool = BlockingPool::new(endpoint(&[&nil_server()], false), NonZeroUsize::MIN);
         let seed = Node::of(pool.endpoint.first());
         let deadline = || Instant::now() + Duration::from_secs(10);
         let _held = pool.lease(&seed, deadline()).await.unwrap().unwrap();
@@ -835,7 +839,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_lease_gives_its_connection_back_only_after_a_whole_reply() {
-        let pool = Pool::new(1, Vec::new());
+        let pool = Pool::new(NonZeroUsize::MIN, Vec::new());
         // A server error is a whole reply.
         let first = lease(&pool, 1).await;
         assert!(first.settle::<()>(Err(reply("ERR no"))).is_err());
@@ -857,7 +861,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_dead_reused_connection_closes_the_idle_ones_but_a_slow_one_does_not() {
-        let pool = Pool::new(3, vec![1, 2, 3]);
+        let pool = Pool::new(NonZeroUsize::new(3).unwrap(), vec![1, 2, 3]);
         let slow = lease(&pool, 0).await;
         assert!(
             slow.settle::<()>(Err(io(std::io::ErrorKind::TimedOut)))
@@ -875,7 +879,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_lease_gives_up_only_when_no_connection_is_free() {
-        let pool = Pool::new(1, Vec::new());
+        let pool = Pool::new(NonZeroUsize::MIN, Vec::new());
         let give_up = || std::future::ready(());
         let open = || async { Ok(1) };
         let held = pool.lease(give_up(), open).await.unwrap();

@@ -11,7 +11,8 @@ the runtime with `RedisStreamRuntime`, which connects on its first call that nee
 Lang sends the options as a `RedisStreamConfig`, from
 `crates/streams-redis/protos/temporal/sdk/streams/v1/redis.proto`. Rust code can call
 `RedisStore::connect` with `RedisStoreOptions`. The Store needs Redis 7.0 or later. These are the
-main options.
+main fields of the config. `RedisStoreOptions` has the same ones, but holds the two `wait_` fields
+as `wait: Option<WaitOptions>`, and a zero count there is not possible.
 
 | Option | Default | Use |
 |---|---|---|
