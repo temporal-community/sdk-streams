@@ -40,7 +40,7 @@ redis = { version = "1.7", default-features = false, features = [
 temporalio-common = { workspace = true }
 temporalio-streams = { workspace = true }
 thiserror = "2"
-tokio = { version = "1.47", default-features = false, features = ["rt", "sync", "time"] }
+tokio = { version = "1.47", default-features = false, features = ["macros", "rt", "sync", "time"] }
 tracing = "0.1"
 
 [build-dependencies]
@@ -48,7 +48,7 @@ tonic-prost-build = { workspace = true }
 
 [dev-dependencies]
 temporalio-streams = { workspace = true, features = ["test-support"] }
-tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "time"] }
+tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "test-util", "time"] }
 
 [lints]
 workspace = true

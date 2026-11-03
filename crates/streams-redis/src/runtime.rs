@@ -13,6 +13,7 @@ pub const REDIS_RUNTIME_NAME: &str = "temporalio-streams-redis";
 
 /// The options of a Stream runtime on Redis.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RuntimeOptions {
     /// How to connect to Redis.
     pub store: RedisStoreOptions,
@@ -20,38 +21,37 @@ pub struct RuntimeOptions {
     pub backend: String,
 }
 
-impl RuntimeOptions {
-    /// The options from the backend's config message.
-    pub fn from_config(config: RedisStreamConfig) -> RedisStoreResult<Self> {
-        let Some(seed) = config.urls.first() else {
+/// The options from the backend's config message. An unset or zero field keeps its default.
+impl TryFrom<RedisStreamConfig> for RuntimeOptions {
+    type Error = RedisStoreError;
+
+    fn try_from(config: RedisStreamConfig) -> RedisStoreResult<Self> {
+        if config.urls.is_empty() {
             return Err(RedisStoreError::invalid(
                 "The Redis Stream backend needs a URL",
             ));
+        }
+        let defaults = RedisStoreOptions::default();
+        let store = RedisStoreOptions {
+            urls: config.urls,
+            cluster: config.cluster,
+            key_prefix: Some(config.key_prefix)
+                .filter(|prefix| !prefix.is_empty())
+                .unwrap_or(defaults.key_prefix),
+            retention: duration("retention", config.retention)?.unwrap_or(defaults.retention),
+            safety_ttl: duration("safety_ttl", config.safety_ttl)?.unwrap_or(defaults.safety_ttl),
+            blocking_reads_per_node: count(
+                "blocking_reads_per_node",
+                config.blocking_reads_per_node,
+            )?
+            .unwrap_or(defaults.blocking_reads_per_node),
+            response_timeout: duration("response_timeout", config.response_timeout)?
+                .unwrap_or(defaults.response_timeout),
+            wait_replicas: count("wait_replicas", config.wait_replicas)?
+                .unwrap_or(defaults.wait_replicas),
+            wait_timeout: duration("wait_timeout", config.wait_timeout)?
+                .unwrap_or(defaults.wait_timeout),
         };
-        let mut store = RedisStoreOptions::new(seed.clone());
-        store.urls = config.urls;
-        store.cluster = config.cluster;
-        if !config.key_prefix.is_empty() {
-            store.key_prefix = config.key_prefix;
-        }
-        if let Some(retention) = duration(config.retention) {
-            store.retention = retention;
-        }
-        if let Some(safety_ttl) = duration(config.safety_ttl) {
-            store.safety_ttl = safety_ttl;
-        }
-        if config.blocking_reads_per_node > 0 {
-            store.blocking_reads_per_node = config.blocking_reads_per_node as usize;
-        }
-        if let Some(timeout) = duration(config.response_timeout) {
-            store.response_timeout = timeout;
-        }
-        if config.wait_replicas > 0 {
-            store.wait_replicas = config.wait_replicas as usize;
-        }
-        if let Some(timeout) = duration(config.wait_timeout) {
-            store.wait_timeout = timeout;
-        }
         Ok(Self {
             store,
             backend: config.backend,
@@ -59,10 +59,24 @@ impl RuntimeOptions {
     }
 }
 
-fn duration(value: Option<prost_types::Duration>) -> Option<Duration> {
-    let value = value?;
-    let duration = Duration::new(value.seconds.max(0) as u64, value.nanos.max(0) as u32);
-    (!duration.is_zero()).then_some(duration)
+// Proto3 can't tell an unset number from zero, so zero keeps the default. A negative value is
+// a bad config.
+fn duration(
+    field: &str,
+    value: Option<prost_types::Duration>,
+) -> RedisStoreResult<Option<Duration>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let duration = Duration::try_from(value)
+        .map_err(|_| RedisStoreError::invalid(format!("The config's {field} is negative")))?;
+    Ok((!duration.is_zero()).then_some(duration))
+}
+
+fn count(field: &str, value: i32) -> RedisStoreResult<Option<usize>> {
+    let count = usize::try_from(value)
+        .map_err(|_| RedisStoreError::invalid(format!("The config's {field} is negative")))?;
+    Ok((count > 0).then_some(count))
 }
 
 /// Connects to Redis on the runtime's first call that needs Redis.
@@ -100,7 +114,7 @@ impl RedisStreamRuntime {
     ) -> RedisStoreResult<Arc<StreamRuntime>> {
         let config = RedisStreamConfig::decode(config)
             .map_err(|error| RedisStoreError::invalid(format!("The config is bad: {error}")))?;
-        Ok(Self::create(RuntimeOptions::from_config(config)?, meter))
+        Ok(Self::create(RuntimeOptions::try_from(config)?, meter))
     }
 }
 
@@ -110,7 +124,7 @@ mod tests {
 
     #[test]
     fn the_config_fills_the_defaults() {
-        let options = RuntimeOptions::from_config(RedisStreamConfig {
+        let options = RuntimeOptions::try_from(RedisStreamConfig {
             urls: vec!["redis://x:1".to_string()],
             backend: "redis-a".to_string(),
             ..Default::default()
@@ -118,8 +132,8 @@ mod tests {
         .unwrap();
         assert_eq!(options.backend, "redis-a");
         assert_eq!(options.store, RedisStoreOptions::new("redis://x:1"));
-        assert!(RuntimeOptions::from_config(RedisStreamConfig::default()).is_err());
-        let waits = RuntimeOptions::from_config(RedisStreamConfig {
+        assert!(RuntimeOptions::try_from(RedisStreamConfig::default()).is_err());
+        let waits = RuntimeOptions::try_from(RedisStreamConfig {
             urls: vec!["redis://x:1".to_string()],
             wait_replicas: 2,
             wait_timeout: Some(prost_types::Duration {
@@ -133,5 +147,14 @@ mod tests {
             (waits.store.wait_replicas, waits.store.wait_timeout),
             (2, Duration::from_millis(250))
         );
+        let negative = RuntimeOptions::try_from(RedisStreamConfig {
+            urls: vec!["redis://x:1".to_string()],
+            retention: Some(prost_types::Duration {
+                seconds: -1,
+                nanos: 0,
+            }),
+            ..Default::default()
+        });
+        assert!(matches!(negative, Err(RedisStoreError::Invalid(_))));
     }
 }

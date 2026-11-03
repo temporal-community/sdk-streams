@@ -1,7 +1,7 @@
 //! The errors of the Redis Store. Each one becomes a Stream error at the `Store` trait, with the
 //! reason that lang turns into an error class, so a caller gets the same classes on every backend.
 
-use redis::RedisError;
+use redis::{ErrorKind, RedisError, ServerErrorKind};
 use temporalio_streams::{Reason, StreamError};
 
 /// An error of the Redis Store or of its runtime.
@@ -51,6 +51,20 @@ impl From<RedisStoreError> for StreamError {
 /// that a retry can't fix is invalid, and any other failure is a Store failure that may be retried.
 fn from_redis(error: &RedisError) -> StreamError {
     let detail = error.detail().unwrap_or_default().to_string();
+    // A bad URL or bad credentials stay wrong on a retry. redis-rs names some server codes as
+    // kinds, and the rest stay strings below.
+    match error.kind() {
+        ErrorKind::InvalidClientConfig | ErrorKind::AuthenticationFailed => {
+            return StreamError::invalid(format!("The Redis config is wrong: {error}"));
+        }
+        ErrorKind::Server(ServerErrorKind::NoPerm | ServerErrorKind::NoScript) => {
+            let code = error.code().unwrap_or_default();
+            return StreamError::invalid(format!(
+                "Redis refused the call for good: {code} {detail}"
+            ));
+        }
+        _ => {}
+    }
     let reason = match error.code() {
         Some("STREAM_NOT_FOUND") => Reason::NotFound,
         Some("STREAM_EXPIRED") => Reason::Expired,
@@ -62,7 +76,7 @@ fn from_redis(error: &RedisError) -> StreamError {
         Some("STREAM_FORMAT_TOO_NEW") => Reason::FormatTooNew,
         Some("STREAM_INVALID") => Reason::Invalid,
         Some("STREAM_STORAGE") => Reason::Storage,
-        Some(code @ ("NOPERM" | "WRONGTYPE" | "NOSCRIPT" | "NOAUTH" | "WRONGPASS")) => {
+        Some(code @ ("WRONGTYPE" | "NOAUTH" | "WRONGPASS")) => {
             return StreamError::invalid(format!(
                 "Redis refused the call for good: {code} {detail}"
             ));
@@ -136,5 +150,10 @@ mod tests {
         }
         let other = server("ERR", "max number of clients reached");
         assert_eq!(other.reason, Reason::Storage);
+        let url = RedisError::from((ErrorKind::InvalidClientConfig, "Redis URL did not parse"));
+        assert_eq!(
+            StreamError::from(RedisStoreError::from(url)).reason,
+            Reason::Invalid
+        );
     }
 }

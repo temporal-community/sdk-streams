@@ -23,7 +23,8 @@ use temporalio_streams::{
 use tokio::time::Instant;
 
 /// The Redis connection options and the Stream TTLs.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RedisStoreOptions {
     /// One `redis://` or `rediss://` URL, or the seed nodes of a cluster. Credentials and TLS
     /// come from the URL.
@@ -53,6 +54,16 @@ impl RedisStoreOptions {
     pub fn new(url: impl Into<String>) -> Self {
         Self {
             urls: vec![url.into()],
+            ..Self::default()
+        }
+    }
+}
+
+/// The defaults with no URL. A Store needs at least one before it connects.
+impl Default for RedisStoreOptions {
+    fn default() -> Self {
+        Self {
+            urls: Vec::new(),
             cluster: false,
             key_prefix: temporalio_streams::ids::DEFAULT_KEY_PREFIX.to_string(),
             retention: DEFAULT_RETENTION,
@@ -62,6 +73,36 @@ impl RedisStoreOptions {
             wait_replicas: 0,
             wait_timeout: Duration::from_secs(1),
         }
+    }
+}
+
+// The URLs can hold a password, so the debug form shows them with no user info.
+impl std::fmt::Debug for RedisStoreOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let urls: Vec<String> = self.urls.iter().map(|url| without_user_info(url)).collect();
+        f.debug_struct("RedisStoreOptions")
+            .field("urls", &urls)
+            .field("cluster", &self.cluster)
+            .field("key_prefix", &self.key_prefix)
+            .field("retention", &self.retention)
+            .field("safety_ttl", &self.safety_ttl)
+            .field("blocking_reads_per_node", &self.blocking_reads_per_node)
+            .field("response_timeout", &self.response_timeout)
+            .field("wait_replicas", &self.wait_replicas)
+            .field("wait_timeout", &self.wait_timeout)
+            .finish()
+    }
+}
+
+/// The URL with `***` in place of its user and password, if it has them.
+fn without_user_info(url: &str) -> String {
+    let start = url.find("://").map_or(0, |scheme| scheme + 3);
+    let authority = url[start..]
+        .find('/')
+        .map_or(url.len(), |path| start + path);
+    match url[start..authority].rfind('@') {
+        Some(at) => format!("{}***{}", &url[..start], &url[start + at..]),
+        None => url.to_string(),
     }
 }
 
@@ -93,19 +134,15 @@ impl std::fmt::Debug for RedisStore {
     }
 }
 
-fn millis(duration: Duration) -> u64 {
-    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
-}
-
 impl RedisStore {
     /// Connects to Redis and checks that it is Redis 7.0 or later.
     pub async fn connect(options: RedisStoreOptions) -> RedisStoreResult<Self> {
         check_options(&options)?;
-        let endpoint = Arc::new(Endpoint::parse(
-            &options.urls,
-            options.cluster,
-            options.response_timeout,
-        )?);
+        let endpoint = Endpoint::parse(&options.urls, options.cluster, options.response_timeout)
+            .map_err(|error| {
+                RedisStoreError::invalid(format!("The Redis URLs are wrong: {error}"))
+            })?;
+        let endpoint = Arc::new(endpoint);
         let shared = endpoint.open().await?;
         check_server(&shared).await?;
         let wait = match options.wait_replicas {
@@ -150,14 +187,14 @@ impl RedisStore {
         };
         let mut cmd = script_cmd("EVALSHA", &scripts::CREATE_SCRIPT, &keys);
         cmd.arg(FORMAT_VERSION)
-            .arg(millis(retention))
+            .arg(retention.as_millis())
             .arg(owner)
-            .arg(millis(self.safety_ttl))
-            .arg(millis(TOMBSTONE))
+            .arg(self.safety_ttl.as_millis())
+            .arg(TOMBSTONE.as_millis())
             .arg(encode_part(withdrawal.withdraw_run))
             .arg(withdrawal.superseded)
             .arg(chain)
-            .arg(self.wait_flag());
+            .arg(self.waits());
         let reply = self.write(&scripts::CREATE_SCRIPT, &cmd).await?;
         let [outcome, stored, flag] = strings::<3>(reply, "create")?;
         let outcome = match outcome.as_str() {
@@ -193,26 +230,31 @@ impl RedisStore {
             .arg(batch.sequence)
             .arg(encode_part(withdrawal.withdraw_run))
             .arg(withdrawal.superseded)
-            .arg(millis(self.safety_ttl))
-            .arg(millis(TOMBSTONE))
+            .arg(self.safety_ttl.as_millis())
+            .arg(TOMBSTONE.as_millis())
             .arg(local_activity_task(producer))
             .arg(completed_arg(withdrawal))
             .arg(failed_list(withdrawal))
             .arg(withdrawal.tasks.map_or(&[][..], |tasks| tasks.superseded))
             .arg(batch.digest)
-            .arg(self.wait_flag());
+            .arg(self.waits());
         for record in batch.records {
             cmd.arg(record.as_slice());
         }
         let reply = self.write(&scripts::APPEND_SCRIPT, &cmd).await?;
         let [outcome, first, last, flag] = strings::<4>(reply, "append")?;
+        let resend = match outcome.as_str() {
+            "ok" => false,
+            "resend" => true,
+            other => return Err(bad_reply("append", other)),
+        };
         let offsets = match (first.as_str(), last.as_str()) {
             ("", _) | (_, "") => None,
             (first, last) => Some((offset_of_entry_id(first)?, offset_of_entry_id(last)?)),
         };
         Ok(Appended {
             offsets,
-            resend: outcome == "resend",
+            resend,
             flagged: flag == "1",
         })
     }
@@ -234,15 +276,20 @@ impl RedisStore {
             .arg(&producer.id)
             .arg(encode_part(&producer.run_id))
             .arg(epoch_key(&epoch))
-            .arg(millis(TOMBSTONE))
+            .arg(TOMBSTONE.as_millis())
             .arg(record)
             .arg(owner_chain(handle))
-            .arg(self.wait_flag());
+            .arg(self.waits());
         let reply = self.write(&scripts::CLOSE_SCRIPT, &cmd).await?;
         let [outcome, id] = strings::<2>(reply, "close")?;
+        let already = match outcome.as_str() {
+            "closed" => false,
+            "already" => true,
+            other => return Err(bad_reply("close", other)),
+        };
         Ok(Closed {
             offset: offset_of_entry_id(&id)?,
-            already: outcome == "already",
+            already,
         })
     }
 
@@ -287,20 +334,16 @@ impl RedisStore {
             ));
         };
         let reply = Self::write_and_wait(wait, script, cmd, lease.conn()).await;
-        // After a transport error the `WAIT` can still block the connection, so only a write that
-        // got its answers gives it back.
-        if reply.is_ok() {
-            lease.keep();
-        }
-        reply?
+        lease.settle(reply)?
     }
 
-    /// The script argument that tells a write whether a `WAIT` follows it.
-    fn wait_flag(&self) -> &'static str {
-        if self.wait.is_some() { "1" } else { "" }
+    /// Whether a `WAIT` follows each write. The write scripts take it as their last argument.
+    fn waits(&self) -> bool {
+        self.wait.is_some()
     }
 
-    /// The outer error is a transport error, and the inner one is the server's answer.
+    /// The outer error comes from the connection, or from a script load that Redis refused. The
+    /// inner one is the server's answer to the write.
     async fn write_and_wait(
         wait: &Wait,
         script: &Script,
@@ -312,7 +355,7 @@ impl RedisStore {
             .add_command(cmd.clone())
             .cmd("WAIT")
             .arg(wait.replicas)
-            .arg(millis(wait.timeout));
+            .arg(wait.timeout.as_millis());
         let mut loaded = false;
         loop {
             let replies: Vec<Value> = pipe.query_async(conn).await?;
@@ -377,7 +420,8 @@ impl RedisStore {
                 .arg("COUNT")
                 .arg(1)
                 .arg("BLOCK")
-                .arg(millis(wait).max(1))
+                // `BLOCK 0` waits with no end, so a read at its deadline blocks for 1 ms.
+                .arg(wait.as_millis().max(1))
                 .arg("STREAMS")
                 .arg(keys.log())
                 .arg(&after);
@@ -563,18 +607,19 @@ fn strings<const N: usize>(reply: Value, call: &str) -> RedisStoreResult<[String
 }
 
 fn read_reply(reply: Value) -> RedisStoreResult<(StreamState, Vec<Entry>)> {
-    let Value::Array(mut parts) = reply else {
+    let Value::Array(parts) = reply else {
         return Err(bad_reply("read", reply));
     };
-    if parts.len() != 3 {
-        return Err(bad_reply("read", parts));
-    }
-    let entries = parts.pop().expect("three parts");
-    let time = parts.pop().expect("three parts");
-    let meta = parts.pop().expect("three parts");
-    let Value::Array(meta) = meta else {
-        return Err(bad_reply("read", meta));
+    let [
+        Value::Array(meta),
+        Value::Array(time),
+        Value::Array(entries),
+    ] = <[Value; 3]>::try_from(parts).map_err(|parts| bad_reply("read", parts))?
+    else {
+        return Err(bad_reply("read", "parts that are not arrays"));
     };
+    // The script gives an empty string for a field that the Stream doesn't have, since a nil
+    // would end the array.
     let meta: Vec<Option<String>> = meta
         .iter()
         .map(|value| text(value).filter(|text| !text.is_empty()))
@@ -583,37 +628,31 @@ fn read_reply(reply: Value) -> RedisStoreResult<(StreamState, Vec<Entry>)> {
     let offset = |i: usize| -> RedisStoreResult<i64> {
         field(i).map_or(Ok(0), |id| Ok(offset_of_entry_id(&id)?))
     };
-    let number = |i: usize| {
-        field(i)
-            .and_then(|text| text.parse::<i64>().ok())
-            .unwrap_or(0)
+    let number = |i: usize| -> RedisStoreResult<i64> {
+        field(i).map_or(Ok(0), |text| {
+            text.parse().map_err(|_| bad_reply("read", text))
+        })
     };
-    let [seconds, micros] = match time {
-        Value::Array(time) => {
-            let time: Vec<i64> = time
-                .iter()
-                .filter_map(|value| text(value)?.parse().ok())
-                .collect();
-            <[i64; 2]>::try_from(time).map_err(|time| bad_reply("read", time))?
-        }
-        other => return Err(bad_reply("read", other)),
-    };
+    let time: Vec<i64> = time
+        .iter()
+        .map(|value| text(value).and_then(|text| text.parse().ok()))
+        .collect::<Option<_>>()
+        .ok_or_else(|| bad_reply("read", &time))?;
+    let [seconds, micros] = <[i64; 2]>::try_from(time).map_err(|time| bad_reply("read", time))?;
     let state = StreamState {
         exists: field(0).is_some(),
-        version: number(0) as u32,
-        closed_at: if field(1).is_some() {
-            Some(offset(2)?)
-        } else {
-            None
+        version: u32::try_from(number(0)?).map_err(|error| bad_reply("read", error))?,
+        closed_at: match field(1) {
+            Some(_) => Some(offset(2)?),
+            None => None,
         },
         newest: offset(3)?,
         trimmed: offset(4)?,
-        retention: Duration::from_millis(number(5).max(0) as u64),
-        expires_ms: number(6),
+        retention: Duration::from_millis(
+            u64::try_from(number(5)?).map_err(|error| bad_reply("read", error))?,
+        ),
+        expires_ms: number(6)?,
         now_ms: seconds * 1000 + micros / 1000,
-    };
-    let Value::Array(entries) = entries else {
-        return Err(bad_reply("read", entries));
     };
     let entries = entries
         .into_iter()
@@ -623,21 +662,19 @@ fn read_reply(reply: Value) -> RedisStoreResult<(StreamState, Vec<Entry>)> {
 }
 
 fn entry(value: Value) -> RedisStoreResult<Entry> {
-    let Value::Array(mut pair) = value else {
+    let Value::Array(pair) = value else {
         return Err(bad_reply("read", value));
     };
-    if pair.len() != 2 {
-        return Err(bad_reply("read", pair));
-    }
-    let fields = pair.pop().expect("two parts");
-    let id = text(&pair.pop().expect("two parts")).unwrap_or_default();
+    let [id, Value::Array(fields)] =
+        <[Value; 2]>::try_from(pair).map_err(|pair| bad_reply("read", pair))?
+    else {
+        return Err(bad_reply("read", "an entry with no field array"));
+    };
+    let id = text(&id).ok_or_else(|| bad_reply("read", &id))?;
     let mut entry = Entry {
         offset: offset_of_entry_id(&id)?,
         record: None,
         superseded: None,
-    };
-    let Value::Array(fields) = fields else {
-        return Err(bad_reply("read", fields));
     };
     for pair in fields.chunks(2) {
         let (Some(Value::BulkString(name)), Some(Value::BulkString(value))) =
@@ -698,12 +735,12 @@ async fn check_server(shared: &SharedConnection) -> RedisStoreResult<()> {
             for (node, reply) in replies {
                 let text: String =
                     redis::from_redis_value(reply).map_err(|error| bad_reply("INFO", error))?;
-                check_version(&node, &text)?;
+                check_version(node.as_deref().unwrap_or("the server"), &text)?;
             }
         }
         // A user with only the Store's commands may not have INFO. Then a Redis before 7.0 fails at
         // the first read, on the flags of the read script.
-        Err(error) if error.code() == Some("NOPERM") => {
+        Err(error) if error.kind() == ErrorKind::Server(ServerErrorKind::NoPerm) => {
             tracing::debug!("Could not read the Redis version: {error}");
         }
         Err(error) => return Err(error.into()),
@@ -715,7 +752,7 @@ async fn check_server(shared: &SharedConnection) -> RedisStoreResult<()> {
             for (node, reply) in replies {
                 if let Some(policy) = eviction_policy(reply).filter(|p| p != "noeviction") {
                     tracing::warn!(
-                        node,
+                        node = node.as_deref().unwrap_or("the server"),
                         policy,
                         "Redis may evict Stream keys under memory pressure, which loses Records \
                          and their fence. Use maxmemory-policy noeviction for Streams."
@@ -775,6 +812,21 @@ mod tests {
         check_version("a", "redis_version:8.10.1").unwrap();
         assert!(check_version("a", "redis_version:6.2.14").is_err());
         assert!(check_version("a", "").is_err());
+    }
+
+    #[test]
+    fn the_debug_form_hides_the_user_info_of_a_url() {
+        let options = RedisStoreOptions::new("rediss://user:p@ss@redis.example:6380/0");
+        let debug = format!("{options:?}");
+        assert!(
+            !debug.contains("user") && !debug.contains("p@ss"),
+            "{debug}"
+        );
+        assert!(
+            debug.contains("rediss://***@redis.example:6380/0"),
+            "{debug}"
+        );
+        assert_eq!(without_user_info("redis://h:1/0"), "redis://h:1/0");
     }
 
     #[test]
@@ -873,8 +925,8 @@ mod tests {
                 .arg(1)
                 .arg("r0")
                 .arg(b"")
-                .arg(millis(DEFAULT_SAFETY_TTL))
-                .arg(millis(TOMBSTONE))
+                .arg(DEFAULT_SAFETY_TTL.as_millis())
+                .arg(TOMBSTONE.as_millis())
                 .arg(task)
                 .arg("")
                 .arg(failed)
