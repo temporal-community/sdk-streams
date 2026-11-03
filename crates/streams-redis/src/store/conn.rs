@@ -22,7 +22,7 @@ use std::{
     num::NonZeroUsize,
     path::PathBuf,
     str::FromStr,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
     time::Duration,
 };
 use tokio::{
@@ -249,7 +249,7 @@ impl<C> Pool<C> {
         let Ok(permit) = permit else {
             return Ok(None);
         };
-        let idle = self.idle.lock().unwrap().pop();
+        let idle = lock(&self.idle).pop();
         let reused = idle.is_some();
         let conn = match idle {
             Some(conn) => conn,
@@ -295,14 +295,20 @@ impl<C> Lease<C> {
         match &result {
             Err(error) if error.code().is_none() => {
                 if reused && stale(error) {
-                    idle.lock().unwrap().clear();
+                    lock(&idle).clear();
                 }
             }
             // Before the permit goes, so the next lease finds the connection.
-            _ => idle.lock().unwrap().push(conn),
+            _ => lock(&idle).push(conn),
         }
         result
     }
+}
+
+/// Locks a list or cache of the pools. Each change to one is a single push, pop or insert, so a
+/// panic while another call held it leaves it valid, and the lock takes it as it is.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Whether the connection itself failed, as when the server closed it. A timeout tells only that
@@ -403,18 +409,18 @@ struct SlotCache(Mutex<HashMap<u16, Node>>);
 
 impl SlotCache {
     fn get(&self, slot: Option<u16>) -> Option<Node> {
-        self.0.lock().unwrap().get(&slot?).cloned()
+        lock(&self.0).get(&slot?).cloned()
     }
 
     fn learn(&self, slot: u16, node: Node) {
-        self.0.lock().unwrap().insert(slot, node);
+        lock(&self.0).insert(slot, node);
     }
 
     /// Drops a slot's entry while it still names `node`. A failover can change a node's address
     /// for good, and otherwise only a redirect would update the entry.
     fn forget(&self, slot: Option<u16>, node: &Node) {
         if let Some(slot) = slot {
-            let mut slots = self.0.lock().unwrap();
+            let mut slots = lock(&self.0);
             if slots.get(&slot) == Some(node) {
                 slots.remove(&slot);
             }
@@ -624,9 +630,7 @@ impl BlockingPool {
     }
 
     fn node(&self, node: &Node) -> Arc<NodePool> {
-        self.nodes
-            .lock()
-            .unwrap()
+        lock(&self.nodes)
             .entry(node.clone())
             .or_insert_with(|| {
                 Arc::new(NodePool {

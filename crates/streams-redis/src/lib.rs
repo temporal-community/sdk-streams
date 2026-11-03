@@ -1,4 +1,10 @@
 #![warn(missing_docs)]
+// A panic in a lang bridge's worker takes the process down, so the library says why it can't fail.
+#![warn(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::cast_possible_truncation
+)]
 
 //! The Redis Store of the Temporal Stream runtime. It is experimental.
 //!
