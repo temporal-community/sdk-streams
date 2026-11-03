@@ -696,12 +696,12 @@ async fn check_server(shared: &SharedConnection) -> RedisStoreResult<()> {
             for (node, reply) in replies {
                 let text: String =
                     redis::from_redis_value(reply).map_err(|error| bad_reply("INFO", error))?;
-                check_version(&node, &text)?;
+                check_version(node.as_deref().unwrap_or("the server"), &text)?;
             }
         }
         // A user with only the Store's commands may not have INFO. Then a Redis before 7.0 fails at
         // the first read, on the flags of the read script.
-        Err(error) if error.code() == Some("NOPERM") => {
+        Err(error) if error.kind() == ErrorKind::Server(ServerErrorKind::NoPerm) => {
             tracing::debug!("Could not read the Redis version: {error}");
         }
         Err(error) => return Err(error.into()),
@@ -713,7 +713,7 @@ async fn check_server(shared: &SharedConnection) -> RedisStoreResult<()> {
             for (node, reply) in replies {
                 if let Some(policy) = eviction_policy(reply).filter(|p| p != "noeviction") {
                     tracing::warn!(
-                        node,
+                        node = node.as_deref().unwrap_or("the server"),
                         policy,
                         "Redis may evict Stream keys under memory pressure, which loses Records \
                          and their fence. Use maxmemory-policy noeviction for Streams."

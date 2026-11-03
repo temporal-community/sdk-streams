@@ -38,14 +38,19 @@ impl TryFrom<RedisStreamConfig> for RuntimeOptions {
             key_prefix: Some(config.key_prefix)
                 .filter(|prefix| !prefix.is_empty())
                 .unwrap_or(defaults.key_prefix),
-            retention: duration(config.retention).unwrap_or(defaults.retention),
-            safety_ttl: duration(config.safety_ttl).unwrap_or(defaults.safety_ttl),
-            blocking_reads_per_node: count(config.blocking_reads_per_node)
-                .unwrap_or(defaults.blocking_reads_per_node),
-            response_timeout: duration(config.response_timeout)
+            retention: duration("retention", config.retention)?.unwrap_or(defaults.retention),
+            safety_ttl: duration("safety_ttl", config.safety_ttl)?.unwrap_or(defaults.safety_ttl),
+            blocking_reads_per_node: count(
+                "blocking_reads_per_node",
+                config.blocking_reads_per_node,
+            )?
+            .unwrap_or(defaults.blocking_reads_per_node),
+            response_timeout: duration("response_timeout", config.response_timeout)?
                 .unwrap_or(defaults.response_timeout),
-            wait_replicas: count(config.wait_replicas).unwrap_or(defaults.wait_replicas),
-            wait_timeout: duration(config.wait_timeout).unwrap_or(defaults.wait_timeout),
+            wait_replicas: count("wait_replicas", config.wait_replicas)?
+                .unwrap_or(defaults.wait_replicas),
+            wait_timeout: duration("wait_timeout", config.wait_timeout)?
+                .unwrap_or(defaults.wait_timeout),
         };
         Ok(Self {
             store,
@@ -54,15 +59,24 @@ impl TryFrom<RedisStreamConfig> for RuntimeOptions {
     }
 }
 
-// Proto3 can't tell an unset number from zero, so zero and negative values also keep the default.
-fn duration(value: Option<prost_types::Duration>) -> Option<Duration> {
-    Duration::try_from(value?)
-        .ok()
-        .filter(|duration| !duration.is_zero())
+// Proto3 can't tell an unset number from zero, so zero keeps the default. A negative value is
+// a bad config.
+fn duration(
+    field: &str,
+    value: Option<prost_types::Duration>,
+) -> RedisStoreResult<Option<Duration>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let duration = Duration::try_from(value)
+        .map_err(|_| RedisStoreError::invalid(format!("The config's {field} is negative")))?;
+    Ok((!duration.is_zero()).then_some(duration))
 }
 
-fn count(value: i32) -> Option<usize> {
-    usize::try_from(value).ok().filter(|&count| count > 0)
+fn count(field: &str, value: i32) -> RedisStoreResult<Option<usize>> {
+    let count = usize::try_from(value)
+        .map_err(|_| RedisStoreError::invalid(format!("The config's {field} is negative")))?;
+    Ok((count > 0).then_some(count))
 }
 
 /// Connects to Redis on the runtime's first call that needs Redis.
@@ -133,5 +147,14 @@ mod tests {
             (waits.store.wait_replicas, waits.store.wait_timeout),
             (2, Duration::from_millis(250))
         );
+        let negative = RuntimeOptions::try_from(RedisStreamConfig {
+            urls: vec!["redis://x:1".to_string()],
+            retention: Some(prost_types::Duration {
+                seconds: -1,
+                nanos: 0,
+            }),
+            ..Default::default()
+        });
+        assert!(matches!(negative, Err(RedisStoreError::Invalid(_))));
     }
 }

@@ -166,11 +166,15 @@ impl ConnectionLike for SharedConnection {
 
 impl SharedConnection {
     /// Runs `cmd` on the server, or on every primary of a cluster, and returns each reply with the
-    /// node that sent it. Each primary holds its own share of the keys and its own settings.
-    pub(crate) async fn on_each_primary(&self, cmd: Cmd) -> RedisResult<Vec<(String, Value)>> {
+    /// node that sent it, if a cluster names it. Each primary holds its own share of the keys and
+    /// its own settings.
+    pub(crate) async fn on_each_primary(
+        &self,
+        cmd: Cmd,
+    ) -> RedisResult<Vec<(Option<String>, Value)>> {
         match self.clone() {
             SharedConnection::Single(mut conn) => {
-                Ok(vec![(String::new(), cmd.query_async(&mut conn).await?)])
+                Ok(vec![(None, cmd.query_async(&mut conn).await?)])
             }
             SharedConnection::Cluster(mut conn) => {
                 let routing = RoutingInfo::MultiNode((MultipleNodeRoutingInfo::AllMasters, None));
@@ -186,10 +190,10 @@ impl SharedConnection {
                                 Value::SimpleString(text) => text,
                                 other => format!("{other:?}"),
                             };
-                            Ok((node, reply.extract_error()?))
+                            Ok((Some(node), reply.extract_error()?))
                         })
                         .collect(),
-                    other => Ok(vec![(String::new(), other.extract_error()?)]),
+                    other => Ok(vec![(None, other.extract_error()?)]),
                 }
             }
         }
