@@ -1,11 +1,7 @@
-//! The Redis backends of the shared suites, one for a standalone server and one for a cluster,
-//! each when its URL is set. A standalone server with a replica also runs them with `WAIT`.
+//! The Redis backends of the shared suites, on a standalone server and on a cluster. The
+//! standalone server's replica also runs them with `WAIT`.
 
 #![allow(dead_code)]
-
-mod server;
-
-pub(crate) use server::server_url;
 
 use prost::Message;
 use redis::AsyncCommands;
@@ -17,41 +13,46 @@ use temporalio_streams::{
     testing::{Needs, RawKeys, TestBackend},
 };
 use temporalio_streams_redis::{
-    RedisStore, RedisStoreOptions, RedisStreamRuntime, WaitOptions, proto::RedisStreamConfig,
+    RedisStore, RedisStoreOptions, RedisStreamRuntime, WaitOptions,
+    proto::RedisStreamConfig,
+    testing::{cluster_url, standalone_url},
 };
 
 /// The key prefix of the tests, so that they never touch other data on the server.
 const PREFIX: &str = "streams-test";
 
-/// The backends of each Redis server that is set, standalone first.
-pub(crate) fn backends() -> Vec<Arc<dyn TestBackend>> {
-    let mut backends: Vec<Arc<dyn TestBackend>> = vec![];
-    for (variable, cluster) in [
-        ("STREAMS_REDIS_URL", false),
-        ("STREAMS_REDIS_CLUSTER_URL", true),
-    ] {
-        let Some(url) = server_url(variable) else {
-            continue;
-        };
-        // Each write then goes through the `WAIT` pipeline, refusals too.
-        if !cluster && has_replica(&url) {
-            backends.push(Arc::new(RedisBackend {
-                url: url.clone(),
-                cluster,
-                wait_replicas: 1,
-            }));
-        }
-        backends.push(Arc::new(RedisBackend {
-            url,
-            cluster,
-            wait_replicas: 0,
-        }));
-    }
-    backends
+/// The backends of the standalone server, with `WAIT` and with none.
+pub(crate) fn standalone() -> Vec<Arc<dyn TestBackend>> {
+    let url = standalone_url();
+    assert!(
+        has_replica(&url),
+        "the server at STREAMS_REDIS_URL needs a replica"
+    );
+    // Each write then goes through the `WAIT` pipeline, refusals too.
+    let waits = RedisBackend {
+        url: url.clone(),
+        cluster: false,
+        wait_replicas: 1,
+    };
+    let plain = RedisBackend {
+        url,
+        cluster: false,
+        wait_replicas: 0,
+    };
+    vec![Arc::new(waits), Arc::new(plain)]
+}
+
+/// The backend of the cluster.
+pub(crate) fn cluster() -> Vec<Arc<dyn TestBackend>> {
+    vec![Arc::new(RedisBackend {
+        url: cluster_url(),
+        cluster: true,
+        wait_replicas: 0,
+    })]
 }
 
 /// Whether a standalone server has a replica that is online.
-fn has_replica(url: &str) -> bool {
+pub(crate) fn has_replica(url: &str) -> bool {
     let mut conn = redis::Client::open(url).unwrap().get_connection().unwrap();
     let info: String = redis::cmd("INFO")
         .arg("replication")

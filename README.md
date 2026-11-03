@@ -35,6 +35,12 @@ TTLs, the ACLs and the known limits.
 - A FIPS build uses `default-features = false` and the `fips` feature. The default feature links
   `ring`.
 
+## Testing
+
+`cargo test` runs the cases that need no server. The cases that need Redis are `#[ignore]`. To run
+them, start the servers with `crates/streams-redis/scripts/redis-test-servers.sh`, set the two URLs
+that it prints, and run `cargo test -- --include-ignored`.
+
 ## License
 
 MIT. See `LICENSE.txt`.

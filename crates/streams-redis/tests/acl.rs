@@ -1,14 +1,11 @@
 //! The Redis users of `docs/redis.md`, with exactly the key access and commands it lists per role,
 //! run every Store call of that role, on a standalone server and on a cluster whose slot moves.
 
-mod support;
-
 use prost::Message;
 use std::{
     num::NonZeroUsize,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use support::server_url;
 use temporalio_common::protos::temporal::api::common::v1::Payload;
 use temporalio_streams::{
     Reason,
@@ -20,7 +17,10 @@ use temporalio_streams::{
     },
     store::{Batch, Owner, Store, Withdrawal},
 };
-use temporalio_streams_redis::{RedisStore, RedisStoreOptions, WaitOptions};
+use temporalio_streams_redis::{
+    RedisStore, RedisStoreOptions, WaitOptions,
+    testing::{cluster_url, standalone_url},
+};
 
 const PREFIX: &str = "streams-acl";
 
@@ -127,10 +127,9 @@ fn client_named(process: &str) -> Producer {
 }
 
 #[tokio::test]
+#[ignore = "needs Redis"]
 async fn the_documented_commands_run_every_call_of_each_role() {
-    let Some(url) = server_url("STREAMS_REDIS_URL") else {
-        return;
-    };
+    let url = standalone_url();
     let unique = unique();
     let namespace = format!("ns-{unique}");
     let (producer_name, reader_name) = (format!("prod-{unique}"), format!("read-{unique}"));
@@ -368,10 +367,9 @@ async fn primaries(conn: &mut redis::cluster_async::ClusterConnection) -> Vec<Pr
 /// While a slot moves, the source answers `ASK` for the Stream's keys that it gave away, so the
 /// Store's client sends `ASKING` to the target.
 #[tokio::test]
+#[ignore = "needs a Redis cluster"]
 async fn the_documented_commands_serve_a_cluster_while_a_slot_moves() {
-    let Some(url) = server_url("STREAMS_REDIS_CLUSTER_URL") else {
-        return;
-    };
+    let url = cluster_url();
     let unique = unique();
     let namespace = format!("ns-{unique}");
     let mut cluster = redis::cluster::ClusterClient::new(vec![url.as_str()])

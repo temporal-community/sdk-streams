@@ -14,6 +14,8 @@ REPLICA=${STREAMS_REPLICA_PORT:-6492}
 # Three ports for the cluster primaries, so that test runs on one host can use different ones.
 read -r -a CLUSTER <<<"${STREAMS_CLUSTER_PORTS:-7291 7292 7293}"
 DATA=${STREAMS_REDIS_DATA:-${TMPDIR:-/tmp}/streams-redis}
+# The docker image when there is no local redis-server, so CI can test an older Redis.
+IMAGE=${STREAMS_REDIS_IMAGE:-redis:7}
 mkdir -p "$DATA"
 
 start() {
@@ -27,7 +29,7 @@ start() {
     redis-server --port "$port" --save '' --appendonly no --daemonize yes \
       --dir "$DATA/$port" --logfile "$DATA/$port.log" "$@"
   else
-    docker run -d --rm --name "streams-redis-$port" --network host redis:7 \
+    docker run -d --rm --name "streams-redis-$port" --network host "$IMAGE" \
       redis-server --port "$port" --save '' --appendonly no "$@" >/dev/null
   fi
 }

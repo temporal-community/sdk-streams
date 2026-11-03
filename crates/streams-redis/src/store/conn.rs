@@ -791,10 +791,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "needs Redis"]
     async fn a_cached_slot_on_a_dead_node_goes_back_to_the_seed() {
-        let Some(url) = crate::server::server_url("STREAMS_REDIS_URL") else {
-            return;
-        };
+        let url = crate::testing::standalone_url();
         // A standalone server answers every slot, so the seed serves the read once the dead
         // node is dropped.
         let pool = BlockingPool::new(endpoint(&[&url], true), NonZeroUsize::MIN);

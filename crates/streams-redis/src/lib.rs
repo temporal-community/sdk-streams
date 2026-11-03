@@ -12,10 +12,8 @@ mod options;
 mod protos;
 mod runtime;
 mod store;
-#[cfg(test)]
-mod server {
-    include!("../tests/support/server.rs");
-}
+#[cfg(any(test, feature = "test-support"))]
+pub mod testing;
 
 pub use error::{RedisStoreError, RedisStoreResult};
 pub use options::{KeyPrefix, RedisStoreOptions, WaitOptions};
