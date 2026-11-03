@@ -20,6 +20,7 @@ use std::{
     collections::HashMap,
     future::Future,
     num::NonZeroUsize,
+    path::PathBuf,
     str::FromStr,
     sync::{Arc, Mutex},
     time::Duration,
@@ -52,11 +53,22 @@ pub(crate) struct Endpoint {
 /// One server, or the seeds of a cluster. Every node gets the credentials and TLS of the first
 /// one, so each kind holds it by its type.
 enum Topology {
-    Standalone(ConnectionInfo),
-    Cluster {
-        first: ConnectionInfo,
-        rest: Vec<ConnectionInfo>,
-    },
+    Standalone(Seed),
+    Cluster { first: Seed, rest: Vec<Seed> },
+}
+
+/// A URL of the options, with the node that it names.
+struct Seed {
+    info: ConnectionInfo,
+    node: Node,
+}
+
+impl Seed {
+    fn parse(url: &str) -> RedisResult<Self> {
+        let info = url.into_connection_info()?;
+        let node = Node::of(&info)?;
+        Ok(Self { info, node })
+    }
 }
 
 impl Endpoint {
@@ -65,7 +77,7 @@ impl Endpoint {
         cluster: bool,
         response_timeout: Duration,
     ) -> RedisResult<Self> {
-        let mut seeds = urls.iter().map(|url| url.as_str().into_connection_info());
+        let mut seeds = urls.iter().map(|url| Seed::parse(url));
         let Some(first) = seeds.next().transpose()? else {
             return Err(RedisError::from((
                 ErrorKind::InvalidClientConfig,
@@ -95,14 +107,14 @@ impl Endpoint {
     }
 
     /// The server, or the cluster seed whose credentials and TLS every node gets.
-    fn first(&self) -> &ConnectionInfo {
+    fn first(&self) -> &Seed {
         match &self.topology {
             Topology::Standalone(first) | Topology::Cluster { first, .. } => first,
         }
     }
 
     /// The server, or each seed of the cluster, the first one first.
-    fn seeds(&self) -> impl Iterator<Item = &ConnectionInfo> {
+    fn seeds(&self) -> impl Iterator<Item = &Seed> {
         let rest = match &self.topology {
             Topology::Standalone(_) => &[][..],
             Topology::Cluster { rest, .. } => rest.as_slice(),
@@ -114,7 +126,7 @@ impl Endpoint {
     pub(crate) async fn open(&self) -> RedisResult<SharedConnection> {
         match &self.topology {
             Topology::Cluster { .. } => {
-                let client = ClusterClient::builder(self.seeds().cloned())
+                let client = ClusterClient::builder(self.seeds().map(|seed| seed.info.clone()))
                     .response_timeout(self.response_timeout)
                     .build()?;
                 Ok(SharedConnection::Cluster(
@@ -122,7 +134,7 @@ impl Endpoint {
                 ))
             }
             Topology::Standalone(server) => {
-                let client = Client::open(server.clone())?;
+                let client = Client::open(server.info.clone())?;
                 let config = ConnectionManagerConfig::new()
                     .set_response_timeout(Some(self.response_timeout));
                 Ok(SharedConnection::Single(
@@ -322,40 +334,49 @@ impl WaitPool {
     }
 }
 
-/// The host and port of a Redis node.
+/// A Redis node, as a cluster names it in a redirect, or the local socket of a standalone server.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct Node {
-    host: String,
-    port: u16,
+enum Node {
+    Tcp { host: String, port: u16 },
+    Unix(PathBuf),
 }
 
 impl Node {
-    fn of(info: &ConnectionInfo) -> Self {
-        let (host, port) = match info.addr() {
+    fn of(info: &ConnectionInfo) -> RedisResult<Self> {
+        match info.addr() {
             ConnectionAddr::Tcp(host, port) | ConnectionAddr::TcpTls { host, port, .. } => {
-                (host.clone(), *port)
+                Ok(Self::Tcp {
+                    host: host.clone(),
+                    port: *port,
+                })
             }
-            ConnectionAddr::Unix(path) => (path.display().to_string(), 0),
-            _ => (String::new(), 0),
-        };
-        Self { host, port }
+            ConnectionAddr::Unix(path) => Ok(Self::Unix(path.clone())),
+            other => Err(RedisError::from((
+                ErrorKind::InvalidClientConfig,
+                "the Store can't connect to this kind of address",
+                format!("{other:?}"),
+            ))),
+        }
     }
 
     /// The seed's connection settings, with its credentials and TLS, for this node.
     fn info(&self, seed: &ConnectionInfo) -> ConnectionInfo {
-        let addr = match seed.addr() {
-            ConnectionAddr::TcpTls {
-                insecure,
-                tls_params,
-                ..
-            } => ConnectionAddr::TcpTls {
-                host: self.host.clone(),
-                port: self.port,
+        let addr = match (self, seed.addr()) {
+            (
+                Self::Tcp { host, port },
+                ConnectionAddr::TcpTls {
+                    insecure,
+                    tls_params,
+                    ..
+                },
+            ) => ConnectionAddr::TcpTls {
+                host: host.clone(),
+                port: *port,
                 insecure: *insecure,
                 tls_params: tls_params.clone(),
             },
-            ConnectionAddr::Tcp(..) => ConnectionAddr::Tcp(self.host.clone(), self.port),
-            other => other.clone(),
+            (Self::Tcp { host, port }, _) => ConnectionAddr::Tcp(host.clone(), *port),
+            (Self::Unix(path), _) => ConnectionAddr::Unix(path.clone()),
         };
         seed.clone().set_addr(addr)
     }
@@ -368,7 +389,7 @@ impl FromStr for Node {
     fn from_str(address: &str) -> RedisResult<Self> {
         let bad = || RedisError::from((ErrorKind::InvalidClientConfig, "not a host:port"));
         let (host, port) = address.rsplit_once(':').ok_or_else(bad)?;
-        Ok(Self {
+        Ok(Self::Tcp {
             host: host.to_string(),
             port: port.parse().map_err(|_| bad())?,
         })
@@ -515,13 +536,13 @@ impl BlockingPool {
         let slot = self.endpoint.cluster().then(|| slot(key));
         // A seed that is down may have a replica that took over its slots, which another seed
         // knows.
-        let mut seeds = self.endpoint.seeds().map(Node::of);
+        let mut seeds = self.endpoint.seeds().map(|seed| seed.node.clone());
         let mut node = match self.slots.get(slot) {
             Some(node) => node,
             None => {
                 // The read tries the first seed now, so the walk goes on from the next one.
                 seeds.next();
-                Node::of(self.endpoint.first())
+                self.endpoint.first().node.clone()
             }
         };
         let mut attempt = Attempt {
@@ -609,7 +630,7 @@ impl BlockingPool {
             .entry(node.clone())
             .or_insert_with(|| {
                 Arc::new(NodePool {
-                    info: node.info(self.endpoint.first()),
+                    info: node.info(&self.endpoint.first().info),
                     pool: Pool::new(self.per_node, Vec::new()),
                 })
             })
@@ -652,7 +673,7 @@ mod tests {
     use super::*;
 
     fn node(host: &str, port: u16) -> Node {
-        Node {
+        Node::Tcp {
             host: host.to_string(),
             port,
         }
@@ -819,7 +840,7 @@ mod tests {
     #[tokio::test]
     async fn the_block_time_starts_when_the_read_has_a_connection() {
         let pool = BlockingPool::new(endpoint(&[&nil_server()], false), NonZeroUsize::MIN);
-        let seed = Node::of(pool.endpoint.first());
+        let seed = pool.endpoint.first().node.clone();
         let held = pool
             .lease(&seed, Instant::now() + Duration::from_secs(1))
             .await
@@ -845,7 +866,7 @@ mod tests {
     #[tokio::test]
     async fn a_read_with_no_free_connection_ends_after_the_permit_wait() {
         let pool = BlockingPool::new(endpoint(&[&nil_server()], false), NonZeroUsize::MIN);
-        let seed = Node::of(pool.endpoint.first());
+        let seed = pool.endpoint.first().node.clone();
         let deadline = || Instant::now() + Duration::from_secs(10);
         let _held = pool.lease(&seed, deadline()).await.unwrap().unwrap();
         tokio::time::pause();
@@ -922,7 +943,7 @@ mod tests {
             .into_connection_info()
             .unwrap();
         let other = node("10.0.0.2", 7292).info(&seed);
-        assert_eq!(Node::of(&other), node("10.0.0.2", 7292));
+        assert_eq!(Node::of(&other).unwrap(), node("10.0.0.2", 7292));
         let settings = |info: &ConnectionInfo| {
             let redis = info.redis_settings();
             (
