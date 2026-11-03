@@ -206,7 +206,7 @@ impl RedisStore {
         Ok(Created {
             outcome,
             retention: Duration::from_millis(stored),
-            flagged: flag == "1",
+            flagged: flagged(&flag, "create")?,
         })
     }
 
@@ -906,6 +906,7 @@ mod tests {
         let store = RedisStore::connect(options).await.unwrap();
         let namespace = format!("ns-{}", std::process::id());
         let task = task_key(&Default::default());
+        // A task key that isn't an epoch key, and a failed list that isn't event ids.
         for (i, (task, failed)) in [("zz", "1"), (task.as_str(), "x")].into_iter().enumerate() {
             let handle = StreamHandle {
                 id: format!("s{i}"),
@@ -918,13 +919,13 @@ mod tests {
                 .unwrap();
             let keys = store.keys(&namespace, &handle.id);
             let mut shared = store.shared.clone();
-            let set: RedisResult<()> = redis::cmd("HSET")
+            let _: () = redis::cmd("HSET")
                 .arg(keys.meta())
                 .arg("run|r0")
                 .arg("1")
                 .query_async(&mut shared)
-                .await;
-            set.unwrap();
+                .await
+                .unwrap();
             // A Local Activity of run r1 that withdraws r0, with one malformed task fact.
             let mut cmd = script_cmd("EVALSHA", &scripts::APPEND_SCRIPT, &keys);
             cmd.arg(FORMAT_VERSION)
