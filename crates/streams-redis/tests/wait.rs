@@ -152,6 +152,7 @@ async fn too_few_replicas(url: &str, cluster: bool) {
     assert_eq!(create(&plain).await.unwrap().outcome, CreateOutcome::Exists);
     if !cluster {
         let count = replicas(url).await.len();
+        assert!(count > 0, "the server at STREAMS_REDIS_URL needs a replica");
         let enough = store(url, cluster, count, LONG).await;
         assert_eq!(
             create(&enough).await.unwrap().outcome,

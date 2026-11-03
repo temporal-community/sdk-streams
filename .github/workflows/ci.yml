@@ -56,7 +56,7 @@ jobs:
       # Normal and build edges only, since the tests' own dependencies may depend on `ring`.
       - run: |
           tree=$(cargo tree -e normal,build --no-default-features --features fips \
-            -i ring --target all 2>/dev/null || true)
+            -i ring --target all)
           if [ -n "$tree" ]; then echo "$tree"; exit 1; fi
 
   redis:

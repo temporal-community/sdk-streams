@@ -33,14 +33,12 @@ impl TryFrom<RedisStreamConfig> for RuntimeOptions {
             ));
         }
         let defaults = RedisStoreOptions::default();
-        let wait = match count("wait_replicas", config.wait_replicas)? {
-            None => None,
-            Some(replicas) => Some(WaitOptions {
-                replicas,
-                timeout: duration("wait_timeout", config.wait_timeout)?
-                    .unwrap_or(WaitOptions::DEFAULT_TIMEOUT),
-            }),
-        };
+        // A bad timeout is refused even with no replicas, since the config is wrong either way.
+        let wait_timeout = duration("wait_timeout", config.wait_timeout)?;
+        let wait = count("wait_replicas", config.wait_replicas)?.map(|replicas| WaitOptions {
+            replicas,
+            timeout: wait_timeout.unwrap_or(WaitOptions::DEFAULT_TIMEOUT),
+        });
         let key_prefix = match config.key_prefix.as_str() {
             "" => defaults.key_prefix,
             _ => KeyPrefix::try_from(config.key_prefix)?,
@@ -167,5 +165,14 @@ mod tests {
             ..Default::default()
         });
         assert!(matches!(negative, Err(RedisStoreError::Invalid(_))));
+        let negative_wait = RuntimeOptions::try_from(RedisStreamConfig {
+            urls: vec!["redis://x:1".to_string()],
+            wait_timeout: Some(prost_types::Duration {
+                seconds: -1,
+                nanos: 0,
+            }),
+            ..Default::default()
+        });
+        assert!(matches!(negative_wait, Err(RedisStoreError::Invalid(_))));
     }
 }
