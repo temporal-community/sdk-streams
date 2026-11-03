@@ -23,7 +23,8 @@ use temporalio_streams::{
 use tokio::time::Instant;
 
 /// The Redis connection options and the Stream TTLs.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RedisStoreOptions {
     /// One `redis://` or `rediss://` URL, or the seed nodes of a cluster. Credentials and TLS
     /// come from the URL.
@@ -72,6 +73,36 @@ impl Default for RedisStoreOptions {
             wait_replicas: 0,
             wait_timeout: Duration::from_secs(1),
         }
+    }
+}
+
+// The URLs can hold a password, so the debug form shows them with no user info.
+impl std::fmt::Debug for RedisStoreOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let urls: Vec<String> = self.urls.iter().map(|url| without_user_info(url)).collect();
+        f.debug_struct("RedisStoreOptions")
+            .field("urls", &urls)
+            .field("cluster", &self.cluster)
+            .field("key_prefix", &self.key_prefix)
+            .field("retention", &self.retention)
+            .field("safety_ttl", &self.safety_ttl)
+            .field("blocking_reads_per_node", &self.blocking_reads_per_node)
+            .field("response_timeout", &self.response_timeout)
+            .field("wait_replicas", &self.wait_replicas)
+            .field("wait_timeout", &self.wait_timeout)
+            .finish()
+    }
+}
+
+/// The URL with `***` in place of its user and password, if it has them.
+fn without_user_info(url: &str) -> String {
+    let start = url.find("://").map_or(0, |scheme| scheme + 3);
+    let authority = url[start..]
+        .find('/')
+        .map_or(url.len(), |path| start + path);
+    match url[start..authority].rfind('@') {
+        Some(at) => format!("{}***{}", &url[..start], &url[start + at..]),
+        None => url.to_string(),
     }
 }
 
@@ -742,6 +773,21 @@ mod tests {
         check_version("a", "redis_version:8.10.1").unwrap();
         assert!(check_version("a", "redis_version:6.2.14").is_err());
         assert!(check_version("a", "").is_err());
+    }
+
+    #[test]
+    fn the_debug_form_hides_the_user_info_of_a_url() {
+        let options = RedisStoreOptions::new("rediss://user:p@ss@redis.example:6380/0");
+        let debug = format!("{options:?}");
+        assert!(
+            !debug.contains("user") && !debug.contains("p@ss"),
+            "{debug}"
+        );
+        assert!(
+            debug.contains("rediss://***@redis.example:6380/0"),
+            "{debug}"
+        );
+        assert_eq!(without_user_info("redis://h:1/0"), "redis://h:1/0");
     }
 
     #[test]

@@ -13,6 +13,7 @@ pub const REDIS_RUNTIME_NAME: &str = "temporalio-streams-redis";
 
 /// The options of a Stream runtime on Redis.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RuntimeOptions {
     /// How to connect to Redis.
     pub store: RedisStoreOptions,
