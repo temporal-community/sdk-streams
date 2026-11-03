@@ -1,15 +1,12 @@
 //! The Redis Store says what it does atomically beyond the log.
 
-mod support;
-
 use temporalio_streams::store::{Capabilities, Store};
-use temporalio_streams_redis::{RedisStore, RedisStoreOptions};
+use temporalio_streams_redis::{RedisStore, RedisStoreOptions, testing::standalone_url};
 
 #[tokio::test]
+#[ignore = "needs Redis"]
 async fn the_redis_store_says_what_it_can_do() {
-    let Some(url) = support::server_url("STREAMS_REDIS_URL") else {
-        return;
-    };
+    let url = standalone_url();
     let redis = RedisStore::connect(RedisStoreOptions::new(url))
         .await
         .unwrap();

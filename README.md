@@ -11,7 +11,8 @@ the runtime with `RedisStreamRuntime`, which connects on its first call that nee
 Lang sends the options as a `RedisStreamConfig`, from
 `crates/streams-redis/protos/temporal/sdk/streams/v1/redis.proto`. Rust code can call
 `RedisStore::connect` with `RedisStoreOptions`. The Store needs Redis 7.0 or later. These are the
-main options.
+main fields of the config. `RedisStoreOptions` has the same ones, but holds the two `wait_` fields
+as `wait: Option<WaitOptions>`, and a zero count there is not possible.
 
 | Option | Default | Use |
 |---|---|---|
@@ -33,6 +34,12 @@ TTLs, the ACLs and the known limits.
   `temporalio-streams` to those copies in `[patch.crates-io]`, so that each type exists once.
 - A FIPS build uses `default-features = false` and the `fips` feature. The default feature links
   `ring`.
+
+## Testing
+
+`cargo test` runs the cases that need no server. The cases that need Redis are `#[ignore]`. To run
+them, start the servers with `crates/streams-redis/scripts/redis-test-servers.sh`, set the two URLs
+that it prints, and run `cargo test -- --include-ignored`.
 
 ## License
 

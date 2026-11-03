@@ -79,19 +79,11 @@ jobs:
             | sudo tee /etc/apt/sources.list.d/redis.list
           sudo apt-get update && sudo apt-get install -y redis
       - run: crates/streams-redis/scripts/redis-test-servers.sh >> "$GITHUB_ENV"
-      - run: cargo test -p temporalio-streams-redis -- --test-threads=8
-        env:
-          STREAMS_REQUIRE: redis
+      - run: cargo test -p temporalio-streams-redis -- --include-ignored --test-threads=8
 
   redis-7-0:
-    name: Redis 7.0 Store tests (standalone)
+    name: Redis 7.0 Store tests (standalone and cluster)
     runs-on: ubuntu-latest
-    # The oldest Redis that `connect` accepts.
-    services:
-      redis:
-        image: redis:7.0
-        ports:
-          - 6379:6379
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.94.0
@@ -100,6 +92,10 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       - uses: Swatinem/rust-cache@v2
       - run: scripts/patch-sdk-rust.sh
-      - run: cargo test -p temporalio-streams-redis -- --test-threads=8
+      # The script runs the servers in docker and needs only `redis-cli` on the host.
+      - run: sudo apt-get update && sudo apt-get install -y redis-tools
+      # The oldest Redis that `connect` accepts.
+      - run: crates/streams-redis/scripts/redis-test-servers.sh >> "$GITHUB_ENV"
         env:
-          STREAMS_REDIS_URL: redis://localhost:6379/0
+          STREAMS_REDIS_IMAGE: redis:7.0
+      - run: cargo test -p temporalio-streams-redis -- --include-ignored --test-threads=8

@@ -1,16 +1,16 @@
 //! A Store with `wait_replicas` refuses a write that too few replicas have, even one that it finds
 //! done, and its writes wait for their replicas in parallel.
 
-mod support;
-
-use std::time::Duration;
-use support::server_url;
+use std::{num::NonZeroUsize, time::Duration};
 use temporalio_streams::{
-    Reason, StreamError,
+    Reason,
     proto::{Producer, ProducerEpoch, StreamHandle, StreamProducerKind},
-    store::{Batch, CreateOutcome, Owner, Withdrawal},
+    store::{Batch, CreateOutcome, Owner, Store, Withdrawal},
 };
-use temporalio_streams_redis::{RedisStore, RedisStoreOptions};
+use temporalio_streams_redis::{
+    RedisStore, RedisStoreOptions, WaitOptions,
+    testing::{cluster_url, standalone_url},
+};
 
 const PREFIX: &str = "streams-wait";
 
@@ -25,9 +25,9 @@ const LONG: Duration = Duration::from_secs(1);
 async fn store(url: &str, cluster: bool, wait_replicas: usize, timeout: Duration) -> RedisStore {
     let mut options = RedisStoreOptions::new(url);
     options.cluster = cluster;
-    options.key_prefix = PREFIX.to_string();
-    options.wait_replicas = wait_replicas;
-    options.wait_timeout = timeout;
+    options.key_prefix = PREFIX.parse().unwrap();
+    options.wait =
+        NonZeroUsize::new(wait_replicas).map(|replicas| WaitOptions { replicas, timeout });
     RedisStore::connect(options).await.unwrap()
 }
 
@@ -102,79 +102,75 @@ fn client() -> Producer {
 }
 
 #[tokio::test]
+#[ignore = "needs Redis"]
 async fn a_write_that_too_few_replicas_have_fails_and_its_retry_finds_it() {
     let _lock = SERVER.lock().await;
-    for (variable, cluster) in [
-        ("STREAMS_REDIS_URL", false),
-        ("STREAMS_REDIS_CLUSTER_URL", true),
-    ] {
-        let Some(url) = server_url(variable) else {
-            continue;
-        };
-        let handle = StreamHandle {
-            id: format!("s-{}", std::process::id()),
-            ..Default::default()
-        };
-        let namespace = unique("ns");
-        let create = |store: &RedisStore| {
-            let (store, namespace, handle) = (store.clone(), namespace.clone(), handle.clone());
-            async move {
-                store
-                    .create(
-                        &namespace,
-                        &handle,
-                        None,
-                        Owner::Client,
-                        &Withdrawal::default(),
-                    )
-                    .await
-            }
-        };
-        // No test server has this many replicas.
-        let waits = store(&url, cluster, 16, SHORT).await;
-        // So the write reloads its script between the script call and its `WAIT`.
-        let flush = redis::cmd("SCRIPT").arg("FLUSH").clone();
-        if cluster {
-            let client = redis::cluster::ClusterClient::new(vec![url.as_str()]).unwrap();
-            let mut conn = client.get_async_connection().await.unwrap();
-            let _: () = flush.query_async(&mut conn).await.unwrap();
-        } else {
-            let _: () = flush.query_async(&mut admin(&url).await).await.unwrap();
+    too_few_replicas(&standalone_url(), false).await;
+}
+
+#[tokio::test]
+#[ignore = "needs a Redis cluster"]
+async fn a_write_that_too_few_replicas_have_fails_on_a_redis_cluster() {
+    let _lock = SERVER.lock().await;
+    too_few_replicas(&cluster_url(), true).await;
+}
+
+async fn too_few_replicas(url: &str, cluster: bool) {
+    let handle = StreamHandle {
+        id: format!("s-{}", std::process::id()),
+        ..Default::default()
+    };
+    let namespace = unique("ns");
+    let create = |store: &RedisStore| {
+        let (store, namespace, handle) = (store.clone(), namespace.clone(), handle.clone());
+        async move {
+            store
+                .create(
+                    &namespace,
+                    &handle,
+                    None,
+                    Owner::Client,
+                    &Withdrawal::default(),
+                )
+                .await
         }
-        let refused = StreamError::from(create(&waits).await.unwrap_err());
-        assert_eq!(refused.reason, Reason::Storage, "{refused}");
-        let plain = store(&url, cluster, 0, SHORT).await;
-        assert_eq!(create(&plain).await.unwrap().outcome, CreateOutcome::Exists);
-        if !cluster {
-            let count = replicas(&url).await.len();
-            if count > 0 {
-                let enough = store(&url, cluster, count, LONG).await;
-                assert_eq!(
-                    create(&enough).await.unwrap().outcome,
-                    CreateOutcome::Exists
-                );
-            }
-        }
+    };
+    // No test server has this many replicas.
+    let waits = store(url, cluster, 16, SHORT).await;
+    // So the write reloads its script between the script call and its `WAIT`.
+    let flush = redis::cmd("SCRIPT").arg("FLUSH").clone();
+    if cluster {
+        let client = redis::cluster::ClusterClient::new(vec![url]).unwrap();
+        let mut conn = client.get_async_connection().await.unwrap();
+        let _: () = flush.query_async(&mut conn).await.unwrap();
+    } else {
+        let _: () = flush.query_async(&mut admin(url).await).await.unwrap();
+    }
+    let refused = create(&waits).await.unwrap_err();
+    assert_eq!(refused.reason, Reason::Storage, "{refused}");
+    let plain = store(url, cluster, 0, SHORT).await;
+    assert_eq!(create(&plain).await.unwrap().outcome, CreateOutcome::Exists);
+    if !cluster {
+        let count = replicas(url).await.len();
+        let enough = store(url, cluster, count, LONG).await;
+        assert_eq!(
+            create(&enough).await.unwrap().outcome,
+            CreateOutcome::Exists
+        );
     }
 }
 
 /// A create, resend or close that finds its write done waits for the replicas to have that write.
 #[tokio::test]
+#[ignore = "needs Redis"]
 async fn a_call_that_finds_its_write_waits_for_the_replicas() {
     let _lock = SERVER.lock().await;
-    let Some(url) = server_url("STREAMS_REDIS_URL") else {
-        return;
-    };
+    let url = standalone_url();
     let replicas = replicas(&url).await;
-    if replicas.is_empty() {
-        let required = std::env::var("STREAMS_REQUIRE").unwrap_or_default();
-        assert!(
-            !required.split(',').any(|service| service.trim() == "redis"),
-            "STREAMS_REQUIRE names redis, but the server at STREAMS_REDIS_URL has no replica"
-        );
-        eprintln!("give the server at STREAMS_REDIS_URL a replica to run this case");
-        return;
-    }
+    assert!(
+        !replicas.is_empty(),
+        "the server at STREAMS_REDIS_URL needs a replica"
+    );
     let (namespace, handle) = (
         unique("ns"),
         StreamHandle {
@@ -207,9 +203,9 @@ async fn a_call_that_finds_its_write_waits_for_the_replicas() {
         .await
         .unwrap();
     pause(&replicas).await;
-    plain.append(&namespace, &handle.id, &batch).await.unwrap();
+    plain.append(&namespace, &handle, &batch).await.unwrap();
     let resent = waits[0]
-        .append(&namespace, &handle.id, &batch)
+        .append(&namespace, &handle, &batch)
         .await
         .map(|_| ());
     plain
@@ -230,13 +226,10 @@ async fn a_call_that_finds_its_write_waits_for_the_replicas() {
         .map(|_| ());
     resume(&replicas).await;
     for result in [resent, closed, found] {
-        assert_eq!(
-            StreamError::from(result.unwrap_err()).reason,
-            Reason::Storage
-        );
+        assert_eq!(result.unwrap_err().reason, Reason::Storage);
     }
     let enough = store(&url, false, replicas.len(), LONG).await;
-    let resent = enough.append(&namespace, &handle.id, &batch).await.unwrap();
+    let resent = enough.append(&namespace, &handle, &batch).await.unwrap();
     assert!(resent.resend);
     let closed = enough
         .close(&namespace, &handle, &producer, b"")
@@ -248,17 +241,18 @@ async fn a_call_that_finds_its_write_waits_for_the_replicas() {
 /// Writes with `WAIT` don't queue behind each other's `WAIT`. Standalone only, since a cluster
 /// spreads the Streams over its nodes.
 #[tokio::test]
+#[ignore = "needs Redis"]
 async fn writes_wait_for_their_replicas_at_once() {
     let _lock = SERVER.lock().await;
-    let Some(url) = server_url("STREAMS_REDIS_URL") else {
-        return;
-    };
+    let url = standalone_url();
     // No test server has this many replicas, so each `WAIT` blocks until the case unblocks it.
     let mut options = RedisStoreOptions::new(&url);
-    options.key_prefix = PREFIX.to_string();
-    options.wait_replicas = 16;
+    options.key_prefix = PREFIX.parse().unwrap();
     options.response_timeout = Duration::from_secs(60);
-    options.wait_timeout = Duration::from_secs(30);
+    options.wait = Some(WaitOptions {
+        replicas: NonZeroUsize::new(16).unwrap(),
+        timeout: Duration::from_secs(30),
+    });
     let waits = RedisStore::connect(options).await.unwrap();
     let namespace = unique("ns");
     // A write that finds no script runs its `WAIT` twice, so load the script first.
@@ -319,10 +313,7 @@ async fn writes_wait_for_their_replicas_at_once() {
         assert_eq!(unblocked, 1, "client {id} was no longer blocked");
     }
     for result in writes.join_all().await {
-        assert_eq!(
-            StreamError::from(result.unwrap_err()).reason,
-            Reason::Storage
-        );
+        assert_eq!(result.unwrap_err().reason, Reason::Storage);
     }
 }
 

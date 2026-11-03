@@ -1,11 +1,11 @@
 //! The Redis users of `docs/redis.md`, with exactly the key access and commands it lists per role,
 //! run every Store call of that role, on a standalone server and on a cluster whose slot moves.
 
-mod support;
-
 use prost::Message;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use support::server_url;
+use std::{
+    num::NonZeroUsize,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 use temporalio_common::protos::temporal::api::common::v1::Payload;
 use temporalio_streams::{
     Reason,
@@ -17,7 +17,10 @@ use temporalio_streams::{
     },
     store::{Batch, Owner, Store, Withdrawal},
 };
-use temporalio_streams_redis::{RedisStore, RedisStoreOptions};
+use temporalio_streams_redis::{
+    RedisStore, RedisStoreOptions, WaitOptions,
+    testing::{cluster_url, standalone_url},
+};
 
 const PREFIX: &str = "streams-acl";
 
@@ -78,7 +81,7 @@ async fn store(url: String) -> Box<dyn Store> {
 }
 
 async fn store_with(mut options: RedisStoreOptions) -> Box<dyn Store> {
-    options.key_prefix = PREFIX.to_string();
+    options.key_prefix = PREFIX.parse().unwrap();
     Box::new(RedisStore::connect(options).await.unwrap())
 }
 
@@ -124,10 +127,9 @@ fn client_named(process: &str) -> Producer {
 }
 
 #[tokio::test]
+#[ignore = "needs Redis"]
 async fn the_documented_commands_run_every_call_of_each_role() {
-    let Some(url) = server_url("STREAMS_REDIS_URL") else {
-        return;
-    };
+    let url = standalone_url();
     let unique = unique();
     let namespace = format!("ns-{unique}");
     let (producer_name, reader_name) = (format!("prod-{unique}"), format!("read-{unique}"));
@@ -261,8 +263,10 @@ async fn the_documented_commands_run_every_call_of_each_role() {
     // With `+wait`, too few replicas is a Store failure, not a refusal.
     let mut options =
         RedisStoreOptions::new(user(&url, &producer_name, &namespace, PRODUCER).await);
-    options.wait_replicas = 16;
-    options.wait_timeout = Duration::from_millis(50);
+    options.wait = Some(WaitOptions {
+        replicas: NonZeroUsize::new(16).unwrap(),
+        timeout: Duration::from_millis(50),
+    });
     let waits = store_with(options).await;
     let failed = waits
         .create(
@@ -363,10 +367,9 @@ async fn primaries(conn: &mut redis::cluster_async::ClusterConnection) -> Vec<Pr
 /// While a slot moves, the source answers `ASK` for the Stream's keys that it gave away, so the
 /// Store's client sends `ASKING` to the target.
 #[tokio::test]
+#[ignore = "needs a Redis cluster"]
 async fn the_documented_commands_serve_a_cluster_while_a_slot_moves() {
-    let Some(url) = server_url("STREAMS_REDIS_CLUSTER_URL") else {
-        return;
-    };
+    let url = cluster_url();
     let unique = unique();
     let namespace = format!("ns-{unique}");
     let mut cluster = redis::cluster::ClusterClient::new(vec![url.as_str()])
@@ -416,7 +419,7 @@ async fn the_documented_commands_serve_a_cluster_while_a_slot_moves() {
     let connect = |name: &str| {
         let mut options = RedisStoreOptions::new(login(&url, name));
         options.cluster = true;
-        options.key_prefix = PREFIX.to_string();
+        options.key_prefix = PREFIX.parse().unwrap();
         RedisStore::connect(options)
     };
     let producer = connect(&producer_name).await.unwrap();
@@ -435,7 +438,7 @@ async fn the_documented_commands_serve_a_cluster_while_a_slot_moves() {
         .await
         .unwrap();
     producer
-        .append(&namespace, &handle.id, &batch(1))
+        .append(&namespace, &handle, &batch(1))
         .await
         .unwrap();
 
@@ -460,7 +463,7 @@ async fn the_documented_commands_serve_a_cluster_while_a_slot_moves() {
         .arg(keys.producers());
     source.run(&migrate).await;
 
-    let appended = producer.append(&namespace, &handle.id, &batch(2)).await;
+    let appended = producer.append(&namespace, &handle, &batch(2)).await;
     let read = reader.read(&namespace, &handle.id, 0, 10).await;
     let read_back = reader.read_back(&namespace, &handle.id, i64::MAX, 10).await;
     let deadline = tokio::time::Instant::now() + Duration::from_millis(300);

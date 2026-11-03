@@ -20,6 +20,8 @@ tls-aws-lc = ["temporalio-common/tls-aws-lc"]
 # Turns on `tls-aws-lc` and the FIPS mode of `aws-lc-rs`, so that the shared rustls provider links
 # `aws-lc-fips-sys`.
 fips = ["tls-aws-lc", "dep:aws-lc-rs"]
+# The test support of the crate's own tests. Nothing else needs it.
+test-support = []
 
 [dependencies]
 async-trait = "0.1"
@@ -48,6 +50,7 @@ tonic-prost-build = { workspace = true }
 
 [dev-dependencies]
 temporalio-streams = { workspace = true, features = ["test-support"] }
+temporalio-streams-redis = { path = ".", default-features = false, features = ["test-support"] }
 tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "test-util", "time"] }
 
 [lints]

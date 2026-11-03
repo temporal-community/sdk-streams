@@ -6,6 +6,13 @@ mod support;
 use temporalio_streams::testing;
 
 #[tokio::test]
+#[ignore = "needs Redis"]
 async fn the_service_suite_passes_on_redis() {
-    testing::run(support::backends(), testing::service::CASES).await;
+    testing::run(support::standalone(), testing::service::CASES).await;
+}
+
+#[tokio::test]
+#[ignore = "needs a Redis cluster"]
+async fn the_service_suite_passes_on_a_redis_cluster() {
+    testing::run(support::cluster(), testing::service::CASES).await;
 }
