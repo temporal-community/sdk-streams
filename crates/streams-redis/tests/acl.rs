@@ -175,10 +175,11 @@ async fn the_documented_commands_run_every_call_of_each_role() {
             .len(),
         1
     );
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+    // The log has an entry after 0, so the Reader's blocking read wakes at once.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     assert!(
-        !reader
-            .wait_after(&namespace, "s", first, deadline)
+        reader
+            .wait_after(&namespace, "s", 0, deadline)
             .await
             .unwrap()
     );
@@ -202,7 +203,9 @@ async fn the_documented_commands_run_every_call_of_each_role() {
         .unwrap();
 
     // An append after the Retention trims the old Records and prunes the old Producers. An open
-    // Workflow Stream has the safety TTL, so it doesn't expire with the Retention.
+    // Workflow Stream has the safety TTL, so it doesn't expire with the Retention. The scripts
+    // read the server's `TIME`, so that every writer trims on one clock. So this case must let
+    // that clock pass, and no client hook can stand in for it.
     let short = StreamHandle {
         id: "short".to_string(),
         ..Default::default()

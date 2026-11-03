@@ -3,7 +3,7 @@
 
 mod support;
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use support::server_url;
 use temporalio_streams::{
     Reason, StreamError,
@@ -253,11 +253,15 @@ async fn writes_wait_for_their_replicas_at_once() {
     let Some(url) = server_url("STREAMS_REDIS_URL") else {
         return;
     };
-    // No test server has this many replicas, so each `WAIT` takes its whole timeout.
-    let timeout = Duration::from_millis(500);
-    let waits = store(&url, false, 16, timeout).await;
+    // No test server has this many replicas, so each `WAIT` blocks until the case unblocks it.
+    let mut options = RedisStoreOptions::new(&url);
+    options.key_prefix = PREFIX.to_string();
+    options.wait_replicas = 16;
+    options.response_timeout = Duration::from_secs(60);
+    options.wait_timeout = Duration::from_secs(30);
+    let waits = RedisStore::connect(options).await.unwrap();
     let namespace = unique("ns");
-    // A write that finds no script waits once before the reload and once after, so load it first.
+    // A write that finds no script runs its `WAIT` twice, so load the script first.
     store(&url, false, 0, SHORT)
         .await
         .create(
@@ -272,7 +276,6 @@ async fn writes_wait_for_their_replicas_at_once() {
         )
         .await
         .unwrap();
-    let start = Instant::now();
     let mut writes = tokio::task::JoinSet::new();
     for i in 0..4 {
         let (waits, namespace) = (waits.clone(), namespace.clone());
@@ -292,12 +295,51 @@ async fn writes_wait_for_their_replicas_at_once() {
                 .await
         });
     }
+    // Writes that share a connection would run their `WAIT`s one after the other, so the server
+    // would never show all four at once.
+    let mut admin = admin(&url).await;
+    let blocked = loop {
+        let blocked = waiting_clients(&mut admin).await;
+        if blocked.len() == 4 {
+            break blocked;
+        }
+        assert!(
+            writes.try_join_next().is_none(),
+            "a write ended before all four waited at once"
+        );
+        tokio::task::yield_now().await;
+    };
+    for id in blocked {
+        let _: i64 = redis::cmd("CLIENT")
+            .arg("UNBLOCK")
+            .arg(id)
+            .query_async(&mut admin)
+            .await
+            .unwrap();
+    }
     for result in writes.join_all().await {
         assert_eq!(
             StreamError::from(result.unwrap_err()).reason,
             Reason::Storage
         );
     }
-    // One after the other, the four writes take four timeouts.
-    assert!(start.elapsed() < timeout * 3, "{:?}", start.elapsed());
+}
+
+/// The ids of the clients that block in `WAIT`.
+async fn waiting_clients(admin: &mut redis::aio::MultiplexedConnection) -> Vec<String> {
+    let clients: String = redis::cmd("CLIENT")
+        .arg("LIST")
+        .query_async(admin)
+        .await
+        .unwrap();
+    clients
+        .lines()
+        .filter(|client| client.split(' ').any(|field| field == "cmd=wait"))
+        .filter_map(|client| {
+            client
+                .split(' ')
+                .find_map(|field| field.strip_prefix("id="))
+        })
+        .map(str::to_string)
+        .collect()
 }
