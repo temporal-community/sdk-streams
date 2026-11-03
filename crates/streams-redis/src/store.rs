@@ -53,6 +53,16 @@ impl RedisStoreOptions {
     pub fn new(url: impl Into<String>) -> Self {
         Self {
             urls: vec![url.into()],
+            ..Self::default()
+        }
+    }
+}
+
+/// The defaults with no URL. A Store needs at least one before it connects.
+impl Default for RedisStoreOptions {
+    fn default() -> Self {
+        Self {
+            urls: Vec::new(),
             cluster: false,
             key_prefix: temporalio_streams::ids::DEFAULT_KEY_PREFIX.to_string(),
             retention: DEFAULT_RETENTION,
