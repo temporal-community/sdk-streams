@@ -283,12 +283,7 @@ impl RedisStore {
             ));
         };
         let reply = Self::write_and_wait(wait, script, cmd, lease.conn()).await;
-        // After a transport error the `WAIT` can still block the connection, so only a write that
-        // got its answers gives it back.
-        if reply.is_ok() {
-            lease.keep();
-        }
-        reply?
+        lease.settle(reply)?
     }
 
     /// The script argument that tells a write whether a `WAIT` follows it.
