@@ -103,10 +103,6 @@ impl std::fmt::Debug for RedisStore {
     }
 }
 
-fn millis(duration: Duration) -> u64 {
-    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
-}
-
 impl RedisStore {
     /// Connects to Redis and checks that it is Redis 7.0 or later.
     pub async fn connect(options: RedisStoreOptions) -> RedisStoreResult<Self> {
@@ -159,10 +155,10 @@ impl RedisStore {
         };
         let mut cmd = script_cmd("EVALSHA", &scripts::CREATE_SCRIPT, &keys);
         cmd.arg(FORMAT_VERSION)
-            .arg(millis(retention))
+            .arg(retention.as_millis())
             .arg(owner)
-            .arg(millis(self.safety_ttl))
-            .arg(millis(TOMBSTONE))
+            .arg(self.safety_ttl.as_millis())
+            .arg(TOMBSTONE.as_millis())
             .arg(chain)
             .arg(self.wait_flag());
         let reply = self.write(&scripts::CREATE_SCRIPT, &cmd).await?;
@@ -198,8 +194,8 @@ impl RedisStore {
             .arg(epoch_key(&epoch))
             .arg(batch.sequence)
             .arg(withdrawal.superseded)
-            .arg(millis(self.safety_ttl))
-            .arg(millis(TOMBSTONE))
+            .arg(self.safety_ttl.as_millis())
+            .arg(TOMBSTONE.as_millis())
             .arg(batch.digest)
             .arg(self.wait_flag());
         for record in batch.records {
@@ -234,7 +230,7 @@ impl RedisStore {
             .arg(producer.kind)
             .arg(&producer.id)
             .arg(epoch_key(&epoch))
-            .arg(millis(TOMBSTONE))
+            .arg(TOMBSTONE.as_millis())
             .arg(record)
             .arg(owner_chain(handle))
             .arg(self.wait_flag());
@@ -312,7 +308,7 @@ impl RedisStore {
             .add_command(cmd.clone())
             .cmd("WAIT")
             .arg(wait.replicas)
-            .arg(millis(wait.timeout));
+            .arg(wait.timeout.as_millis());
         let mut loaded = false;
         loop {
             let replies: Vec<Value> = pipe.query_async(conn).await?;
@@ -377,7 +373,8 @@ impl RedisStore {
                 .arg("COUNT")
                 .arg(1)
                 .arg("BLOCK")
-                .arg(millis(wait).max(1))
+                // `BLOCK 0` waits with no end, so a read at its deadline blocks for 1 ms.
+                .arg(wait.as_millis().max(1))
                 .arg("STREAMS")
                 .arg(keys.log())
                 .arg(&after);
