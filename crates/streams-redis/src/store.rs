@@ -9,7 +9,7 @@ use conn::{BlockingPool, Endpoint, SharedConnection, WaitPool};
 use redis::{Cmd, ErrorKind, RedisResult, Script, ServerErrorKind, Value};
 use std::{num::NonZeroUsize, sync::Arc, time::Duration};
 use temporalio_streams::{
-    StreamError, StreamResult,
+    StreamResult,
     epoch::epoch_key,
     ids::StreamKeys,
     offset::{entry_id_of_offset, offset_of_entry_id},
@@ -83,148 +83,6 @@ impl RedisStore {
         StreamKeys::new(self.prefix.as_str(), namespace, stream_id)
     }
 
-    /// Creates a Stream, or finds it. A Workflow-owned Stream stores its handle's run chain, which
-    /// later creates and closes must name.
-    pub async fn create(
-        &self,
-        namespace: &str,
-        handle: &StreamHandle,
-        retention: Option<Duration>,
-        owner: Owner,
-        _withdrawal: &Withdrawal<'_>,
-    ) -> RedisStoreResult<Created> {
-        let keys = self.keys(namespace, &handle.id);
-        let retention = retention.filter(|r| !r.is_zero()).unwrap_or(self.retention);
-        let (owner, chain) = match owner {
-            Owner::Workflow => ("wf", owner_chain(handle)),
-            Owner::Client => ("client", String::new()),
-        };
-        let mut cmd = script_cmd("EVALSHA", &scripts::CREATE_SCRIPT, &keys);
-        cmd.arg(FORMAT_VERSION)
-            .arg(retention.as_millis())
-            .arg(owner)
-            .arg(self.safety_ttl.as_millis())
-            .arg(TOMBSTONE.as_millis())
-            .arg(chain)
-            .arg(self.waits());
-        let reply = self.write(&scripts::CREATE_SCRIPT, &cmd).await?;
-        let [outcome, stored] = strings::<2>(reply, "create")?;
-        let outcome = match outcome.as_str() {
-            "created" => CreateOutcome::Created,
-            "exists" => CreateOutcome::Exists,
-            other => return Err(bad_reply("create", other)),
-        };
-        let stored: u64 = stored.parse().map_err(|_| bad_reply("create", &stored))?;
-        Ok(Created {
-            outcome,
-            retention: Duration::from_millis(stored),
-            flagged: false,
-        })
-    }
-
-    /// Appends one batch.
-    pub async fn append(
-        &self,
-        namespace: &str,
-        stream_id: &str,
-        batch: &Batch<'_>,
-    ) -> RedisStoreResult<Appended> {
-        let keys = self.keys(namespace, stream_id);
-        let producer = batch.producer;
-        let epoch = producer.epoch.unwrap_or_default();
-        let withdrawal = &batch.withdrawal;
-        let mut cmd = script_cmd("EVALSHA", &scripts::APPEND_SCRIPT, &keys);
-        cmd.arg(FORMAT_VERSION)
-            .arg(producer.kind)
-            .arg(&producer.id)
-            .arg(epoch_key(&epoch))
-            .arg(batch.sequence)
-            .arg(withdrawal.superseded)
-            .arg(self.safety_ttl.as_millis())
-            .arg(TOMBSTONE.as_millis())
-            .arg(batch.digest)
-            .arg(self.waits());
-        for record in batch.records {
-            cmd.arg(record.as_slice());
-        }
-        let reply = self.write(&scripts::APPEND_SCRIPT, &cmd).await?;
-        let [outcome, first, last, flag] = strings::<4>(reply, "append")?;
-        let resend = match outcome.as_str() {
-            "ok" => false,
-            "resend" => true,
-            other => return Err(bad_reply("append", other)),
-        };
-        let offsets = match (first.as_str(), last.as_str()) {
-            ("", _) | (_, "") => None,
-            (first, last) => Some((offset_of_entry_id(first)?, offset_of_entry_id(last)?)),
-        };
-        Ok(Appended {
-            offsets,
-            resend,
-            flagged: flagged(&flag, "append")?,
-        })
-    }
-
-    /// Closes a Stream with an encoded close Record, if the Producer's kind and the handle's run
-    /// chain are the owner's.
-    pub async fn close(
-        &self,
-        namespace: &str,
-        handle: &StreamHandle,
-        producer: &Producer,
-        record: &[u8],
-    ) -> RedisStoreResult<Closed> {
-        let keys = self.keys(namespace, &handle.id);
-        let epoch = producer.epoch.unwrap_or_default();
-        let mut cmd = script_cmd("EVALSHA", &scripts::CLOSE_SCRIPT, &keys);
-        cmd.arg(FORMAT_VERSION)
-            .arg(producer.kind)
-            .arg(&producer.id)
-            .arg(epoch_key(&epoch))
-            .arg(TOMBSTONE.as_millis())
-            .arg(record)
-            .arg(owner_chain(handle))
-            .arg(self.waits());
-        let reply = self.write(&scripts::CLOSE_SCRIPT, &cmd).await?;
-        let [outcome, id] = strings::<2>(reply, "close")?;
-        let already = match outcome.as_str() {
-            "closed" => false,
-            "already" => true,
-            other => return Err(bad_reply("close", other)),
-        };
-        Ok(Closed {
-            offset: offset_of_entry_id(&id)?,
-            already,
-        })
-    }
-
-    /// Reads the Stream's state and up to `count` entries from `from`, inclusive. Zero reads
-    /// from the start of the log.
-    pub async fn read(
-        &self,
-        namespace: &str,
-        stream_id: &str,
-        from: i64,
-        count: usize,
-    ) -> RedisStoreResult<(StreamState, Vec<Entry>)> {
-        let keys = self.keys(namespace, stream_id);
-        let start = if from > 0 {
-            entry_id_of_offset(from)
-        } else {
-            "-".to_string()
-        };
-        // With `EVALSHA_RO`, a Reader's user needs only read access to the keys.
-        let mut cmd = redis::cmd("EVALSHA_RO");
-        cmd.arg(scripts::READ_SCRIPT.get_hash())
-            .arg(2)
-            .arg(keys.meta())
-            .arg(keys.log())
-            .arg(start)
-            .arg(count);
-        let reply = run_script(&scripts::READ_SCRIPT, &cmd, &mut self.shared.clone()).await?;
-        read_reply(reply)
-    }
-
     /// Runs a write script, and then `WAIT` when the options name replicas. Both are in one
     /// pipeline on one connection, so the `WAIT` covers the script's writes.
     async fn write(&self, script: &Script, cmd: &Cmd) -> RedisStoreResult<Value> {
@@ -277,15 +135,169 @@ impl RedisStore {
             }
         }
     }
+}
+
+// The trait returns Stream errors, so the runtime and lang get the same reasons on every backend.
+// A `?` turns the crate's error into one, and a Redis error goes through the crate's error first.
+#[async_trait::async_trait]
+impl Store for RedisStore {
+    // Every rule but the run fence is in the Lua scripts.
+    fn capabilities(&self) -> Capabilities {
+        Capabilities::ALL.without(Capabilities::RUN_FENCE)
+    }
+
+    /// Creates a Stream, or finds it. A Workflow-owned Stream stores its handle's run chain, which
+    /// later creates and closes must name.
+    async fn create(
+        &self,
+        namespace: &str,
+        handle: &StreamHandle,
+        retention: Option<Duration>,
+        owner: Owner,
+        _withdrawal: &Withdrawal<'_>,
+    ) -> StreamResult<Created> {
+        let keys = self.keys(namespace, &handle.id);
+        let retention = retention.filter(|r| !r.is_zero()).unwrap_or(self.retention);
+        let (owner, chain) = match owner {
+            Owner::Workflow => ("wf", owner_chain(handle)),
+            Owner::Client => ("client", String::new()),
+        };
+        let mut cmd = script_cmd("EVALSHA", &scripts::CREATE_SCRIPT, &keys);
+        cmd.arg(FORMAT_VERSION)
+            .arg(retention.as_millis())
+            .arg(owner)
+            .arg(self.safety_ttl.as_millis())
+            .arg(TOMBSTONE.as_millis())
+            .arg(chain)
+            .arg(self.waits());
+        let reply = self.write(&scripts::CREATE_SCRIPT, &cmd).await?;
+        let [outcome, stored] = strings::<2>(reply, "create")?;
+        let outcome = match outcome.as_str() {
+            "created" => CreateOutcome::Created,
+            "exists" => CreateOutcome::Exists,
+            other => return Err(bad_reply("create", other).into()),
+        };
+        let stored: u64 = stored.parse().map_err(|_| bad_reply("create", &stored))?;
+        Ok(Created {
+            outcome,
+            retention: Duration::from_millis(stored),
+            flagged: false,
+        })
+    }
+
+    /// Appends one batch.
+    async fn append(
+        &self,
+        namespace: &str,
+        handle: &StreamHandle,
+        batch: &Batch<'_>,
+    ) -> StreamResult<Appended> {
+        let keys = self.keys(namespace, &handle.id);
+        let producer = batch.producer;
+        let epoch = producer.epoch.unwrap_or_default();
+        let withdrawal = &batch.withdrawal;
+        let mut cmd = script_cmd("EVALSHA", &scripts::APPEND_SCRIPT, &keys);
+        cmd.arg(FORMAT_VERSION)
+            .arg(producer.kind)
+            .arg(&producer.id)
+            .arg(epoch_key(&epoch))
+            .arg(batch.sequence)
+            .arg(withdrawal.superseded)
+            .arg(self.safety_ttl.as_millis())
+            .arg(TOMBSTONE.as_millis())
+            .arg(batch.digest)
+            .arg(self.waits());
+        for record in batch.records {
+            cmd.arg(record.as_slice());
+        }
+        let reply = self.write(&scripts::APPEND_SCRIPT, &cmd).await?;
+        let [outcome, first, last, flag] = strings::<4>(reply, "append")?;
+        let resend = match outcome.as_str() {
+            "ok" => false,
+            "resend" => true,
+            other => return Err(bad_reply("append", other).into()),
+        };
+        let offsets = match (first.as_str(), last.as_str()) {
+            ("", _) | (_, "") => None,
+            (first, last) => Some((offset_of_entry_id(first)?, offset_of_entry_id(last)?)),
+        };
+        Ok(Appended {
+            offsets,
+            resend,
+            flagged: flagged(&flag, "append")?,
+        })
+    }
+
+    /// Closes a Stream with an encoded close Record, if the Producer's kind and the handle's run
+    /// chain are the owner's.
+    async fn close(
+        &self,
+        namespace: &str,
+        handle: &StreamHandle,
+        producer: &Producer,
+        record: &[u8],
+    ) -> StreamResult<Closed> {
+        let keys = self.keys(namespace, &handle.id);
+        let epoch = producer.epoch.unwrap_or_default();
+        let mut cmd = script_cmd("EVALSHA", &scripts::CLOSE_SCRIPT, &keys);
+        cmd.arg(FORMAT_VERSION)
+            .arg(producer.kind)
+            .arg(&producer.id)
+            .arg(epoch_key(&epoch))
+            .arg(TOMBSTONE.as_millis())
+            .arg(record)
+            .arg(owner_chain(handle))
+            .arg(self.waits());
+        let reply = self.write(&scripts::CLOSE_SCRIPT, &cmd).await?;
+        let [outcome, id] = strings::<2>(reply, "close")?;
+        let already = match outcome.as_str() {
+            "closed" => false,
+            "already" => true,
+            other => return Err(bad_reply("close", other).into()),
+        };
+        Ok(Closed {
+            offset: offset_of_entry_id(&id)?,
+            already,
+        })
+    }
+
+    /// Reads the Stream's state and up to `count` entries from `from`, inclusive. Zero reads
+    /// from the start of the log.
+    async fn read(
+        &self,
+        namespace: &str,
+        stream_id: &str,
+        from: i64,
+        count: usize,
+    ) -> StreamResult<(StreamState, Vec<Entry>)> {
+        let keys = self.keys(namespace, stream_id);
+        let start = if from > 0 {
+            entry_id_of_offset(from)
+        } else {
+            "-".to_string()
+        };
+        // With `EVALSHA_RO`, a Reader's user needs only read access to the keys.
+        let mut cmd = redis::cmd("EVALSHA_RO");
+        cmd.arg(scripts::READ_SCRIPT.get_hash())
+            .arg(2)
+            .arg(keys.meta())
+            .arg(keys.log())
+            .arg(start)
+            .arg(count);
+        let reply = run_script(&scripts::READ_SCRIPT, &cmd, &mut self.shared.clone())
+            .await
+            .map_err(RedisStoreError::from)?;
+        Ok(read_reply(reply)?)
+    }
 
     /// Reads up to `count` entries at or before `before`, newest first, with `XREVRANGE`.
-    pub async fn read_back(
+    async fn read_back(
         &self,
         namespace: &str,
         stream_id: &str,
         before: i64,
         count: usize,
-    ) -> RedisStoreResult<Vec<Entry>> {
+    ) -> StreamResult<Vec<Entry>> {
         let keys = self.keys(namespace, stream_id);
         let reply: Value = redis::cmd("XREVRANGE")
             .arg(keys.log())
@@ -294,22 +306,26 @@ impl RedisStore {
             .arg("COUNT")
             .arg(count)
             .query_async(&mut self.shared.clone())
-            .await?;
+            .await
+            .map_err(RedisStoreError::from)?;
         let Value::Array(entries) = reply else {
-            return Err(bad_reply("read back", reply));
+            return Err(bad_reply("read back", reply).into());
         };
-        entries.into_iter().map(entry).collect()
+        Ok(entries
+            .into_iter()
+            .map(entry)
+            .collect::<RedisStoreResult<_>>()?)
     }
 
     /// Waits until the log has an entry after `after`, or `deadline` passes. Returns whether an
     /// entry came. The wait uses a dedicated connection.
-    pub async fn wait_after(
+    async fn wait_after(
         &self,
         namespace: &str,
         stream_id: &str,
         after: i64,
         deadline: Instant,
-    ) -> RedisStoreResult<bool> {
+    ) -> StreamResult<bool> {
         let keys = self.keys(namespace, stream_id);
         if deadline <= Instant::now() {
             return Ok(false);
@@ -332,93 +348,15 @@ impl RedisStore {
                 .arg(&after);
             xread
         };
-        let reply = self.blocking.query(&keys.log(), deadline, xread).await?;
+        let reply = self
+            .blocking
+            .query(&keys.log(), deadline, xread)
+            .await
+            .map_err(RedisStoreError::from)?;
         Ok(
             matches!(reply, Some(Value::Array(ref keys)) if !keys.is_empty())
                 || matches!(reply, Some(Value::Map(ref keys)) if !keys.is_empty()),
         )
-    }
-}
-
-// The trait returns Stream errors, so the runtime and lang get the same reasons on every backend.
-// Each method turns the crate's error into one at this boundary.
-#[async_trait::async_trait]
-impl Store for RedisStore {
-    // Every rule but the run fence is in the Lua scripts.
-    fn capabilities(&self) -> Capabilities {
-        Capabilities::ALL.without(Capabilities::RUN_FENCE)
-    }
-
-    async fn create(
-        &self,
-        namespace: &str,
-        handle: &StreamHandle,
-        retention: Option<Duration>,
-        owner: Owner,
-        withdrawal: &Withdrawal<'_>,
-    ) -> StreamResult<Created> {
-        RedisStore::create(self, namespace, handle, retention, owner, withdrawal)
-            .await
-            .map_err(StreamError::from)
-    }
-
-    async fn append(
-        &self,
-        namespace: &str,
-        handle: &StreamHandle,
-        batch: &Batch<'_>,
-    ) -> StreamResult<Appended> {
-        RedisStore::append(self, namespace, &handle.id, batch)
-            .await
-            .map_err(StreamError::from)
-    }
-
-    async fn close(
-        &self,
-        namespace: &str,
-        handle: &StreamHandle,
-        producer: &Producer,
-        record: &[u8],
-    ) -> StreamResult<Closed> {
-        RedisStore::close(self, namespace, handle, producer, record)
-            .await
-            .map_err(StreamError::from)
-    }
-
-    async fn read(
-        &self,
-        namespace: &str,
-        stream_id: &str,
-        from: i64,
-        count: usize,
-    ) -> StreamResult<(StreamState, Vec<Entry>)> {
-        RedisStore::read(self, namespace, stream_id, from, count)
-            .await
-            .map_err(StreamError::from)
-    }
-
-    async fn wait_after(
-        &self,
-        namespace: &str,
-        stream_id: &str,
-        after: i64,
-        deadline: Instant,
-    ) -> StreamResult<bool> {
-        RedisStore::wait_after(self, namespace, stream_id, after, deadline)
-            .await
-            .map_err(StreamError::from)
-    }
-
-    async fn read_back(
-        &self,
-        namespace: &str,
-        stream_id: &str,
-        before: i64,
-        count: usize,
-    ) -> StreamResult<Vec<Entry>> {
-        RedisStore::read_back(self, namespace, stream_id, before, count)
-            .await
-            .map_err(StreamError::from)
     }
 }
 

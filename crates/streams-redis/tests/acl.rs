@@ -440,7 +440,7 @@ async fn the_documented_commands_serve_a_cluster_while_a_slot_moves() {
         .await
         .unwrap();
     producer
-        .append(&namespace, &handle.id, &batch(1))
+        .append(&namespace, &handle, &batch(1))
         .await
         .unwrap();
 
@@ -465,7 +465,7 @@ async fn the_documented_commands_serve_a_cluster_while_a_slot_moves() {
         .arg(keys.producers());
     source.run(&migrate).await;
 
-    let appended = producer.append(&namespace, &handle.id, &batch(2)).await;
+    let appended = producer.append(&namespace, &handle, &batch(2)).await;
     let read = reader.read(&namespace, &handle.id, 0, 10).await;
     let read_back = reader.read_back(&namespace, &handle.id, i64::MAX, 10).await;
     let deadline = tokio::time::Instant::now() + Duration::from_millis(300);

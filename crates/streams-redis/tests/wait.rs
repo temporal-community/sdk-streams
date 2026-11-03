@@ -6,9 +6,9 @@ mod support;
 use std::{num::NonZeroUsize, time::Duration};
 use support::server_url;
 use temporalio_streams::{
-    Reason, StreamError,
+    Reason,
     proto::{Producer, ProducerEpoch, StreamHandle, StreamProducerKind},
-    store::{Batch, CreateOutcome, Owner, Withdrawal},
+    store::{Batch, CreateOutcome, Owner, Store, Withdrawal},
 };
 use temporalio_streams_redis::{RedisStore, RedisStoreOptions, WaitOptions};
 
@@ -141,7 +141,7 @@ async fn a_write_that_too_few_replicas_have_fails_and_its_retry_finds_it() {
         } else {
             let _: () = flush.query_async(&mut admin(&url).await).await.unwrap();
         }
-        let refused = StreamError::from(create(&waits).await.unwrap_err());
+        let refused = create(&waits).await.unwrap_err();
         assert_eq!(refused.reason, Reason::Storage, "{refused}");
         let plain = store(&url, cluster, 0, SHORT).await;
         assert_eq!(create(&plain).await.unwrap().outcome, CreateOutcome::Exists);
@@ -207,9 +207,9 @@ async fn a_call_that_finds_its_write_waits_for_the_replicas() {
         .await
         .unwrap();
     pause(&replicas).await;
-    plain.append(&namespace, &handle.id, &batch).await.unwrap();
+    plain.append(&namespace, &handle, &batch).await.unwrap();
     let resent = waits[0]
-        .append(&namespace, &handle.id, &batch)
+        .append(&namespace, &handle, &batch)
         .await
         .map(|_| ());
     plain
@@ -230,13 +230,10 @@ async fn a_call_that_finds_its_write_waits_for_the_replicas() {
         .map(|_| ());
     resume(&replicas).await;
     for result in [resent, closed, found] {
-        assert_eq!(
-            StreamError::from(result.unwrap_err()).reason,
-            Reason::Storage
-        );
+        assert_eq!(result.unwrap_err().reason, Reason::Storage);
     }
     let enough = store(&url, false, replicas.len(), LONG).await;
-    let resent = enough.append(&namespace, &handle.id, &batch).await.unwrap();
+    let resent = enough.append(&namespace, &handle, &batch).await.unwrap();
     assert!(resent.resend);
     let closed = enough
         .close(&namespace, &handle, &producer, b"")
@@ -321,10 +318,7 @@ async fn writes_wait_for_their_replicas_at_once() {
         assert_eq!(unblocked, 1, "client {id} was no longer blocked");
     }
     for result in writes.join_all().await {
-        assert_eq!(
-            StreamError::from(result.unwrap_err()).reason,
-            Reason::Storage
-        );
+        assert_eq!(result.unwrap_err().reason, Reason::Storage);
     }
 }
 
