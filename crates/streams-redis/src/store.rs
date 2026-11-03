@@ -246,7 +246,7 @@ impl RedisStore {
         Ok(Appended {
             offsets,
             resend,
-            flagged: flag == "1",
+            flagged: flagged(&flag, "append")?,
         })
     }
 
@@ -544,6 +544,16 @@ async fn run_script(script: &Script, cmd: &Cmd, conn: &mut SharedConnection) -> 
             cmd.query_async(conn).await
         }
         result => result,
+    }
+}
+
+/// The flag of a script answer. Lua has no bool, and a nil would end the answer's array, so the
+/// scripts give `1` or an empty string.
+fn flagged(flag: &str, call: &str) -> RedisStoreResult<bool> {
+    match flag {
+        "1" => Ok(true),
+        "" => Ok(false),
+        other => Err(bad_reply(call, other)),
     }
 }
 
