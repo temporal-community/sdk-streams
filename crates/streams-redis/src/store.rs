@@ -191,7 +191,7 @@ impl RedisStore {
             .arg(self.safety_ttl.as_millis())
             .arg(TOMBSTONE.as_millis())
             .arg(chain)
-            .arg(self.wait_flag());
+            .arg(self.waits());
         let reply = self.write(&scripts::CREATE_SCRIPT, &cmd).await?;
         let [outcome, stored] = strings::<2>(reply, "create")?;
         let outcome = match outcome.as_str() {
@@ -228,19 +228,24 @@ impl RedisStore {
             .arg(self.safety_ttl.as_millis())
             .arg(TOMBSTONE.as_millis())
             .arg(batch.digest)
-            .arg(self.wait_flag());
+            .arg(self.waits());
         for record in batch.records {
             cmd.arg(record.as_slice());
         }
         let reply = self.write(&scripts::APPEND_SCRIPT, &cmd).await?;
         let [outcome, first, last, flag] = strings::<4>(reply, "append")?;
+        let resend = match outcome.as_str() {
+            "ok" => false,
+            "resend" => true,
+            other => return Err(bad_reply("append", other)),
+        };
         let offsets = match (first.as_str(), last.as_str()) {
             ("", _) | (_, "") => None,
             (first, last) => Some((offset_of_entry_id(first)?, offset_of_entry_id(last)?)),
         };
         Ok(Appended {
             offsets,
-            resend: outcome == "resend",
+            resend,
             flagged: flag == "1",
         })
     }
@@ -264,12 +269,17 @@ impl RedisStore {
             .arg(TOMBSTONE.as_millis())
             .arg(record)
             .arg(owner_chain(handle))
-            .arg(self.wait_flag());
+            .arg(self.waits());
         let reply = self.write(&scripts::CLOSE_SCRIPT, &cmd).await?;
         let [outcome, id] = strings::<2>(reply, "close")?;
+        let already = match outcome.as_str() {
+            "closed" => false,
+            "already" => true,
+            other => return Err(bad_reply("close", other)),
+        };
         Ok(Closed {
             offset: offset_of_entry_id(&id)?,
-            already: outcome == "already",
+            already,
         })
     }
 
@@ -317,9 +327,9 @@ impl RedisStore {
         lease.settle(reply)?
     }
 
-    /// The script argument that tells a write whether a `WAIT` follows it.
-    fn wait_flag(&self) -> &'static str {
-        if self.wait.is_some() { "1" } else { "" }
+    /// Whether a `WAIT` follows each write. The write scripts take it as their last argument.
+    fn waits(&self) -> bool {
+        self.wait.is_some()
     }
 
     /// The outer error is a transport error, and the inner one is the server's answer.
@@ -561,18 +571,19 @@ fn strings<const N: usize>(reply: Value, call: &str) -> RedisStoreResult<[String
 }
 
 fn read_reply(reply: Value) -> RedisStoreResult<(StreamState, Vec<Entry>)> {
-    let Value::Array(mut parts) = reply else {
+    let Value::Array(parts) = reply else {
         return Err(bad_reply("read", reply));
     };
-    if parts.len() != 3 {
-        return Err(bad_reply("read", parts));
-    }
-    let entries = parts.pop().expect("three parts");
-    let time = parts.pop().expect("three parts");
-    let meta = parts.pop().expect("three parts");
-    let Value::Array(meta) = meta else {
-        return Err(bad_reply("read", meta));
+    let [
+        Value::Array(meta),
+        Value::Array(time),
+        Value::Array(entries),
+    ] = <[Value; 3]>::try_from(parts).map_err(|parts| bad_reply("read", parts))?
+    else {
+        return Err(bad_reply("read", "parts that are not arrays"));
     };
+    // The script gives an empty string for a field that the Stream doesn't have, since a nil
+    // would end the array.
     let meta: Vec<Option<String>> = meta
         .iter()
         .map(|value| text(value).filter(|text| !text.is_empty()))
@@ -581,37 +592,31 @@ fn read_reply(reply: Value) -> RedisStoreResult<(StreamState, Vec<Entry>)> {
     let offset = |i: usize| -> RedisStoreResult<i64> {
         field(i).map_or(Ok(0), |id| Ok(offset_of_entry_id(&id)?))
     };
-    let number = |i: usize| {
-        field(i)
-            .and_then(|text| text.parse::<i64>().ok())
-            .unwrap_or(0)
+    let number = |i: usize| -> RedisStoreResult<i64> {
+        field(i).map_or(Ok(0), |text| {
+            text.parse().map_err(|_| bad_reply("read", text))
+        })
     };
-    let [seconds, micros] = match time {
-        Value::Array(time) => {
-            let time: Vec<i64> = time
-                .iter()
-                .filter_map(|value| text(value)?.parse().ok())
-                .collect();
-            <[i64; 2]>::try_from(time).map_err(|time| bad_reply("read", time))?
-        }
-        other => return Err(bad_reply("read", other)),
-    };
+    let time: Vec<i64> = time
+        .iter()
+        .map(|value| text(value).and_then(|text| text.parse().ok()))
+        .collect::<Option<_>>()
+        .ok_or_else(|| bad_reply("read", &time))?;
+    let [seconds, micros] = <[i64; 2]>::try_from(time).map_err(|time| bad_reply("read", time))?;
     let state = StreamState {
         exists: field(0).is_some(),
-        version: number(0) as u32,
-        closed_at: if field(1).is_some() {
-            Some(offset(2)?)
-        } else {
-            None
+        version: u32::try_from(number(0)?).map_err(|error| bad_reply("read", error))?,
+        closed_at: match field(1) {
+            Some(_) => Some(offset(2)?),
+            None => None,
         },
         newest: offset(3)?,
         trimmed: offset(4)?,
-        retention: Duration::from_millis(number(5).max(0) as u64),
-        expires_ms: number(6),
+        retention: Duration::from_millis(
+            u64::try_from(number(5)?).map_err(|error| bad_reply("read", error))?,
+        ),
+        expires_ms: number(6)?,
         now_ms: seconds * 1000 + micros / 1000,
-    };
-    let Value::Array(entries) = entries else {
-        return Err(bad_reply("read", entries));
     };
     let entries = entries
         .into_iter()
@@ -621,21 +626,19 @@ fn read_reply(reply: Value) -> RedisStoreResult<(StreamState, Vec<Entry>)> {
 }
 
 fn entry(value: Value) -> RedisStoreResult<Entry> {
-    let Value::Array(mut pair) = value else {
+    let Value::Array(pair) = value else {
         return Err(bad_reply("read", value));
     };
-    if pair.len() != 2 {
-        return Err(bad_reply("read", pair));
-    }
-    let fields = pair.pop().expect("two parts");
-    let id = text(&pair.pop().expect("two parts")).unwrap_or_default();
+    let [id, Value::Array(fields)] =
+        <[Value; 2]>::try_from(pair).map_err(|pair| bad_reply("read", pair))?
+    else {
+        return Err(bad_reply("read", "an entry with no field array"));
+    };
+    let id = text(&id).ok_or_else(|| bad_reply("read", &id))?;
     let mut entry = Entry {
         offset: offset_of_entry_id(&id)?,
         record: None,
         superseded: None,
-    };
-    let Value::Array(fields) = fields else {
-        return Err(bad_reply("read", fields));
     };
     for pair in fields.chunks(2) {
         let (Some(Value::BulkString(name)), Some(Value::BulkString(value))) =
