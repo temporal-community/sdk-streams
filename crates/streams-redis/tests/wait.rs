@@ -310,12 +310,13 @@ async fn writes_wait_for_their_replicas_at_once() {
         tokio::task::yield_now().await;
     };
     for id in blocked {
-        let _: i64 = redis::cmd("CLIENT")
+        let unblocked: i64 = redis::cmd("CLIENT")
             .arg("UNBLOCK")
-            .arg(id)
+            .arg(&id)
             .query_async(&mut admin)
             .await
             .unwrap();
+        assert_eq!(unblocked, 1, "client {id} was no longer blocked");
     }
     for result in writes.join_all().await {
         assert_eq!(
@@ -325,7 +326,8 @@ async fn writes_wait_for_their_replicas_at_once() {
     }
 }
 
-/// The ids of the clients that block in `WAIT`.
+/// The ids of the clients that block in `WAIT` now. `cmd` is only a client's last command, so a
+/// client counts only while its flags have `b`, for blocked.
 async fn waiting_clients(admin: &mut redis::aio::MultiplexedConnection) -> Vec<String> {
     let clients: String = redis::cmd("CLIENT")
         .arg("LIST")
@@ -334,12 +336,14 @@ async fn waiting_clients(admin: &mut redis::aio::MultiplexedConnection) -> Vec<S
         .unwrap();
     clients
         .lines()
-        .filter(|client| client.split(' ').any(|field| field == "cmd=wait"))
         .filter_map(|client| {
-            client
-                .split(' ')
-                .find_map(|field| field.strip_prefix("id="))
+            let field = |name: &str| {
+                client
+                    .split(' ')
+                    .find_map(|field| field.strip_prefix(name)?.strip_prefix('='))
+            };
+            let blocked = field("flags")?.contains('b') && field("cmd")? == "wait";
+            blocked.then(|| field("id").map(str::to_string)).flatten()
         })
-        .map(str::to_string)
         .collect()
 }
