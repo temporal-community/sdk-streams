@@ -138,11 +138,11 @@ impl RedisStore {
     /// Connects to Redis and checks that it is Redis 7.0 or later.
     pub async fn connect(options: RedisStoreOptions) -> RedisStoreResult<Self> {
         check_options(&options)?;
-        let endpoint = Arc::new(Endpoint::parse(
-            &options.urls,
-            options.cluster,
-            options.response_timeout,
-        )?);
+        let endpoint = Endpoint::parse(&options.urls, options.cluster, options.response_timeout)
+            .map_err(|error| {
+                RedisStoreError::invalid(format!("The Redis URLs are wrong: {error}"))
+            })?;
+        let endpoint = Arc::new(endpoint);
         let shared = endpoint.open().await?;
         check_server(&shared).await?;
         let wait = match options.wait_replicas {

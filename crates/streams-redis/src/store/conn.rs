@@ -41,11 +41,18 @@ const WAIT_CONNECTIONS: usize = 8;
 
 /// Where the Store's Redis is, parsed once from the URLs of the options.
 pub(crate) struct Endpoint {
-    /// The standalone server, or each seed of a cluster. The first one gives every node its
-    /// credentials and TLS.
-    seeds: Vec<ConnectionInfo>,
-    cluster: bool,
+    topology: Topology,
     response_timeout: Duration,
+}
+
+/// One server, or the seeds of a cluster. Every node gets the credentials and TLS of the first
+/// one, so each kind holds it by its type.
+enum Topology {
+    Standalone(ConnectionInfo),
+    Cluster {
+        first: ConnectionInfo,
+        rest: Vec<ConnectionInfo>,
+    },
 }
 
 impl Endpoint {
@@ -54,41 +61,71 @@ impl Endpoint {
         cluster: bool,
         response_timeout: Duration,
     ) -> RedisResult<Self> {
-        let count = if cluster { urls.len() } else { 1 };
-        let seeds = urls
-            .iter()
-            .take(count)
-            .map(|url| url.as_str().into_connection_info())
-            .collect::<RedisResult<Vec<_>>>()?;
-        if seeds.is_empty() {
+        let mut seeds = urls.iter().map(|url| url.as_str().into_connection_info());
+        let Some(first) = seeds.next().transpose()? else {
             return Err(RedisError::from((
                 ErrorKind::InvalidClientConfig,
                 "no Redis URL",
             )));
-        }
+        };
+        let rest = seeds.collect::<RedisResult<Vec<_>>>()?;
+        let topology = match (cluster, rest.is_empty()) {
+            (true, _) => Topology::Cluster { first, rest },
+            (false, true) => Topology::Standalone(first),
+            // A standalone Store uses one server, so the other URLs would do nothing.
+            (false, false) => {
+                return Err(RedisError::from((
+                    ErrorKind::InvalidClientConfig,
+                    "a standalone Redis takes one URL, and a cluster's seeds need `cluster`",
+                )));
+            }
+        };
         Ok(Self {
-            seeds,
-            cluster,
+            topology,
             response_timeout,
         })
     }
 
+    fn cluster(&self) -> bool {
+        matches!(self.topology, Topology::Cluster { .. })
+    }
+
+    /// The server, or the cluster seed whose credentials and TLS every node gets.
+    fn first(&self) -> &ConnectionInfo {
+        match &self.topology {
+            Topology::Standalone(first) | Topology::Cluster { first, .. } => first,
+        }
+    }
+
+    /// The server, or each seed of the cluster, the first one first.
+    fn seeds(&self) -> impl Iterator<Item = &ConnectionInfo> {
+        let rest = match &self.topology {
+            Topology::Standalone(_) => &[][..],
+            Topology::Cluster { rest, .. } => rest.as_slice(),
+        };
+        std::iter::once(self.first()).chain(rest)
+    }
+
     /// Opens a connection for short calls, which the client reconnects when it drops.
     pub(crate) async fn open(&self) -> RedisResult<SharedConnection> {
-        if self.cluster {
-            let client = ClusterClient::builder(self.seeds.clone())
-                .response_timeout(self.response_timeout)
-                .build()?;
-            return Ok(SharedConnection::Cluster(
-                client.get_async_connection().await?,
-            ));
+        match &self.topology {
+            Topology::Cluster { .. } => {
+                let client = ClusterClient::builder(self.seeds().cloned())
+                    .response_timeout(self.response_timeout)
+                    .build()?;
+                Ok(SharedConnection::Cluster(
+                    client.get_async_connection().await?,
+                ))
+            }
+            Topology::Standalone(server) => {
+                let client = Client::open(server.clone())?;
+                let config = ConnectionManagerConfig::new()
+                    .set_response_timeout(Some(self.response_timeout));
+                Ok(SharedConnection::Single(
+                    client.get_connection_manager_with_config(config).await?,
+                ))
+            }
         }
-        let client = Client::open(self.seeds[0].clone())?;
-        let config =
-            ConnectionManagerConfig::new().set_response_timeout(Some(self.response_timeout));
-        Ok(SharedConnection::Single(
-            client.get_connection_manager_with_config(config).await?,
-        ))
     }
 }
 
@@ -437,13 +474,17 @@ impl BlockingPool {
         deadline: Instant,
         cmd: impl Fn(Duration) -> Cmd,
     ) -> RedisResult<Option<Value>> {
-        let slot = self.endpoint.cluster.then(|| slot(key));
+        let slot = self.endpoint.cluster().then(|| slot(key));
         // A seed that is down may have a replica that took over its slots, which another seed
         // knows.
-        let mut seeds = self.endpoint.seeds.iter().map(Node::of);
+        let mut seeds = self.endpoint.seeds().map(Node::of);
         let mut node = match self.slots.get(slot) {
             Some(node) => node,
-            None => seeds.next().expect("an endpoint has a seed"),
+            None => {
+                // The read tries the first seed now, so the walk goes on from the next one.
+                seeds.next();
+                Node::of(self.endpoint.first())
+            }
         };
         let mut attempt = Attempt {
             cluster: slot.is_some(),
@@ -530,7 +571,7 @@ impl BlockingPool {
             .entry(node.clone())
             .or_insert_with(|| {
                 Arc::new(NodePool {
-                    info: node.info(&self.endpoint.seeds[0]),
+                    info: node.info(self.endpoint.first()),
                     pool: Pool::new(self.per_node, Vec::new()),
                 })
             })
@@ -678,9 +719,16 @@ mod tests {
     }
 
     #[test]
-    fn an_endpoint_needs_a_url() {
-        assert!(Endpoint::parse(&[], false, Duration::from_secs(1)).is_err());
-        assert!(Endpoint::parse(&[], true, Duration::from_secs(1)).is_err());
+    fn an_endpoint_needs_a_url_and_a_standalone_one_takes_only_one() {
+        let parse = |urls: &[&str], cluster| {
+            let urls: Vec<String> = urls.iter().map(|url| url.to_string()).collect();
+            Endpoint::parse(&urls, cluster, Duration::from_secs(1))
+        };
+        assert!(parse(&[], false).is_err());
+        assert!(parse(&[], true).is_err());
+        let two = ["redis://127.0.0.1:1", "redis://127.0.0.1:2"];
+        assert!(parse(&two, false).is_err());
+        assert_eq!(parse(&two, true).unwrap().seeds().count(), 2);
     }
 
     #[tokio::test]
@@ -733,7 +781,7 @@ mod tests {
     #[tokio::test]
     async fn the_block_time_starts_when_the_read_has_a_connection() {
         let pool = BlockingPool::new(endpoint(&[&nil_server()], false), 1);
-        let seed = Node::of(&pool.endpoint.seeds[0]);
+        let seed = Node::of(pool.endpoint.first());
         let held = pool
             .lease(&seed, Instant::now() + Duration::from_secs(1))
             .await
@@ -759,7 +807,7 @@ mod tests {
     #[tokio::test]
     async fn a_read_with_no_free_connection_ends_after_the_permit_wait() {
         let pool = BlockingPool::new(endpoint(&[&nil_server()], false), 1);
-        let seed = Node::of(&pool.endpoint.seeds[0]);
+        let seed = Node::of(pool.endpoint.first());
         let deadline = || Instant::now() + Duration::from_secs(10);
         let _held = pool.lease(&seed, deadline()).await.unwrap().unwrap();
         tokio::time::pause();
