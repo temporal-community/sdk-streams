@@ -289,9 +289,10 @@ impl<C> Lease<C> {
     }
 }
 
-/// Whether the connection itself failed, as when the server closed it.
+/// Whether the connection itself failed, as when the server closed it. A timeout tells only that
+/// the server was slow, so the idle connections may still be good.
 fn stale(error: &RedisError) -> bool {
-    error.is_io_error() || error.is_connection_dropped()
+    !error.is_timeout() && (error.is_io_error() || error.is_connection_dropped())
 }
 
 /// The connections of the writes with `WAIT`.
@@ -855,16 +856,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_dead_reused_connection_closes_the_idle_ones() {
-        let pool = Pool::new(3, vec![1, 2]);
+    async fn a_dead_reused_connection_closes_the_idle_ones_but_a_slow_one_does_not() {
+        let pool = Pool::new(3, vec![1, 2, 3]);
+        let slow = lease(&pool, 0).await;
+        assert!(
+            slow.settle::<()>(Err(io(std::io::ErrorKind::TimedOut)))
+                .is_err()
+        );
         let dead = lease(&pool, 0).await;
-        assert!(dead.reused);
+        assert_eq!((dead.conn, dead.reused), (2, true));
         assert!(
             dead.settle::<()>(Err(io(std::io::ErrorKind::BrokenPipe)))
                 .is_err()
         );
-        let next = lease(&pool, 3).await;
-        assert_eq!((next.conn, next.reused), (3, false));
+        let next = lease(&pool, 4).await;
+        assert_eq!((next.conn, next.reused), (4, false));
     }
 
     #[tokio::test]

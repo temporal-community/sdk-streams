@@ -332,7 +332,8 @@ impl RedisStore {
         self.wait.is_some()
     }
 
-    /// The outer error is a transport error, and the inner one is the server's answer.
+    /// The outer error comes from the connection, or from a script load that Redis refused. The
+    /// inner one is the server's answer to the write.
     async fn write_and_wait(
         wait: &Wait,
         script: &Script,
