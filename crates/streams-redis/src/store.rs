@@ -60,15 +60,19 @@ impl RedisStore {
         let endpoint = Arc::new(endpoint);
         let shared = endpoint.open().await?;
         check_server(&shared).await?;
+        let cluster = match &shared {
+            SharedConnection::Cluster(cluster) => Some(cluster.clone()),
+            SharedConnection::Single(_) => None,
+        };
         let wait = match options.wait {
             None => None,
             Some(wait) => Some(Arc::new(Wait {
                 replicas: wait.replicas,
                 timeout: wait.timeout,
-                pool: WaitPool::new(endpoint.open().await?, endpoint.clone()),
+                pool: WaitPool::new(endpoint.open().await?, endpoint.clone(), cluster.clone()),
             })),
         };
-        let blocking = BlockingPool::new(endpoint, options.blocking_reads_per_node);
+        let blocking = BlockingPool::new(endpoint, options.blocking_reads_per_node, cluster);
         Ok(Self {
             shared,
             wait,
