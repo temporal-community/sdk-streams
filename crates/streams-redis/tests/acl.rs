@@ -18,7 +18,7 @@ use temporalio_streams::{
     store::{Batch, Owner, Store, Withdrawal},
 };
 use temporalio_streams_redis::{
-    RedisStore, RedisStoreOptions, WaitOptions,
+    RedisStore, RedisStoreError, RedisStoreOptions, WaitOptions,
     testing::{cluster_url, standalone_url},
 };
 
@@ -281,9 +281,19 @@ async fn the_documented_commands_run_every_call_of_each_role() {
         .await
         .unwrap_err();
     assert_eq!(failed.reason, Reason::Storage, "{failed}");
+    // Without `+wait`, each write would run its script and then fail, so connect refuses it.
+    let no_wait = (PRODUCER.0, PRODUCER.1.trim_end_matches(" +wait"));
+    let mut options = RedisStoreOptions::new(user(&url, &producer_name, &namespace, no_wait).await);
+    options.key_prefix = PREFIX.parse().unwrap();
+    options.wait = Some(WaitOptions {
+        replicas: NonZeroUsize::MIN,
+        timeout: Duration::from_millis(50),
+    });
+    let refused = RedisStore::connect(options).await.unwrap_err();
+    assert!(matches!(refused, RedisStoreError::Invalid(_)), "{refused}");
 
     let mut conn = admin(&url).await;
-    for name in [producer_name, reader_name] {
+    for name in [producer_name, reader_name, read_only_name] {
         let _: () = redis::cmd("ACL")
             .arg("DELUSER")
             .arg(name)

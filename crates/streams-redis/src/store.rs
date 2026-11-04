@@ -52,14 +52,12 @@ impl std::fmt::Debug for RedisStore {
 impl RedisStore {
     /// Connects to Redis and checks that it is Redis 7.0 or later.
     pub async fn connect(options: RedisStoreOptions) -> RedisStoreResult<Self> {
-        check_options(&options)?;
-        let endpoint = Endpoint::parse(&options.urls, options.cluster, options.response_timeout)
-            .map_err(|error| {
-                RedisStoreError::invalid(format!("The Redis URLs are wrong: {error}"))
-            })?;
-        let endpoint = Arc::new(endpoint);
+        let endpoint = Arc::new(check(&options)?);
         let shared = endpoint.open().await?;
         check_server(&shared).await?;
+        if options.wait.is_some() {
+            check_wait(&shared).await?;
+        }
         let cluster = match &shared {
             SharedConnection::Cluster(cluster) => Some(cluster.clone()),
             SharedConnection::Single(_) => None,
@@ -501,17 +499,32 @@ fn entry(value: Value) -> RedisStoreResult<Entry> {
     Ok(entry)
 }
 
-/// Refuses options that can't work, before any connection.
+/// Refuses options that can't work, before any connection, and parses the URLs.
+pub(crate) fn check(options: &RedisStoreOptions) -> RedisStoreResult<Endpoint> {
+    check_options(options)?;
+    Endpoint::parse(&options.urls, options.cluster, options.response_timeout)
+        .map_err(|error| RedisStoreError::invalid(format!("The Redis URLs are wrong: {error}")))
+}
+
 fn check_options(options: &RedisStoreOptions) -> RedisStoreResult<()> {
     if options.urls.is_empty() {
         return Err(RedisStoreError::invalid("The Redis Store needs a URL"));
     }
+    // The scripts take whole milliseconds, so a shorter TTL would be zero there.
     let ttls = [options.retention, options.safety_ttl];
-    if ttls.iter().any(|ttl| ttl.is_zero() || *ttl > MAX_TTL) {
+    if ttls
+        .iter()
+        .any(|ttl| ttl.as_millis() == 0 || *ttl > MAX_TTL)
+    {
         return Err(RedisStoreError::invalid(format!(
-            "The Retention and the safety TTL must be above zero and at most {} s",
+            "The Retention and the safety TTL must be at least 1 ms and at most {} s",
             MAX_TTL.as_secs()
         )));
+    }
+    if options.response_timeout.is_zero() {
+        return Err(RedisStoreError::invalid(
+            "The response timeout must be above zero",
+        ));
     }
     // A `WAIT` with a zero timeout waits for the replicas forever. The script and the round trip
     // need the other half of the response timeout, or too few replicas looks like a lost answer.
@@ -523,6 +536,23 @@ fn check_options(options: &RedisStoreOptions) -> RedisStoreResult<()> {
         ));
     }
     Ok(())
+}
+
+/// Refuses a user that can't run `WAIT`. Its write would run the script, fail the `WAIT`, and
+/// report a write that happened as a lasting failure.
+async fn check_wait(shared: &SharedConnection) -> RedisStoreResult<()> {
+    let wait: RedisResult<Value> = redis::cmd("WAIT")
+        .arg(0)
+        .arg(1)
+        .query_async(&mut shared.clone())
+        .await;
+    match wait {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::Server(ServerErrorKind::NoPerm) => Err(
+            RedisStoreError::invalid("A Store with `wait` needs a Redis user with `+wait`"),
+        ),
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// Refuses a server older than Redis 7.0, and warns about one that may evict Stream keys.
@@ -630,6 +660,23 @@ mod tests {
             );
         }
         check(Duration::from_millis(2500)).unwrap();
+    }
+
+    #[test]
+    fn the_ttls_and_the_response_timeout_must_be_at_least_1_ms() {
+        let check = |change: fn(&mut RedisStoreOptions)| {
+            let mut options = RedisStoreOptions::new("redis://127.0.0.1:1");
+            change(&mut options);
+            check_options(&options)
+        };
+        let changes: [fn(&mut RedisStoreOptions); 3] = [
+            |options| options.retention = Duration::from_micros(500),
+            |options| options.safety_ttl = Duration::from_micros(500),
+            |options| options.response_timeout = Duration::ZERO,
+        ];
+        for change in changes {
+            assert!(matches!(check(change), Err(RedisStoreError::Invalid(_))));
+        }
     }
 
     #[test]

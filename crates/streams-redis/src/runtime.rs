@@ -58,6 +58,8 @@ impl TryFrom<RedisStreamConfig> for RuntimeOptions {
                 .unwrap_or(defaults.response_timeout),
             wait,
         };
+        // A bridge builds the runtime at startup and connects later, so a bad config fails here.
+        crate::store::check(&store)?;
         Ok(Self {
             store,
             backend: config.backend,
@@ -172,5 +174,25 @@ mod tests {
             ..Default::default()
         });
         assert!(matches!(negative_wait, Err(RedisStoreError::Invalid(_))));
+        for bad in [
+            RedisStreamConfig {
+                urls: vec!["redis://x:1".to_string(), "redis://x:2".to_string()],
+                ..Default::default()
+            },
+            RedisStreamConfig {
+                urls: vec!["redis://x:1".to_string()],
+                wait_replicas: 1,
+                wait_timeout: Some(prost_types::Duration {
+                    seconds: 3,
+                    nanos: 0,
+                }),
+                ..Default::default()
+            },
+        ] {
+            assert!(matches!(
+                RuntimeOptions::try_from(bad),
+                Err(RedisStoreError::Invalid(_))
+            ));
+        }
     }
 }
