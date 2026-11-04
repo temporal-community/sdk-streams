@@ -95,10 +95,8 @@ impl StoreFactory for Connect {
     }
 }
 
-/// Builds the Stream runtime on Redis.
-///
-/// The runtime connects on the first call that needs Redis. So a bridge can build it with no async
-/// runtime, and a Workflow that never publishes never needs Redis.
+/// Builds the Stream runtime on Redis. It connects on the first call that needs Redis, so a bridge
+/// can build it with no async runtime, and a Workflow that never publishes needs no Redis.
 #[derive(Debug)]
 pub struct RedisStreamRuntime;
 

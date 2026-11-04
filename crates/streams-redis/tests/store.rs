@@ -1,5 +1,5 @@
-//! The shared Store suite on Redis standalone and on a Redis cluster. Start the servers with
-//! `scripts/redis-test-servers.sh` and set the two URLs that it prints.
+//! The shared Store suite on a standalone Redis and on a Redis cluster. Run it with
+//! `cargo test -- --include-ignored` on the servers of `scripts/redis-test-servers.sh`.
 
 mod support;
 

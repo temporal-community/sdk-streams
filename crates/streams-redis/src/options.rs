@@ -111,7 +111,7 @@ impl WaitOptions {
 pub struct KeyPrefix(String);
 
 impl KeyPrefix {
-    /// The prefix as the keys and the ACL key patterns write it.
+    /// The prefix as it appears in the keys and in the ACL key patterns.
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -131,7 +131,7 @@ impl TryFrom<String> for KeyPrefix {
             return Err(RedisStoreError::invalid("The key prefix must not be empty"));
         }
         // The keys hold the prefix percent-encoded, but the ACL key patterns of `docs/redis.md`
-        // name it as written, so a prefix that encoding changes could widen or miss a pattern.
+        // show it as written, so a prefix that encoding changes could widen or miss a pattern.
         if encode_part(&prefix) != prefix {
             return Err(RedisStoreError::invalid(
                 "The key prefix must have only letters, digits, '-', '.', '_' and '~'",

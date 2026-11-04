@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
-# Starts the Redis servers for the Store tests, one standalone server with one replica and a
-# cluster of three primaries. It uses a local redis-server when there is one. Otherwise it uses
-# docker on a Linux host, since a cluster's nodes must reach each other on the addresses that they
-# announce.
+# Starts the Redis servers of the Store tests, a standalone server with one replica and a cluster
+# of three primaries. With no local redis-server it uses docker, on a Linux host only, since the
+# cluster nodes must reach each other at the addresses that they announce.
 #
 #   STREAMS_REDIS_URL=redis://localhost:6491/0
 #   STREAMS_REDIS_CLUSTER_URL=redis://localhost:7291/0

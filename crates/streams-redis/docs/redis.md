@@ -12,7 +12,7 @@ form, and the `testdata/` of `temporalio-streams` has its test vectors.
 ```
 
 - Each part is percent-encoded. The hash tag puts the three keys in one cluster slot.
-- The prefix has only letters, digits, `-`, `.`, `_` and `~`, so a key pattern names it as written.
+- The prefix has only letters, digits, `-`, `.`, `_` and `~`, so a key pattern shows it as written.
 - A create writes `:meta`. An append writes `:producers`, and an append or a close writes `:log`.
 
 ## The meta hash
@@ -95,7 +95,7 @@ these lists on a standalone server and on a cluster.
 ## Known limits
 
 - Nothing closes a Workflow-owned Stream whose owner was terminated or timed out, so it stays open
-  until its safety TTL passes. The native server closes it at the owner's end.
+  until its safety TTL passes. The native server closes it when the owner's run ends.
 - A client's Stream has no owner but the kind, so any client closes it.
 - Redis can't tie a run to its run chain. A run of another chain that holds the owner's handle,
   such as a child Workflow with its parent's Stream, can still close it. The native server checks

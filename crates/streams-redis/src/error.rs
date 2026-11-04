@@ -47,11 +47,11 @@ impl From<RedisStoreError> for StreamError {
     }
 }
 
-/// The Stream error of a Redis error. Scripts name their refusals with a `STREAM_` code. A refusal
+/// The Stream error of a Redis error. Scripts mark their refusals with a `STREAM_` code. A refusal
 /// that a retry can't fix is invalid, and any other failure is a Store failure that may be retried.
 fn from_redis(error: &RedisError) -> StreamError {
     let detail = error.detail().unwrap_or_default().to_string();
-    // A bad URL or bad credentials stay wrong on a retry. redis-rs names some server codes as
+    // A bad URL or bad credentials stay wrong on a retry. redis-rs gives some server codes as
     // kinds, and the rest stay strings below.
     match error.kind() {
         ErrorKind::InvalidClientConfig | ErrorKind::AuthenticationFailed => {

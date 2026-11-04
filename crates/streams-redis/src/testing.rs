@@ -1,6 +1,5 @@
-//! Test support, for the crate's own tests. A case that needs a Redis server is `#[ignore]`, so
-//! a plain `cargo test` skips it, and `cargo test -- --include-ignored` runs it.
-//! `crates/streams-redis/scripts/redis-test-servers.sh` starts the servers and prints their URLs.
+//! Test support. The cases that need Redis are `#[ignore]`, so a plain `cargo test` skips them.
+//! `cargo test -- --include-ignored` runs them on the servers of `scripts/redis-test-servers.sh`.
 
 /// The URL of the standalone test server, which has one replica.
 pub fn standalone_url() -> String {

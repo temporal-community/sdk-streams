@@ -14,8 +14,8 @@ use temporalio_streams_redis::{
 
 const PREFIX: &str = "streams-wait";
 
-/// Held by each case for its whole run. The cases flush the scripts, pause the replicas and time
-/// their `WAIT`s, so one case would slow down the next.
+/// Held by each case for its whole run. The cases flush the scripts, pause the replicas and block
+/// in `WAIT`, so one case would disturb the next.
 static SERVER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// A `WAIT` that must fail gets a short timeout, and one that must pass gets a long one.
@@ -180,7 +180,7 @@ async fn a_call_that_finds_its_write_waits_for_the_replicas() {
         },
     );
     let plain = store(&url, false, 0, SHORT).await;
-    // A Store per call, since a call's own write moves its connection's offset past the replica's.
+    // A Store per call, since a call's own write puts its connection's offset past the replica's.
     let mut waits = vec![];
     for _ in 0..3 {
         waits.push(store(&url, false, replicas.len(), SHORT).await);

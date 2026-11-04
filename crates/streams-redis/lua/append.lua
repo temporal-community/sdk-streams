@@ -1,7 +1,7 @@
 -- Appends one batch of one Producer.
 --
 -- ARGV: format version, kind, Producer id, epoch key, sequence (0 takes the next one),
--- Superseded facts, safety TTL ms, Tombstone ms, the batch digest, `1` when a `WAIT` follows,
+-- Superseded facts, safety TTL ms, Tombstone ms, the batch digest, `1` when a `WAIT` runs after it,
 -- then one Record per argument.
 --
 -- Returns {'ok' or 'resend', first id, last id, '1' when flagged}.

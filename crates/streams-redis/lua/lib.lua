@@ -47,7 +47,7 @@ local function check_owner(meta, kind, chain)
   return nil
 end
 
--- Returns nil when a create names the Stream's owner, or else the refusal. The owner is part of
+-- Returns nil when a create gives the Stream's owner, or else the refusal. The owner is part of
 -- the Stream's identity, so a create can't change it.
 local function check_identity(meta, owner, chain)
   local stored = redis.call('HGET', meta, 'oc') or ''
@@ -94,7 +94,7 @@ local function id_below(a, b)
 end
 
 -- Sets `trimmed` to the entry id `id`, unless it is at or past it already. A clock that steps
--- back must not move the watermark back.
+-- back must not lower the watermark.
 local function raise_trimmed(meta, id)
   local trimmed = redis.call('HGET', meta, 'trimmed')
   if not trimmed or id_below(trimmed, id) then
@@ -106,7 +106,7 @@ end
 -- tell expired Records from an empty Stream.
 local function trim(meta, log, now)
   if redis.call('EXISTS', log) == 0 then
-    -- The expired log took every Record, so a read from an older offset must fail.
+    -- Every Record expired, so a read from an older offset must fail.
     local newest = redis.call('HGET', meta, 'newest')
     if newest then
       raise_trimmed(meta, newest)
@@ -128,7 +128,7 @@ end
 local PRUNE_LIMIT = 64
 
 -- Removes the fence and dedupe fields of the Producers whose last append is older than the
--- Retention. Their Records are older too, so they hold none.
+-- Retention. Their Records are older too, so the log has none of them.
 local function prune(meta, producers, now)
   local min = now - tonumber(redis.call('HGET', meta, 'ret'))
   local old = redis.call('ZRANGEBYSCORE', producers, '-inf', '(' .. min, 'LIMIT', 0, PRUNE_LIMIT)

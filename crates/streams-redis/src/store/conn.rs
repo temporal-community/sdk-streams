@@ -1,12 +1,5 @@
-//! The connections of the Redis Store. All short calls share one multiplexed connection, and each
-//! blocking read, and each write with `WAIT`, uses a dedicated one.
-//!
-//! redis-rs sends all commands of a multiplexed connection on one socket, in order. A blocking
-//! `XREAD` there would block every append after it. So a blocking read uses a dedicated connection
-//! from a bounded pool per node. A cancelled read closes its connection, since its blocked command
-//! still runs on the server, and the next call there would wait behind it. Redis reads no more
-//! commands from a connection while its `WAIT` blocks, so each write with `WAIT` also takes a
-//! connection of its own.
+//! The connections of the Redis Store. A blocked `XREAD` or `WAIT` stops all later commands on its
+//! connection, so each one gets a dedicated connection, and the short calls share one.
 
 use redis::{
     AsyncConnectionConfig, Client, Cmd, ConnectionAddr, ConnectionInfo, ErrorKind,
@@ -30,12 +23,12 @@ use tokio::{
     time::Instant,
 };
 
-/// How long a blocking read waits for a free connection of its node. Then it returns with no wake,
-/// and the caller reads the Stream again, so a read past the pool's size polls about once a second.
+/// How long a blocking read waits for a free connection. Then it returns with no wake, so a read
+/// over the pool's size polls about once a second.
 const PERMIT_WAIT: Duration = Duration::from_secs(1);
 
-/// How long a blocking read waits before it returns with no wake while the cluster moves its slot.
-/// The caller then reads the Stream again, so such a read polls at this rate until the move ends.
+/// How long a blocking read waits, with no wake, while the cluster migrates its slot. So such a
+/// read polls at this rate until the migration ends.
 const RESHARD_WAIT: Duration = Duration::from_millis(100);
 
 /// The most writes with `WAIT` that one Store runs at once, so its connections per node stay few.
@@ -50,14 +43,14 @@ pub(crate) struct Endpoint {
     response_timeout: Duration,
 }
 
-/// One server, or the seeds of a cluster. Every node gets the credentials and TLS of the first
-/// one, so each kind holds it by its type.
+/// One server, or the seeds of a cluster. Each kind has a first URL, since every node gets its
+/// credentials and TLS.
 enum Topology {
     Standalone(Seed),
     Cluster { first: Seed, rest: Vec<Seed> },
 }
 
-/// A URL of the options, with the node that it names.
+/// A URL of the options, and the node at that URL.
 struct Seed {
     info: ConnectionInfo,
     node: Node,
@@ -88,7 +81,7 @@ impl Endpoint {
         let topology = match (cluster, rest.is_empty()) {
             (true, _) => Topology::Cluster { first, rest },
             (false, true) => Topology::Standalone(first),
-            // A standalone Store uses one server, so the other URLs would do nothing.
+            // A standalone Store connects to one server, so the other URLs would have no effect.
             (false, false) => {
                 return Err(RedisError::from((
                     ErrorKind::InvalidClientConfig,
@@ -113,7 +106,7 @@ impl Endpoint {
         }
     }
 
-    /// The server, or each seed of the cluster, the first one first.
+    /// The server, or each seed of the cluster, with the first one first.
     fn seeds(&self) -> impl Iterator<Item = &Seed> {
         let rest = match &self.topology {
             Topology::Standalone(_) => &[][..],
@@ -181,9 +174,8 @@ impl ConnectionLike for SharedConnection {
 }
 
 impl SharedConnection {
-    /// Runs `cmd` on the server, or on every primary of a cluster, and returns each reply with the
-    /// node that sent it, if a cluster names it. Each primary holds its own share of the keys and
-    /// its own settings.
+    /// Runs `cmd` on the server, or on each primary of a cluster, since each primary has its own
+    /// keys and settings. A cluster's reply comes with the node that sent it.
     pub(crate) async fn on_each_primary(
         &self,
         cmd: Cmd,
@@ -230,8 +222,8 @@ impl<C> Pool<C> {
         }
     }
 
-    /// Takes an idle connection, or opens one with `open`. Returns `None` when `give_up` ends
-    /// before a connection is free. The caller sets how long that is, so the pool reads no clock.
+    /// Takes an idle connection, or opens one. Returns `None` if `give_up` ends first, so the
+    /// caller sets the wait and the pool reads no clock.
     async fn lease<F>(
         &self,
         give_up: impl Future<Output = ()>,
@@ -241,7 +233,7 @@ impl<C> Pool<C> {
         F: Future<Output = RedisResult<C>>,
     {
         let permit = tokio::select! {
-            // A free connection wins over a give-up that ends at the same time.
+            // Take a free connection even when `give_up` is also ready.
             biased;
             permit = self.permits.clone().acquire_owned() => permit,
             () = give_up => return Ok(None),
@@ -264,10 +256,8 @@ impl<C> Pool<C> {
     }
 }
 
-/// A connection taken from a [Pool]. A dropped call doesn't stop its command on the server. A
-/// blocked `XREAD` or `WAIT` keeps running there, and the next call on the connection would wait
-/// behind it. So only [Lease::settle] gives the connection back, when a whole reply shows that
-/// nothing still runs. A lease that drops closes its connection.
+/// A connection from a [Pool]. A dropped call doesn't stop its command on the server, and the next
+/// call would wait behind it. So a drop closes the connection, and only [Lease::settle] returns it.
 pub(crate) struct Lease<C> {
     conn: C,
     /// Taken idle from the pool, so the server may have closed it since its last call.
@@ -281,10 +271,8 @@ impl<C> Lease<C> {
         &mut self.conn
     }
 
-    /// Ends the lease with the result of the call on its connection. An answer or a server
-    /// error is a whole reply, so the connection goes back to the pool. After a wire error it
-    /// closes. A reused connection that is dead, as after a server restart, shows that the idle
-    /// ones are dead too, so the pool closes them all.
+    /// Returns the connection to the pool after a whole reply, which is an answer or a server
+    /// error. A wire error closes it.
     pub(crate) fn settle<T>(self, result: RedisResult<T>) -> RedisResult<T> {
         let Lease {
             conn,
@@ -294,25 +282,26 @@ impl<C> Lease<C> {
         } = self;
         match &result {
             Err(error) if error.code().is_none() => {
+                // A server restart also closed the other idle connections.
                 if reused && stale(error) {
                     lock(&idle).clear();
                 }
             }
-            // Before the permit goes, so the next lease finds the connection.
+            // Push it back before the permit drops, so the next lease finds it.
             _ => lock(&idle).push(conn),
         }
         result
     }
 }
 
-/// Locks a list or cache of the pools. Each change to one is a single push, pop or insert, so a
-/// panic while another call held it leaves it valid, and the lock takes it as it is.
+/// Each change under these locks is a single push, pop or insert, so a poisoned lock still guards
+/// valid data.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Whether the connection itself failed, as when the server closed it. A timeout tells only that
-/// the server was slow, so the idle connections may still be good.
+/// Whether the connection itself failed, as when the server closed it. A timeout only shows that
+/// the server is slow, so the idle connections may still be good.
 fn stale(error: &RedisError) -> bool {
     !error.is_timeout() && (error.is_io_error() || error.is_connection_dropped())
 }
@@ -324,7 +313,7 @@ pub(crate) struct WaitPool {
 }
 
 impl WaitPool {
-    /// A pool that starts with `first`, which tells a bad URL at connect.
+    /// The pool starts with `first`, so a bad URL fails at connect.
     pub(crate) fn new(first: SharedConnection, endpoint: Arc<Endpoint>) -> Self {
         Self {
             endpoint,
@@ -340,7 +329,7 @@ impl WaitPool {
     }
 }
 
-/// A Redis node, as a cluster names it in a redirect, or the local socket of a standalone server.
+/// A Redis node from a seed or a redirect. A standalone server can also be a local socket.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum Node {
     Tcp { host: String, port: u16 },
@@ -402,8 +391,8 @@ impl FromStr for Node {
     }
 }
 
-/// The node that serves each slot, learned from redirects. A cluster moves slots rarely, and a
-/// stale entry costs one redirect.
+/// The node that serves each slot, from redirects. A cluster migrates slots rarely, and a stale
+/// entry costs one redirect.
 #[derive(Default)]
 struct SlotCache(Mutex<HashMap<u16, Node>>);
 
@@ -416,8 +405,8 @@ impl SlotCache {
         lock(&self.0).insert(slot, node);
     }
 
-    /// Drops a slot's entry while it still names `node`. A failover can change a node's address
-    /// for good, and otherwise only a redirect would update the entry.
+    /// Removes the slot's entry if it still points at `node`. A failover can change a node's
+    /// address permanently, and only a redirect would update the entry.
     fn forget(&self, slot: Option<u16>, node: &Node) {
         if let Some(slot) = slot {
             let mut slots = lock(&self.0);
@@ -434,7 +423,7 @@ struct Attempt {
     cluster: bool,
     /// The connection came idle from the pool.
     reused: bool,
-    /// The read already followed one redirect.
+    /// The read already used one redirect.
     redirected: bool,
 }
 
@@ -446,9 +435,9 @@ enum Step {
     Retry,
     /// The node is down, so try the next seed.
     NextSeed,
-    /// Follow the cluster to the node that now serves the slot.
+    /// Try the node that the redirect gives.
     Redirect(Node),
-    /// The cluster is moving the slot, so end the read with no wake.
+    /// The cluster is migrating the slot, so end the read with no wake.
     NoWake,
     /// Give the error to the caller.
     Fail,
@@ -467,8 +456,8 @@ fn classify(error: &RedisError, attempt: Attempt) -> Step {
     if !attempt.cluster {
         return Step::Fail;
     }
-    // One redirect is expected when the slot was unknown or moved. A second means the cluster is
-    // resharding.
+    // One redirect is normal when the cache had no entry or a stale one. A second means the cluster
+    // is migrating the slot.
     match redirect(error) {
         Some(target) if !attempt.redirected => Step::Redirect(target),
         _ if resharding(error) => Step::NoWake,
@@ -499,9 +488,8 @@ impl BlockingPool {
         }
     }
 
-    /// Waits until the Stream log at `key` has an entry after the entry id `after`, or `deadline`
-    /// passes. Returns whether an entry came. A read with no free connection, or one while the
-    /// cluster moves the key's slot, returns `false` early, and the caller reads the Stream again.
+    /// Waits for an entry after the entry id `after` in the log at `key`. With no free connection,
+    /// or during a slot migration, it returns `false` early, and the caller reads the Stream again.
     pub(crate) async fn wait_after(
         &self,
         key: &str,
@@ -528,11 +516,8 @@ impl BlockingPool {
         )
     }
 
-    /// Runs the command that `cmd` builds for the time left to `deadline`, on a dedicated
-    /// connection to the node that holds `key`. The time left can be zero.
-    ///
-    /// Returns `None` when no connection became free before `deadline` or within [PERMIT_WAIT], or
-    /// when the cluster moves the key's slot. The caller treats it as a wait in which nothing came.
+    /// Runs the command that `cmd` builds for the time left to `deadline`, which can be zero.
+    /// Returns `None` if no connection was free in time, or if the key's slot is migrating.
     async fn query(
         &self,
         key: &str,
@@ -546,7 +531,7 @@ impl BlockingPool {
         let mut node = match self.slots.get(slot) {
             Some(node) => node,
             None => {
-                // The read tries the first seed now, so the walk goes on from the next one.
+                // This try uses the first seed, so the seed list starts at the second.
                 seeds.next();
                 self.endpoint.first().node.clone()
             }
@@ -556,7 +541,8 @@ impl BlockingPool {
             ..Attempt::default()
         };
         loop {
-            // Each node that is down costs a connect timeout, so the seeds can outlast the read.
+            // Each node that is down costs a connect timeout, so the seed list can take longer than
+            // the read.
             if deadline <= Instant::now() {
                 return Ok(None);
             }
@@ -653,8 +639,8 @@ fn redirect(error: &RedisError) -> Option<Node> {
     error.redirect_node()?.0.parse().ok()
 }
 
-/// Whether the cluster is moving the slot of the command's key. An `ASK` target serves the key
-/// only for a command sent after `ASKING`, and the slot can move again before the next read.
+/// Whether the cluster is migrating the slot of the command's key. An `ASK` target serves the key
+/// only after `ASKING`, and the slot can migrate again before the next read.
 fn resharding(error: &RedisError) -> bool {
     matches!(
         error.kind(),
@@ -716,7 +702,7 @@ mod tests {
             redirect(&reply("MOVED 3999 127.0.0.1:7292")),
             Some(node("127.0.0.1", 7292))
         );
-        // An `ASK` target holds the slot only for one command sent after `ASKING`.
+        // An `ASK` target serves the slot only for one command after `ASKING`.
         assert_eq!(redirect(&reply("ASK 3999 127.0.0.1:7292")), None);
         assert!("127.0.0.1".parse::<Node>().is_err());
         assert!("127.0.0.1:port".parse::<Node>().is_err());
@@ -837,9 +823,8 @@ mod tests {
         format!("redis://{address}")
     }
 
-    // The paused clock moves only on `advance`, or to the next timer when every task waits. So
-    // these cases use no real time. The connections open before the pause, since the clock would
-    // jump past a connect.
+    // The paused clock advances only on `advance`, or to the next timer when all tasks wait. The
+    // connections open before the pause, since the clock would jump past a connect.
     #[tokio::test]
     async fn the_block_time_starts_when_the_read_has_a_connection() {
         let pool = BlockingPool::new(endpoint(&[&nil_server()], false), NonZeroUsize::MIN);

@@ -83,7 +83,7 @@ impl RedisStore {
         StreamKeys::new(self.prefix.as_str(), namespace, stream_id)
     }
 
-    /// Runs a write script, and then `WAIT` when the options name replicas. Both are in one
+    /// Runs a write script, and then `WAIT` when the options set replicas. Both are in one
     /// pipeline on one connection, so the `WAIT` covers the script's writes.
     async fn write(&self, script: &Script, cmd: &Cmd) -> RedisStoreResult<Value> {
         let Some(wait) = &self.wait else {
@@ -100,7 +100,7 @@ impl RedisStore {
         lease.settle(reply)?
     }
 
-    /// Whether a `WAIT` follows each write. The write scripts take it as their last argument.
+    /// Whether each write runs a `WAIT` after it. The write scripts take it as their last argument.
     fn waits(&self) -> bool {
         self.wait.is_some()
     }
@@ -138,7 +138,7 @@ impl RedisStore {
 }
 
 // The trait returns Stream errors, so the runtime and lang get the same reasons on every backend.
-// A `?` turns the crate's error into one, and a Redis error goes through the crate's error first.
+// A Redis error converts through the crate's error, since this crate can't add that `From`.
 #[async_trait::async_trait]
 impl Store for RedisStore {
     // Every rule but the run fence is in the Lua scripts.
@@ -147,7 +147,7 @@ impl Store for RedisStore {
     }
 
     /// Creates a Stream, or finds it. A Workflow-owned Stream stores its handle's run chain, which
-    /// later creates and closes must name.
+    /// later creates and closes must match.
     async fn create(
         &self,
         namespace: &str,
@@ -185,7 +185,6 @@ impl Store for RedisStore {
         })
     }
 
-    /// Appends one batch.
     async fn append(
         &self,
         namespace: &str,
@@ -317,8 +316,7 @@ impl Store for RedisStore {
             .collect::<RedisStoreResult<_>>()?)
     }
 
-    /// Waits until the log has an entry after `after`, or `deadline` passes. Returns whether an
-    /// entry came. The wait uses a dedicated connection.
+    /// The wait uses a dedicated connection, so it doesn't block the short calls.
     async fn wait_after(
         &self,
         namespace: &str,
@@ -351,7 +349,7 @@ fn script_cmd(name: &str, script: &Script, keys: &StreamKeys) -> Cmd {
     cmd
 }
 
-/// Refuses a write that fewer replicas than `wait` names have.
+/// Refuses a write that fewer than `wait.replicas` replicas have.
 fn acknowledged(wait: &Wait, acked: Value) -> RedisStoreResult<()> {
     let acked: usize = redis::from_redis_value(acked.extract_error()?)
         .map_err(|error| bad_reply("WAIT", error))?;
