@@ -133,6 +133,7 @@ async fn the_documented_commands_run_every_call_of_each_role() {
     let unique = unique();
     let namespace = format!("ns-{unique}");
     let (producer_name, reader_name) = (format!("prod-{unique}"), format!("read-{unique}"));
+    let read_only_name = format!("ro-{unique}");
     let handle = StreamHandle {
         id: "s".to_string(),
         ..Default::default()
@@ -185,8 +186,10 @@ async fn the_documented_commands_run_every_call_of_each_role() {
             .await
             .unwrap()
     );
-    // The Reader's user has only read access to the keys, so its write fails for good.
-    let refused = reader
+    // A user with read access to the keys can't write them, even with the Producer's commands.
+    let read_only = (READER.0, PRODUCER.1);
+    let read_only = store(user(&url, &read_only_name, &namespace, read_only).await).await;
+    let refused = read_only
         .append(
             &namespace,
             &handle,
@@ -198,6 +201,7 @@ async fn the_documented_commands_run_every_call_of_each_role() {
         .await
         .unwrap_err();
     assert_eq!(refused.reason, Reason::Invalid, "{refused}");
+    assert!(!refused.message.contains("evalsha"), "{refused}");
 
     producer
         .close(&namespace, &handle, &client(), b"")
