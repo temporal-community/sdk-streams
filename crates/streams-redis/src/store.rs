@@ -137,11 +137,6 @@ impl RedisStore {
         Ok(entries.into_iter().next().and_then(LogEntry::producer))
     }
 
-    /// Whether each write runs a `WAIT` after it. Each write script takes it as an argument.
-    fn waits(&self) -> bool {
-        self.wait.is_some()
-    }
-
     /// The outer error comes from the connection, or from a script load that Redis refused. The
     /// inner one is the server's answer to the write.
     async fn write_and_wait(
@@ -204,7 +199,7 @@ impl Store for RedisStore {
             .arg(self.safety_ttl.as_millis())
             .arg(TOMBSTONE.as_millis())
             .arg(chain)
-            .arg(self.waits());
+            .arg(self.wait.is_some());
         let CreateReply(created) = self.write(&scripts::CREATE_SCRIPT, &cmd).await?;
         Ok(created)
     }
@@ -229,7 +224,7 @@ impl Store for RedisStore {
             .arg(self.safety_ttl.as_millis())
             .arg(TOMBSTONE.as_millis())
             .arg(batch.digest)
-            .arg(self.waits())
+            .arg(self.wait.is_some())
             .arg(producer.encode_to_vec());
         for record in batch.records {
             cmd.arg(without_producer(record, producer)?);
@@ -257,7 +252,7 @@ impl Store for RedisStore {
             .arg(TOMBSTONE.as_millis())
             .arg(record)
             .arg(owner_chain(handle))
-            .arg(self.waits());
+            .arg(self.wait.is_some());
         let CloseReply(closed) = self.write(&scripts::CLOSE_SCRIPT, &cmd).await?;
         Ok(closed)
     }
@@ -373,10 +368,6 @@ fn acknowledged(wait: &Wait, acked: Value) -> RedisStoreResult<()> {
     Ok(())
 }
 
-fn no_script(error: &redis::RedisError) -> bool {
-    error.kind() == ErrorKind::Server(ServerErrorKind::NoScript)
-}
-
 /// The replies of a write pipeline, the script's and the `WAIT`'s.
 async fn write_replies(pipe: &Pipeline, conn: &mut SharedConnection) -> RedisResult<[Value; 2]> {
     let replies: Vec<Value> = pipe.query_async(conn).await?;
@@ -392,7 +383,7 @@ async fn write_replies(pipe: &Pipeline, conn: &mut SharedConnection) -> RedisRes
 /// Runs a script call, and loads the script when Redis lacks it.
 async fn run_script(script: &Script, cmd: &Cmd, conn: &mut SharedConnection) -> RedisResult<Value> {
     match cmd.query_async(conn).await {
-        Err(error) if no_script(&error) => {
+        Err(error) if error.kind() == ErrorKind::Server(ServerErrorKind::NoScript) => {
             script.load_async(conn).await?;
             cmd.query_async(conn).await
         }

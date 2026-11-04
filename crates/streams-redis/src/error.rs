@@ -69,6 +69,19 @@ fn from_redis(error: &RedisError) -> StreamError {
                 "A Redis Cluster node answered, so set `cluster`: MOVED {detail}"
             ));
         }
+        ErrorKind::Server(ServerErrorKind::ResponseError) if detail.contains("user_script") => {
+            return StreamError::invalid(format!("A Stream script failed: {detail}"));
+        }
+        ErrorKind::Server(ServerErrorKind::ResponseError) if detail.contains("unknown command") => {
+            return StreamError::invalid(format!("Redis is too old for the Store: {detail}"));
+        }
+        ErrorKind::Server(ServerErrorKind::ResponseError)
+            if detail.contains("cluster support disabled") =>
+        {
+            return StreamError::invalid(format!(
+                "The server isn't a Redis Cluster, so don't set `cluster`: {detail}"
+            ));
+        }
         _ => {}
     }
     let reason = match error.code() {
@@ -85,17 +98,6 @@ fn from_redis(error: &RedisError) -> StreamError {
         Some(code @ ("WRONGTYPE" | "NOAUTH" | "WRONGPASS")) => {
             return StreamError::invalid(format!(
                 "Redis refused the call for good: {code} {detail}"
-            ));
-        }
-        Some("ERR") if detail.contains("user_script") => {
-            return StreamError::invalid(format!("A Stream script failed: {detail}"));
-        }
-        Some("ERR") if detail.contains("unknown command") => {
-            return StreamError::invalid(format!("Redis is too old for the Store: {detail}"));
-        }
-        Some("ERR") if detail.contains("cluster support disabled") => {
-            return StreamError::invalid(format!(
-                "The server isn't a Redis Cluster, so don't set `cluster`: {detail}"
             ));
         }
         // The code as the server wrote it, so the message has the code the Redis docs use.
