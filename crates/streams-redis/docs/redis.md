@@ -58,7 +58,7 @@ never get the same sequence. Nothing dedupes such a batch, so its retry writes i
 
 ## Orphaned Local Activity Records
 
-A Local Activity batch can name its run's last completed Workflow Task (`previous_completed_task`)
+A Local Activity batch can give its run's last completed Workflow Task (`previous_completed_task`)
 and failed tasks. Then the append withdraws the run's tasks in `oa` that never completed.
 
 - These are the tasks after the completed task and before the batch's task, the failed tasks, and
@@ -72,7 +72,7 @@ and failed tasks. Then the append withdraws the run's tasks in `oa` that never c
 
 ## Retry runs
 
-- A Workflow retry run names its previous run in `withdraw_run`, on its create and on its Local
+- A Workflow retry run gives its previous run in `withdraw_run`, on its create and on its Local
   Activities' appends.
 - The first such call sets `wr|<previous run>`, also when the create makes the Stream.
 - When `run|<previous run>` is set, the call also writes `s`. A create writes it on an entry of its
@@ -135,26 +135,20 @@ these lists on a standalone server and on a cluster.
 - Nothing closes a Workflow-owned Stream whose owner was terminated or timed out, so it stays open
   until its safety TTL passes. The native server closes it when the owner's run ends.
 - A client's Stream has no owner but the kind, so any client closes it.
-- A Local Activity call of a failed Workflow Task is withdrawn only when the retry task runs that
-  call again, or when a later Local Activity write names the failed task. A call that no later
-  write covers, for example because a Signal changed the path and no Local Activity writes
-  again, keeps its Records. The memory Store has the same limit.
+- A failed task's Local Activity Records go only when the retry task runs the same call again, or
+  a later Local Activity write gives the failed task. Otherwise they stay, as in the memory Store.
 - Core sends only the last 100 failed Workflow Tasks of a run. An older failed task before the last
   completed one keeps its Local Activity Records.
-- A Local Activity that runs longer than its Workflow Task, which Core then completes as a
-  heartbeat, keeps its Records when the task where it resolves fails. Only a later run of the same
-  call withdraws them.
-- A retry run withdraws only its previous run. When that run never wrote to the Stream, the runs
-  before it keep their Records. The Store can't tell an earlier retry attempt from a
-  continue-as-new run before it.
-- A run that closes its Stream and then fails under a retry policy leaves the Stream closed, and
-  each retry run's create fails with `stream_closed`. A close can't be withdrawn, since the
-  Readers that read it have ended.
+- A Local Activity that runs longer than its Workflow Task keeps its Records when the task where it
+  resolves fails. Only a later run of the same call withdraws them.
+- A retry run withdraws only its previous run. If that run never wrote, older runs keep their
+  Records, since the Store can't tell a retry attempt from a continue-as-new run.
+- A run that closes its Stream and then fails under a retry policy leaves it closed, so each retry
+  run's create fails with `stream_closed`. The close's Readers have ended, so it can't be withdrawn.
 - A reset run doesn't withdraw the base run's Records after the reset point, and it doesn't fence
   the base run's Producers.
-- The meta keeps the `run|`, `oa|`, `ow|` and `wr|` fields of each run until the Stream expires. A
-  long run chain, such as one that continues-as-new every hour, adds fields to its Stream's meta
-  for as long as it writes.
+- The meta keeps the `run|`, `oa|`, `ow|` and `wr|` fields of each run until the Stream expires, so
+  a long run chain adds fields for as long as it writes.
 - Redis can't tie a run to its run chain. A run of another chain that holds the owner's handle,
   such as a child Workflow with its parent's Stream, can still close it. The native server checks
   the run.

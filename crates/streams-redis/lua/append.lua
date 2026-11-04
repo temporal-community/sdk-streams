@@ -143,7 +143,7 @@ if records > 0 then
 elseif flagged then
   redis.call('HDEL', meta, 'h' .. suffix)
 end
--- Each write goes to the replicas and the AOF, so `run|` is set once.
+-- Redis sends each write to the replicas and the AOF, so the script sets `run|` only once.
 if run ~= '' and records > 0 and not redis.call('HGET', meta, 'run|' .. run) then
   redis.call('HSET', meta, 'run|' .. run, '1')
 end
