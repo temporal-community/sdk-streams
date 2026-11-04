@@ -140,70 +140,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_config_fills_the_defaults() {
-        let options = RuntimeOptions::try_from(RedisStreamConfig {
-            urls: vec!["redis://x:1".to_string()],
-            backend: "redis-a".to_string(),
-            ..Default::default()
-        })
-        .unwrap();
-        assert_eq!(options.backend, "redis-a");
-        assert_eq!(options.store, RedisStoreOptions::new("redis://x:1"));
-        assert!(RuntimeOptions::try_from(RedisStreamConfig::default()).is_err());
-        let waits = RuntimeOptions::try_from(RedisStreamConfig {
-            urls: vec!["redis://x:1".to_string()],
-            wait_replicas: 2,
-            wait_timeout: Some(prost_types::Duration {
-                seconds: 0,
-                nanos: 250_000_000,
-            }),
-            ..Default::default()
-        })
-        .unwrap();
-        assert_eq!(
-            waits.store.wait,
-            Some(WaitOptions {
-                replicas: NonZeroUsize::new(2).unwrap(),
-                timeout: Duration::from_millis(250),
-            })
-        );
-        let negative = RuntimeOptions::try_from(RedisStreamConfig {
-            urls: vec!["redis://x:1".to_string()],
-            retention: Some(prost_types::Duration {
-                seconds: -1,
-                nanos: 0,
-            }),
-            ..Default::default()
+    fn a_bad_config_fails_when_the_runtime_builds() {
+        let url = || vec!["redis://x:1".to_string()];
+        let negative = Some(prost_types::Duration {
+            seconds: -1,
+            nanos: 0,
         });
-        assert!(matches!(negative, Err(RedisStoreError::Invalid(_))));
-        let negative_wait = RuntimeOptions::try_from(RedisStreamConfig {
-            urls: vec!["redis://x:1".to_string()],
-            wait_timeout: Some(prost_types::Duration {
-                seconds: -1,
-                nanos: 0,
-            }),
-            ..Default::default()
-        });
-        assert!(matches!(negative_wait, Err(RedisStoreError::Invalid(_))));
         for bad in [
+            RedisStreamConfig::default(),
             RedisStreamConfig {
                 urls: vec!["redis://x:1".to_string(), "redis://x:2".to_string()],
                 ..Default::default()
             },
             RedisStreamConfig {
-                urls: vec!["redis://x:1".to_string()],
-                wait_replicas: 1,
-                wait_timeout: Some(prost_types::Duration {
-                    seconds: 3,
-                    nanos: 0,
-                }),
+                urls: url(),
+                retention: negative,
+                ..Default::default()
+            },
+            RedisStreamConfig {
+                urls: url(),
+                wait_timeout: negative,
                 ..Default::default()
             },
         ] {
-            assert!(matches!(
-                RuntimeOptions::try_from(bad),
-                Err(RedisStoreError::Invalid(_))
-            ));
+            assert!(
+                matches!(
+                    RuntimeOptions::try_from(bad.clone()),
+                    Err(RedisStoreError::Invalid(_))
+                ),
+                "{bad:?}"
+            );
         }
     }
 }

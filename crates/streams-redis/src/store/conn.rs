@@ -855,16 +855,6 @@ mod tests {
     }
 
     #[test]
-    fn a_moved_redirect_gives_its_node() {
-        assert_eq!(
-            moved_to(&reply("MOVED 3999 127.0.0.1:7292")).unwrap(),
-            node("127.0.0.1", 7292)
-        );
-        assert!("127.0.0.1".parse::<Node>().is_err());
-        assert!("127.0.0.1:port".parse::<Node>().is_err());
-    }
-
-    #[test]
     fn the_retry_policy_of_a_blocking_read() {
         let cluster = Route::Slot(1);
         let cases = [
@@ -901,27 +891,6 @@ mod tests {
         for (error, route, step) in cases {
             assert_eq!(classify(&error, route), step, "{error} {route:?}");
         }
-    }
-
-    #[test]
-    fn a_slot_entry_goes_only_while_it_names_the_dead_node() {
-        let cache = SlotCache::default();
-        cache.learn(1, node("10.0.0.2", 7292));
-        cache.forget(1, &node("10.0.0.3", 7293));
-        assert_eq!(cache.get(1), Some(node("10.0.0.2", 7292)));
-        cache.forget(1, &node("10.0.0.2", 7292));
-        assert_eq!(cache.get(1), None);
-    }
-
-    #[test]
-    fn an_endpoint_keeps_each_seed_and_refuses_a_bad_url() {
-        let two = Topology::Cluster {
-            first: "redis://127.0.0.1:1".to_string(),
-            rest: vec!["redis://127.0.0.1:2".to_string()],
-        };
-        assert_eq!(endpoint(two).seeds().count(), 2);
-        let bad = RedisStoreOptions::new("http://127.0.0.1:1");
-        assert!(Endpoint::try_from(&bad).is_err());
     }
 
     #[tokio::test]

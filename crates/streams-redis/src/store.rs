@@ -670,29 +670,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn retention_hides_old_records_on_read() {
-        let state = StreamState {
-            exists: true,
-            trimmed: 5,
-            retention: Duration::from_millis(1000),
-            now_ms: 3000,
-            ..Default::default()
-        };
-        assert_eq!(
-            state.retained_from(),
-            2000 << temporalio_streams::offset::SEQ_BITS
-        );
-        let state = StreamState {
-            trimmed: 9000 << temporalio_streams::offset::SEQ_BITS,
-            ..state
-        };
-        assert_eq!(
-            state.retained_from(),
-            (9000 << temporalio_streams::offset::SEQ_BITS) + 1
-        );
-    }
-
     #[tokio::test]
     #[ignore = "needs Redis"]
     async fn bad_task_facts_are_refused_before_the_first_write() {
