@@ -4,7 +4,7 @@
 use crate::RedisStoreOptions;
 use parking_lot::Mutex;
 use redis::{
-    AsyncConnectionConfig, Client, Cmd, ConnectionAddr, ConnectionInfo, ErrorKind,
+    AsyncConnectionConfig, Client, Cmd, ConnectionAddr, ConnectionInfo, ErrorKind, FromRedisValue,
     IntoConnectionInfo, Pipeline, RedisError, RedisFuture, RedisResult, ServerErrorKind, Value,
     aio::{ConnectionLike, ConnectionManager, ConnectionManagerConfig, MultiplexedConnection},
     cluster::ClusterClient,
@@ -12,8 +12,8 @@ use redis::{
     cluster_routing::{MultipleNodeRoutingInfo, RoutingInfo},
 };
 use std::{
-    collections::HashMap, future::Future, num::NonZeroUsize, ops::RangeInclusive, path::PathBuf,
-    str::FromStr, sync::Arc, time::Duration,
+    collections::HashMap, fmt, future::Future, num::NonZeroUsize, ops::RangeInclusive,
+    path::PathBuf, str::FromStr, sync::Arc, time::Duration,
 };
 use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore},
@@ -185,16 +185,31 @@ impl ConnectionLike for SharedConnection {
     }
 }
 
+/// The server that sent a reply. Each primary of a cluster has its own keys and settings.
+#[derive(Clone, Debug)]
+pub(crate) enum Origin {
+    Server,
+    Primary(String),
+}
+
+impl fmt::Display for Origin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Origin::Server => f.write_str("the server"),
+            Origin::Primary(node) => f.write_str(node),
+        }
+    }
+}
+
 impl SharedConnection {
-    /// Runs `cmd` on the server, or on each primary of a cluster, since each primary has its own
-    /// keys and settings. A cluster's reply comes with the node that sent it.
-    pub(crate) async fn on_each_primary(
+    /// Runs `cmd` on the server, or on each primary of a cluster, and decodes each reply.
+    pub(crate) async fn on_each_primary<T: FromRedisValue>(
         &self,
         cmd: Cmd,
-    ) -> RedisResult<Vec<(Option<String>, Value)>> {
+    ) -> RedisResult<Vec<(Origin, T)>> {
         match self.clone() {
             SharedConnection::Single(mut conn) => {
-                Ok(vec![(None, cmd.query_async(&mut conn).await?)])
+                Ok(vec![(Origin::Server, cmd.query_async(&mut conn).await?)])
             }
             SharedConnection::Cluster(mut conn) => {
                 let routing = RoutingInfo::MultiNode((MultipleNodeRoutingInfo::AllMasters, None));
@@ -203,17 +218,18 @@ impl SharedConnection {
                     Value::Map(replies) => replies
                         .into_iter()
                         .map(|(node, reply)| {
-                            let node = match node {
-                                Value::BulkString(bytes) => {
-                                    String::from_utf8_lossy(&bytes).into_owned()
-                                }
-                                Value::SimpleString(text) => text,
-                                other => format!("{other:?}"),
-                            };
-                            Ok((Some(node), reply.extract_error()?))
+                            let node = String::from_redis_value(node)?;
+                            Ok((
+                                Origin::Primary(node),
+                                T::from_redis_value(reply.extract_error()?)?,
+                            ))
                         })
                         .collect(),
-                    other => Ok(vec![(None, other.extract_error()?)]),
+                    // A reply that the client didn't split by node.
+                    other => Ok(vec![(
+                        Origin::Server,
+                        T::from_redis_value(other.extract_error()?)?,
+                    )]),
                 }
             }
         }

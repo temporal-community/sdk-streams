@@ -7,12 +7,12 @@ mod replies;
 mod scripts;
 
 use crate::{KeyPrefix, RedisStoreError, RedisStoreOptions, RedisStoreResult};
-use conn::{BlockingPool, Endpoint, Lease, Leased, SharedConnection, WaitPool};
+use conn::{BlockingPool, Endpoint, Lease, Leased, Origin, SharedConnection, WaitPool};
 use prost::Message;
 use records::{Body, LogEntry, with_producers, without_producer};
 use redis::{
-    Cmd, ErrorKind, FromRedisValue, Pipeline, RedisError, RedisResult, Script, ServerErrorKind,
-    Value,
+    Cmd, ErrorKind, FromRedisValue, InfoDict, Pipeline, RedisError, RedisResult, Script,
+    ServerErrorKind, Value,
 };
 use replies::{AppendReply, CloseReply, CreateReply, ReadReply};
 use std::{collections::HashMap, num::NonZeroUsize, sync::Arc, time::Duration};
@@ -455,12 +455,10 @@ async fn check_wait(shared: &SharedConnection) -> RedisStoreResult<()> {
 async fn check_server(shared: &SharedConnection) -> RedisStoreResult<()> {
     let mut info = redis::cmd("INFO");
     info.arg("server");
-    match shared.on_each_primary(info).await {
+    match shared.on_each_primary::<InfoDict>(info).await {
         Ok(replies) => {
-            for (node, reply) in replies {
-                let text: String =
-                    redis::from_redis_value(reply).map_err(|error| bad_reply("INFO", error))?;
-                check_version(node.as_deref().unwrap_or("the server"), &text)?;
+            for (origin, info) in replies {
+                check_version(&origin, &info)?;
             }
         }
         // A user with only the Store's commands may not have INFO. Then a Redis before 7.0 fails at
@@ -475,31 +473,33 @@ async fn check_server(shared: &SharedConnection) -> RedisStoreResult<()> {
     }
     let mut policy = redis::cmd("CONFIG");
     policy.arg("GET").arg("maxmemory-policy");
-    let policies = shared.on_each_primary(policy).await.and_then(|replies| {
-        replies
-            .into_iter()
-            .map(|(node, reply)| Ok((node, eviction_policy(reply)?)))
-            .collect::<RedisResult<Vec<_>>>()
-    });
+    let policies = shared
+        .on_each_primary::<HashMap<String, String>>(policy)
+        .await;
+    let could_not_read = |why: &dyn std::fmt::Display| {
+        tracing::warn!(
+            "Could not read maxmemory-policy: {why}. The Streams need noeviction, since eviction \
+             loses Records and their fence."
+        )
+    };
     match policies {
         Ok(policies) => {
-            let evicting = policies
-                .into_iter()
-                .find_map(|(node, policy)| Some((node, policy.filter(|p| p != "noeviction")?)));
-            if let Some((node, policy)) = evicting {
-                tracing::warn!(
-                    node = node.as_deref().unwrap_or("the server"),
-                    policy,
-                    "Redis may evict Stream keys under memory pressure, which loses Records and \
-                     their fence. Use maxmemory-policy noeviction for Streams."
-                );
+            for (origin, mut config) in policies {
+                match config.remove("maxmemory-policy").as_deref() {
+                    Some("noeviction") => {}
+                    Some(policy) => tracing::warn!(
+                        node = %origin,
+                        policy,
+                        "Redis may evict Stream keys under memory pressure, which loses Records \
+                         and their fence. Use maxmemory-policy noeviction for Streams."
+                    ),
+                    None => could_not_read(&format!("{origin} gave no value")),
+                }
             }
         }
         // Managed services often refuse CONFIG, and some default to a `volatile-*` policy.
-        Err(error) => tracing::warn!(
-            "Could not read maxmemory-policy: {error}. The Streams need noeviction, since \
-             eviction loses Records and their fence."
-        ),
+        Err(error) if error.code().is_some() => could_not_read(&error),
+        Err(error) => return Err(error.into()),
     }
     Ok(())
 }
@@ -507,24 +507,23 @@ async fn check_server(shared: &SharedConnection) -> RedisStoreResult<()> {
 /// Refuses a cluster node for a standalone Store. Its keys of other slots would answer with
 /// redirects on each call.
 async fn check_not_cluster(shared: &SharedConnection) -> RedisStoreResult<()> {
-    let reply: RedisResult<String> = redis::cmd("INFO")
+    let reply: RedisResult<InfoDict> = redis::cmd("INFO")
         .arg("cluster")
         .query_async(&mut shared.clone())
         .await;
     match reply {
-        Ok(info) if info.lines().any(|line| line.trim() == "cluster_enabled:1") => Err(
-            RedisStoreError::invalid("The server is a Redis Cluster node, so set `cluster`"),
-        ),
+        Ok(info) if info.get::<i64>("cluster_enabled") == Some(1) => Err(RedisStoreError::invalid(
+            "The server is a Redis Cluster node, so set `cluster`",
+        )),
         Ok(_) => Ok(()),
         Err(error) if error.kind() == ErrorKind::Server(ServerErrorKind::NoPerm) => Ok(()),
         Err(error) => Err(error.into()),
     }
 }
 
-fn check_version(node: &str, info: &str) -> RedisStoreResult<()> {
-    let version = info
-        .lines()
-        .find_map(|line| line.trim().strip_prefix("redis_version:"))
+fn check_version(node: &Origin, info: &InfoDict) -> RedisStoreResult<()> {
+    let version: String = info
+        .get("redis_version")
         .ok_or_else(|| RedisStoreError::invalid(format!("{node} reports no Redis version")))?;
     let major: u32 = version
         .split('.')
@@ -541,22 +540,17 @@ fn check_version(node: &str, info: &str) -> RedisStoreResult<()> {
     Ok(())
 }
 
-/// The policy in a `CONFIG GET maxmemory-policy` reply.
-fn eviction_policy(reply: Value) -> RedisResult<Option<String>> {
-    let mut config: HashMap<String, String> = redis::from_redis_value(reply)?;
-    Ok(config.remove("maxmemory-policy"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn a_server_before_redis_7_is_refused() {
-        check_version("a", "# Server\r\nredis_version:7.0.15\r\n").unwrap();
-        check_version("a", "redis_version:8.10.1").unwrap();
-        assert!(check_version("a", "redis_version:6.2.14").is_err());
-        assert!(check_version("a", "").is_err());
+        let check = |info: &str| check_version(&Origin::Server, &InfoDict::new(info));
+        check("# Server\r\nredis_version:7.0.15\r\n").unwrap();
+        check("redis_version:8.10.1").unwrap();
+        assert!(check("redis_version:6.2.14").is_err());
+        assert!(check("").is_err());
     }
 
     #[test]
