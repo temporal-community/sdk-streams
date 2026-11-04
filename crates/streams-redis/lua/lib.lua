@@ -163,10 +163,11 @@ local function started(key)
   return tonumber(string.sub(key, 1, 16), 16)
 end
 
--- The form of `task_key` in `temporalio-streams`. A script refuses task facts of another form
--- before its first write, since `orphan_tasks` raises on them.
-local TASK_KEY = '^' .. string.rep('%x', 16) .. '%.' .. string.rep('%x', 8) .. '%.' ..
-  string.rep('%x', 16) .. '%.' .. string.rep('%x', 8) .. '$'
+-- The lowercase form of `task_key` in `temporalio-streams`, since keys compare as bytes. A script
+-- refuses task facts of another form before its first write, since `orphan_tasks` raises on them.
+local HEX = '[0-9a-f]'
+local TASK_KEY = '^' .. string.rep(HEX, 16) .. '%.' .. string.rep(HEX, 8) .. '%.' ..
+  string.rep(HEX, 16) .. '%.' .. string.rep(HEX, 8) .. '$'
 
 local function task_key(text)
   return string.match(text, TASK_KEY) ~= nil
