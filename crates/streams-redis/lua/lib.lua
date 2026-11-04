@@ -47,7 +47,7 @@ local function check_owner(meta, kind, chain)
   return nil
 end
 
--- Returns nil when a create names the Stream's owner, or else the refusal. The owner is part of
+-- Returns nil when a create gives the Stream's owner, or else the refusal. The owner is part of
 -- the Stream's identity, so a create can't change it.
 local function check_identity(meta, owner, chain)
   local stored = redis.call('HGET', meta, 'oc') or ''
@@ -94,7 +94,7 @@ local function id_below(a, b)
 end
 
 -- Sets `trimmed` to the entry id `id`, unless it is at or past it already. A clock that steps
--- back must not move the watermark back.
+-- back must not lower the watermark.
 local function raise_trimmed(meta, id)
   local trimmed = redis.call('HGET', meta, 'trimmed')
   if not trimmed or id_below(trimmed, id) then
@@ -106,7 +106,7 @@ end
 -- tell expired Records from an empty Stream.
 local function trim(meta, log, now)
   if redis.call('EXISTS', log) == 0 then
-    -- The expired log took every Record, so a read from an older offset must fail.
+    -- Every Record expired, so a read from an older offset must fail.
     local newest = redis.call('HGET', meta, 'newest')
     if newest then
       raise_trimmed(meta, newest)
@@ -128,7 +128,7 @@ end
 local PRUNE_LIMIT = 64
 
 -- Removes the fence and dedupe fields of the Producers whose last append is older than the
--- Retention. Their Records are older too, so they hold none.
+-- Retention. Their Records are older too, so the log has none of them.
 local function prune(meta, producers, now)
   local min = now - tonumber(redis.call('HGET', meta, 'ret'))
   local old = redis.call('ZRANGEBYSCORE', producers, '-inf', '(' .. min, 'LIMIT', 0, PRUNE_LIMIT)
@@ -163,38 +163,66 @@ local function started(key)
   return tonumber(string.sub(key, 1, 16), 16)
 end
 
--- The form of `task_key` in `temporalio-streams`. A script refuses task facts of another form
--- before its first write, since `orphan_tasks` raises on them.
-local TASK_KEY = '^' .. string.rep('%x', 16) .. '%.' .. string.rep('%x', 8) .. '%.' ..
-  string.rep('%x', 16) .. '%.' .. string.rep('%x', 8) .. '$'
+-- The lowercase form of `task_key` in `temporalio-streams`, since keys compare as bytes. A script
+-- refuses task keys of another form before its first write, since `orphan_tasks` raises on them.
+local HEX = '[0-9a-f]'
+local TASK_KEY = '^' .. string.rep(HEX, 16) .. '%.' .. string.rep(HEX, 8) .. '%.' ..
+  string.rep(HEX, 16) .. '%.' .. string.rep(HEX, 8) .. '$'
 
 local function task_key(text)
   return string.match(text, TASK_KEY) ~= nil
 end
 
+-- Whether the facts of task t show that task key never completed. `docs/redis.md` has the rule.
+local function never_completed(key, t, c, failed_set)
+  local s, ts = started(key), started(t)
+  local cs = 0
+  if c ~= '' then
+    cs = started(c)
+  end
+  return failed_set[s] == true or (cs < s and s < ts) or (s == ts and key < t)
+    or (c ~= '' and s == cs and key < c)
+end
+
 -- A task at or before c that the rule doesn't withdraw completed, so `oa` drops it.
--- `docs/redis.md` has the rule.
 local function orphan_tasks(open, t, c, failed)
   local failed_set = {}
   for _, id in ipairs(words(failed)) do
     failed_set[tonumber(id)] = true
   end
-  local ts = started(t)
-  local cs = 0
-  if c ~= '' then
-    cs = started(c)
-  end
   local withdrawn, kept = {}, {}
   for _, key in ipairs(open) do
-    local s = started(key)
-    if failed_set[s] or (cs < s and s < ts) or (s == ts and key < t)
-        or (c ~= '' and s == cs and key < c) then
+    if never_completed(key, t, c, failed_set) then
       table.insert(withdrawn, key)
     elseif c == '' or key > c then
       table.insert(kept, key)
     end
   end
   return withdrawn, kept
+end
+
+-- The task key of the Workflow Task with this started event id, with no attempt and no time.
+local function started_key(id)
+  return string.format('%016x', math.max(0, id)) .. '.00000000.0000000000000000.00000000'
+end
+
+local ZERO_KEY = started_key(0)
+
+-- Whether the task facts in `tf|<run>` show that task key never completed. The zero key in the
+-- completed place works as no completed task, since no task key is below it.
+local function fenced_by_facts(facts, key)
+  local width, keys = #ZERO_KEY, {}
+  for at = 1, #facts - width + 1, width do
+    table.insert(keys, string.sub(facts, at, at + width - 1))
+  end
+  if #keys < 2 then
+    return false
+  end
+  local failed_set = {}
+  for i = 3, #keys do
+    failed_set[started(keys[i])] = true
+  end
+  return never_completed(key, keys[1], keys[2], failed_set)
 end
 
 -- A run that never wrote here needs the fence but no Superseded item.

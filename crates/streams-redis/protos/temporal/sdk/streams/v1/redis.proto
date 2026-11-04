@@ -1,8 +1,7 @@
 syntax = "proto3";
 
-// The config of the Redis Stream runtime. It keeps the package of the runtime protos of
-// `temporalio-streams`, so the message keeps its full name. Field numbers are part of the contract
-// with every SDK, and the memory runtime's config shares the numbers of the fields both have.
+// The config of the Redis Stream runtime, in the package of the `temporalio-streams` runtime
+// protos. Every SDK uses these field numbers, and the memory runtime's config uses the same ones.
 package temporal.sdk.streams.v1;
 
 import "google/protobuf/duration.proto";

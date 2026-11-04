@@ -1,11 +1,5 @@
-//! The connections of the Redis Store. All short calls share one multiplexed connection, and each
-//! blocking read, and each write with `WAIT`, uses a dedicated one.
-//!
-//! redis-rs sends all commands of a multiplexed connection on one socket, in order. A blocking
-//! `XREAD` there would block every append after it. So a blocking read uses a dedicated connection
-//! from a bounded pool per node. A cancelled read drops its connection, since the server can still
-//! reply to the blocked command on it. Redis reads no more commands from a connection while its
-//! `WAIT` blocks, so each write with `WAIT` also takes a connection of its own.
+//! The connections of the Redis Store. A blocked `XREAD` or `WAIT` stops all later commands on its
+//! connection, so each one gets a dedicated connection, and the short calls share one.
 
 use redis::{
     AsyncConnectionConfig, Client, Cmd, ConnectionAddr, ConnectionInfo, ErrorKind,
@@ -18,8 +12,11 @@ use redis::{
 use std::{
     collections::HashMap,
     future::Future,
+    num::NonZeroUsize,
+    ops::RangeInclusive,
+    path::PathBuf,
     str::FromStr,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
     time::Duration,
 };
 use tokio::{
@@ -27,24 +24,45 @@ use tokio::{
     time::Instant,
 };
 
-/// How long a blocking read waits for a free connection of its node. Then it returns with no wake,
-/// and the caller reads the Stream again, so a read past the pool's size polls about once a second.
+/// How long a blocking read waits for a free connection. Then it returns with no wake, so a read
+/// over the pool's size polls about once a second.
 const PERMIT_WAIT: Duration = Duration::from_secs(1);
 
-/// How long a blocking read waits before it returns with no wake while the cluster moves its slot.
-/// The caller then reads the Stream again, so such a read polls at this rate until the move ends.
+/// How long a blocking read waits, with no wake, while the cluster migrates its slot. So such a
+/// read polls at this rate until the migration ends.
 const RESHARD_WAIT: Duration = Duration::from_millis(100);
 
 /// The most writes with `WAIT` that one Store runs at once, so its connections per node stay few.
-const WAIT_CONNECTIONS: usize = 8;
+const WAIT_CONNECTIONS: NonZeroUsize = match NonZeroUsize::new(8) {
+    Some(count) => count,
+    None => panic!("the count is above zero"),
+};
 
 /// Where the Store's Redis is, parsed once from the URLs of the options.
 pub(crate) struct Endpoint {
-    /// The standalone server, or each seed of a cluster. The first one gives every node its
-    /// credentials and TLS.
-    seeds: Vec<ConnectionInfo>,
-    cluster: bool,
+    topology: Topology,
     response_timeout: Duration,
+}
+
+/// One server, or the seeds of a cluster. Each kind has a first URL, since every node gets its
+/// credentials and TLS.
+enum Topology {
+    Standalone(Seed),
+    Cluster { first: Seed, rest: Vec<Seed> },
+}
+
+/// A URL of the options, and the node at that URL.
+struct Seed {
+    info: ConnectionInfo,
+    node: Node,
+}
+
+impl Seed {
+    fn parse(url: &str) -> RedisResult<Self> {
+        let info = url.into_connection_info()?;
+        let node = Node::of(&info)?;
+        Ok(Self { info, node })
+    }
 }
 
 impl Endpoint {
@@ -53,41 +71,79 @@ impl Endpoint {
         cluster: bool,
         response_timeout: Duration,
     ) -> RedisResult<Self> {
-        let count = if cluster { urls.len() } else { 1 };
-        let seeds = urls
-            .iter()
-            .take(count)
-            .map(|url| url.as_str().into_connection_info())
-            .collect::<RedisResult<Vec<_>>>()?;
-        if seeds.is_empty() {
+        let mut seeds = urls.iter().map(|url| Seed::parse(url));
+        let Some(first) = seeds.next().transpose()? else {
             return Err(RedisError::from((
                 ErrorKind::InvalidClientConfig,
                 "no Redis URL",
             )));
-        }
+        };
+        let rest = seeds.collect::<RedisResult<Vec<_>>>()?;
+        let topology = match (cluster, rest.is_empty()) {
+            (true, _) => Topology::Cluster { first, rest },
+            (false, true) => Topology::Standalone(first),
+            // A standalone Store connects to one server, so the other URLs would have no effect.
+            (false, false) => {
+                return Err(RedisError::from((
+                    ErrorKind::InvalidClientConfig,
+                    "a standalone Redis takes one URL, and a cluster's seeds need `cluster`",
+                )));
+            }
+        };
         Ok(Self {
-            seeds,
-            cluster,
+            topology,
             response_timeout,
         })
     }
 
+    fn cluster(&self) -> bool {
+        matches!(self.topology, Topology::Cluster { .. })
+    }
+
+    /// The server, or the cluster seed whose credentials and TLS every node gets.
+    fn first(&self) -> &Seed {
+        match &self.topology {
+            Topology::Standalone(first) | Topology::Cluster { first, .. } => first,
+        }
+    }
+
+    /// The server, or each seed of the cluster, with the first one first.
+    fn seeds(&self) -> impl Iterator<Item = &Seed> {
+        let rest = match &self.topology {
+            Topology::Standalone(_) => &[][..],
+            Topology::Cluster { rest, .. } => rest.as_slice(),
+        };
+        std::iter::once(self.first()).chain(rest)
+    }
+
     /// Opens a connection for short calls, which the client reconnects when it drops.
     pub(crate) async fn open(&self) -> RedisResult<SharedConnection> {
-        if self.cluster {
-            let client = ClusterClient::builder(self.seeds.clone())
-                .response_timeout(self.response_timeout)
-                .build()?;
-            return Ok(SharedConnection::Cluster(
-                client.get_async_connection().await?,
-            ));
+        self.open_with(&[]).await
+    }
+
+    /// Opens a connection for short calls. A cluster client also gets the `live` nodes as seeds,
+    /// since after a failover every configured seed can be down.
+    async fn open_with(&self, live: &[Node]) -> RedisResult<SharedConnection> {
+        match &self.topology {
+            Topology::Cluster { first, .. } => {
+                let live = live.iter().map(|node| node.info(&first.info));
+                let seeds = self.seeds().map(|seed| seed.info.clone()).chain(live);
+                let client = ClusterClient::builder(seeds)
+                    .response_timeout(self.response_timeout)
+                    .build()?;
+                Ok(SharedConnection::Cluster(
+                    client.get_async_connection().await?,
+                ))
+            }
+            Topology::Standalone(server) => {
+                let client = Client::open(server.info.clone())?;
+                let config = ConnectionManagerConfig::new()
+                    .set_response_timeout(Some(self.response_timeout));
+                Ok(SharedConnection::Single(
+                    client.get_connection_manager_with_config(config).await?,
+                ))
+            }
         }
-        let client = Client::open(self.seeds[0].clone())?;
-        let config =
-            ConnectionManagerConfig::new().set_response_timeout(Some(self.response_timeout));
-        Ok(SharedConnection::Single(
-            client.get_connection_manager_with_config(config).await?,
-        ))
     }
 }
 
@@ -127,12 +183,15 @@ impl ConnectionLike for SharedConnection {
 }
 
 impl SharedConnection {
-    /// Runs `cmd` on the server, or on every primary of a cluster, and returns each reply with the
-    /// node that sent it. Each primary holds its own share of the keys and its own settings.
-    pub(crate) async fn on_each_primary(&self, cmd: Cmd) -> RedisResult<Vec<(String, Value)>> {
+    /// Runs `cmd` on the server, or on each primary of a cluster, since each primary has its own
+    /// keys and settings. A cluster's reply comes with the node that sent it.
+    pub(crate) async fn on_each_primary(
+        &self,
+        cmd: Cmd,
+    ) -> RedisResult<Vec<(Option<String>, Value)>> {
         match self.clone() {
             SharedConnection::Single(mut conn) => {
-                Ok(vec![(String::new(), cmd.query_async(&mut conn).await?)])
+                Ok(vec![(None, cmd.query_async(&mut conn).await?)])
             }
             SharedConnection::Cluster(mut conn) => {
                 let routing = RoutingInfo::MultiNode((MultipleNodeRoutingInfo::AllMasters, None));
@@ -148,10 +207,10 @@ impl SharedConnection {
                                 Value::SimpleString(text) => text,
                                 other => format!("{other:?}"),
                             };
-                            Ok((node, reply.extract_error()?))
+                            Ok((Some(node), reply.extract_error()?))
                         })
                         .collect(),
-                    other => Ok(vec![(String::new(), other.extract_error()?)]),
+                    other => Ok(vec![(None, other.extract_error()?)]),
                 }
             }
         }
@@ -165,92 +224,115 @@ struct Pool<C> {
 }
 
 impl<C> Pool<C> {
-    fn new(size: usize, idle: Vec<C>) -> Self {
+    fn new(size: NonZeroUsize, idle: Vec<C>) -> Self {
         Self {
-            permits: Arc::new(Semaphore::new(size.max(1))),
+            permits: Arc::new(Semaphore::new(size.get())),
             idle: Arc::new(Mutex::new(idle)),
         }
     }
 
-    /// Takes an idle connection, or opens one with `open`. A `fresh` lease always opens one.
-    /// Returns `None` when no connection becomes free by `until`.
+    /// Takes an idle connection, or opens one. Returns `None` if `give_up` ends first, so the
+    /// caller sets the wait and the pool reads no clock.
     async fn lease<F>(
         &self,
-        until: Instant,
-        fresh: bool,
+        give_up: impl Future<Output = ()>,
         open: impl FnOnce() -> F,
     ) -> RedisResult<Option<Lease<C>>>
     where
         F: Future<Output = RedisResult<C>>,
     {
-        let permit = self.permits.clone().acquire_owned();
-        let Ok(Ok(permit)) = tokio::time::timeout_at(until, permit).await else {
+        let permit = tokio::select! {
+            // Take a free connection even when `give_up` is also ready.
+            biased;
+            permit = self.permits.clone().acquire_owned() => permit,
+            () = give_up => return Ok(None),
+        };
+        let Ok(permit) = permit else {
             return Ok(None);
         };
-        let idle = if fresh {
-            None
-        } else {
-            self.idle.lock().unwrap().pop()
-        };
+        let idle = lock(&self.idle).pop();
         let reused = idle.is_some();
         let conn = match idle {
             Some(conn) => conn,
             None => open().await?,
         };
         Ok(Some(Lease {
-            conn: Some(conn),
+            conn,
             reused,
-            keep: false,
             idle: self.idle.clone(),
             _permit: permit,
         }))
     }
 }
 
-/// A connection taken from a [Pool]. It goes back to the pool when the lease drops, but only if
-/// the call on it got its answer. A cancelled or failed call can still get a late reply on the
-/// connection, and the next call would read that reply as its own.
+/// A connection from a [Pool]. A dropped call doesn't stop its command on the server, and the next
+/// call would wait behind it. So a drop closes the connection, and only [Lease::settle] returns it.
 pub(crate) struct Lease<C> {
-    conn: Option<C>,
-    /// Taken idle from the pool, so the server may have dropped it since its last use.
+    conn: C,
+    /// Taken idle from the pool, so the server may have closed it since its last call.
     reused: bool,
-    keep: bool,
     idle: Arc<Mutex<Vec<C>>>,
     _permit: OwnedSemaphorePermit,
 }
 
 impl<C> Lease<C> {
     pub(crate) fn conn(&mut self) -> &mut C {
-        self.conn
-            .as_mut()
-            .expect("a lease holds its connection until it drops")
+        &mut self.conn
     }
 
-    /// Says that the call on the connection got its answer, so the next call can use it.
-    pub(crate) fn keep(&mut self) {
-        self.keep = true;
+    /// Returns the connection to the pool after a whole reply, which is an answer or a server
+    /// error. A wire error closes it.
+    pub(crate) fn settle<T>(self, result: RedisResult<T>) -> RedisResult<T> {
+        let Lease {
+            conn,
+            reused,
+            idle,
+            _permit,
+        } = self;
+        match &result {
+            Err(error) if error.code().is_none() => {
+                // A server restart also closed the other idle connections.
+                if reused && stale(error) {
+                    lock(&idle).clear();
+                }
+            }
+            // Push it back before the permit drops, so the next lease finds it.
+            _ => lock(&idle).push(conn),
+        }
+        result
     }
 }
 
-impl<C> Drop for Lease<C> {
-    fn drop(&mut self) {
-        if let Some(conn) = self.conn.take().filter(|_| self.keep) {
-            self.idle.lock().unwrap().push(conn);
-        }
-    }
+/// Each change under these locks is a single push, pop or insert, so a poisoned lock still guards
+/// valid data.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Whether the connection itself failed, as when the server closed it. A timeout only shows that
+/// the server is slow, so the idle connections may still be good.
+fn stale(error: &RedisError) -> bool {
+    !error.is_timeout() && (error.is_io_error() || error.is_connection_dropped())
 }
 
 /// The connections of the writes with `WAIT`.
 pub(crate) struct WaitPool {
     endpoint: Arc<Endpoint>,
+    /// The shared connection of a cluster, which knows the live nodes.
+    cluster: Option<ClusterConnection>,
     pool: Pool<SharedConnection>,
 }
 
 impl WaitPool {
-    /// A pool that starts with `first`, which tells a bad URL at connect.
-    pub(crate) fn new(first: SharedConnection, endpoint: Arc<Endpoint>) -> Self {
+    /// The pool starts with `first`, so a bad URL fails at connect.
+    pub(crate) fn new(
+        first: SharedConnection,
+        endpoint: Arc<Endpoint>,
+        cluster: Option<ClusterConnection>,
+    ) -> Self {
         Self {
             endpoint,
+            cluster,
             pool: Pool::new(WAIT_CONNECTIONS, vec![first]),
         }
     }
@@ -258,45 +340,116 @@ impl WaitPool {
     /// Takes an idle connection, or opens one. Returns `None` when every connection stays busy
     /// for the response timeout.
     pub(crate) async fn take(&self) -> RedisResult<Option<Lease<SharedConnection>>> {
-        let until = Instant::now() + self.endpoint.response_timeout;
-        self.pool.lease(until, false, || self.endpoint.open()).await
+        let give_up = tokio::time::sleep(self.endpoint.response_timeout);
+        let open = || async {
+            let live: Vec<Node> = match &self.cluster {
+                Some(cluster) => primaries(cluster)
+                    .await
+                    .into_iter()
+                    .map(|(_, node)| node)
+                    .collect(),
+                None => Vec::new(),
+            };
+            self.endpoint.open_with(&live).await
+        };
+        self.pool.lease(give_up, open).await
     }
 }
 
-/// The host and port of a Redis node.
+/// The primary of each slot range, from a live node of the cluster. An empty list when the
+/// cluster doesn't answer, so the caller falls back to the seeds.
+async fn primaries(cluster: &ClusterConnection) -> Vec<(RangeInclusive<u16>, Node)> {
+    let reply = redis::cmd("CLUSTER")
+        .arg("SLOTS")
+        .query_async::<Value>(&mut cluster.clone())
+        .await;
+    reply.map(primaries_of).unwrap_or_default()
+}
+
+fn primaries_of(reply: Value) -> Vec<(RangeInclusive<u16>, Node)> {
+    let Value::Array(ranges) = reply else {
+        return Vec::new();
+    };
+    let range = |range: Value| {
+        let Value::Array(range) = range else {
+            return None;
+        };
+        let [
+            Value::Int(start),
+            Value::Int(end),
+            Value::Array(primary),
+            ..,
+        ] = range.as_slice()
+        else {
+            return None;
+        };
+        let [host, Value::Int(port), ..] = primary.as_slice() else {
+            return None;
+        };
+        let host = match host {
+            Value::BulkString(host) => String::from_utf8(host.clone()).ok()?,
+            Value::SimpleString(host) => host.clone(),
+            _ => return None,
+        };
+        // An empty host is the node that answered, and `?` is unknown, so neither one is usable.
+        if host.is_empty() || host == "?" {
+            return None;
+        }
+        let node = Node::Tcp {
+            host,
+            port: u16::try_from(*port).ok()?,
+        };
+        Some((
+            u16::try_from(*start).ok()?..=u16::try_from(*end).ok()?,
+            node,
+        ))
+    };
+    ranges.into_iter().filter_map(range).collect()
+}
+
+/// A Redis node from a seed or a redirect. A standalone server can also be a local socket.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct Node {
-    host: String,
-    port: u16,
+enum Node {
+    Tcp { host: String, port: u16 },
+    Unix(PathBuf),
 }
 
 impl Node {
-    fn of(info: &ConnectionInfo) -> Self {
-        let (host, port) = match info.addr() {
+    fn of(info: &ConnectionInfo) -> RedisResult<Self> {
+        match info.addr() {
             ConnectionAddr::Tcp(host, port) | ConnectionAddr::TcpTls { host, port, .. } => {
-                (host.clone(), *port)
+                Ok(Self::Tcp {
+                    host: host.clone(),
+                    port: *port,
+                })
             }
-            ConnectionAddr::Unix(path) => (path.display().to_string(), 0),
-            _ => (String::new(), 0),
-        };
-        Self { host, port }
+            ConnectionAddr::Unix(path) => Ok(Self::Unix(path.clone())),
+            other => Err(RedisError::from((
+                ErrorKind::InvalidClientConfig,
+                "the Store can't connect to this kind of address",
+                format!("{other:?}"),
+            ))),
+        }
     }
 
     /// The seed's connection settings, with its credentials and TLS, for this node.
     fn info(&self, seed: &ConnectionInfo) -> ConnectionInfo {
-        let addr = match seed.addr() {
-            ConnectionAddr::TcpTls {
-                insecure,
-                tls_params,
-                ..
-            } => ConnectionAddr::TcpTls {
-                host: self.host.clone(),
-                port: self.port,
+        let addr = match (self, seed.addr()) {
+            (
+                Self::Tcp { host, port },
+                ConnectionAddr::TcpTls {
+                    insecure,
+                    tls_params,
+                    ..
+                },
+            ) => ConnectionAddr::TcpTls {
+                host: host.clone(),
+                port: *port,
                 insecure: *insecure,
                 tls_params: tls_params.clone(),
             },
-            ConnectionAddr::Tcp(..) => ConnectionAddr::Tcp(self.host.clone(), self.port),
-            other => other.clone(),
+            (Self::Tcp { host, port }, _) => ConnectionAddr::Tcp(host.clone(), *port),
+            (Self::Unix(path), _) => ConnectionAddr::Unix(path.clone()),
         };
         seed.clone().set_addr(addr)
     }
@@ -309,32 +462,32 @@ impl FromStr for Node {
     fn from_str(address: &str) -> RedisResult<Self> {
         let bad = || RedisError::from((ErrorKind::InvalidClientConfig, "not a host:port"));
         let (host, port) = address.rsplit_once(':').ok_or_else(bad)?;
-        Ok(Self {
+        Ok(Self::Tcp {
             host: host.to_string(),
             port: port.parse().map_err(|_| bad())?,
         })
     }
 }
 
-/// The node that serves each slot, learned from redirects. A cluster moves slots rarely, and a
-/// stale entry costs one redirect.
+/// The node that serves each slot, from redirects. A cluster migrates slots rarely, and a stale
+/// entry costs one redirect.
 #[derive(Default)]
 struct SlotCache(Mutex<HashMap<u16, Node>>);
 
 impl SlotCache {
     fn get(&self, slot: Option<u16>) -> Option<Node> {
-        self.0.lock().unwrap().get(&slot?).cloned()
+        lock(&self.0).get(&slot?).cloned()
     }
 
     fn learn(&self, slot: u16, node: Node) {
-        self.0.lock().unwrap().insert(slot, node);
+        lock(&self.0).insert(slot, node);
     }
 
-    /// Drops a slot's entry while it still names `node`. A failover can change a node's address
-    /// for good, and otherwise only a redirect would update the entry.
+    /// Removes the slot's entry if it still points at `node`. A failover can change a node's
+    /// address permanently, and only a redirect would update the entry.
     fn forget(&self, slot: Option<u16>, node: &Node) {
         if let Some(slot) = slot {
-            let mut slots = self.0.lock().unwrap();
+            let mut slots = lock(&self.0);
             if slots.get(&slot) == Some(node) {
                 slots.remove(&slot);
             }
@@ -348,22 +501,21 @@ struct Attempt {
     cluster: bool,
     /// The connection came idle from the pool.
     reused: bool,
-    /// The try was already on a new connection.
-    fresh: bool,
-    /// The read already followed one redirect.
+    /// The read already used one redirect.
     redirected: bool,
 }
 
 /// What a blocking read does after a failed try.
 #[derive(Debug, PartialEq, Eq)]
 enum Step {
-    /// Try the node again on a new connection.
-    Fresh,
+    /// Try the node again. The pool closed its idle connections with the dead one, so the try
+    /// opens a new connection.
+    Retry,
     /// The node is down, so try the next seed.
     NextSeed,
-    /// Follow the cluster to the node that now serves the slot.
+    /// Try the node that the redirect gives.
     Redirect(Node),
-    /// The cluster is moving the slot, so end the read with no wake.
+    /// The cluster is migrating the slot, so end the read with no wake.
     NoWake,
     /// Give the error to the caller.
     Fail,
@@ -371,10 +523,10 @@ enum Step {
 
 /// The retry policy of a blocking read. It has no I/O, so a table test covers it.
 fn classify(error: &RedisError, attempt: Attempt) -> Step {
-    // A server restart closes every idle connection. So one retry on a new connection tells a
+    // A server restart closes every idle connection. So a retry on a new connection tells a
     // dead connection from a dead server.
-    if attempt.reused && !attempt.fresh && (error.is_io_error() || error.is_connection_dropped()) {
-        return Step::Fresh;
+    if attempt.reused && stale(error) {
+        return Step::Retry;
     }
     if unreachable(error) {
         return Step::NextSeed;
@@ -382,8 +534,8 @@ fn classify(error: &RedisError, attempt: Attempt) -> Step {
     if !attempt.cluster {
         return Step::Fail;
     }
-    // One redirect is expected when the slot was unknown or moved. A second means the cluster is
-    // resharding.
+    // One redirect is normal when the cache had no entry or a stale one. A second means the cluster
+    // is migrating the slot.
     match redirect(error) {
         Some(target) if !attempt.redirected => Step::Redirect(target),
         _ if resharding(error) => Step::NoWake,
@@ -394,7 +546,9 @@ fn classify(error: &RedisError, attempt: Attempt) -> Step {
 /// Dedicated connections for blocking reads, a bounded number per node.
 pub(crate) struct BlockingPool {
     endpoint: Arc<Endpoint>,
-    per_node: usize,
+    /// The shared connection of a cluster, which knows each slot's live primary.
+    cluster: Option<ClusterConnection>,
+    per_node: NonZeroUsize,
     nodes: Mutex<HashMap<Node, Arc<NodePool>>>,
     slots: SlotCache,
 }
@@ -405,79 +559,99 @@ struct NodePool {
 }
 
 impl BlockingPool {
-    pub(crate) fn new(endpoint: Arc<Endpoint>, per_node: usize) -> Self {
+    pub(crate) fn new(
+        endpoint: Arc<Endpoint>,
+        per_node: NonZeroUsize,
+        cluster: Option<ClusterConnection>,
+    ) -> Self {
         Self {
             endpoint,
+            cluster,
             per_node,
             nodes: Mutex::default(),
             slots: SlotCache::default(),
         }
     }
 
-    /// Runs the command that `cmd` builds for the time left to `deadline`, on a dedicated
-    /// connection to the node that holds `key`.
-    ///
-    /// Returns `None` when no connection became free before `deadline` or within [PERMIT_WAIT], or
-    /// when the cluster moves the key's slot. The caller treats it as a wait in which nothing came.
-    pub(crate) async fn query(
+    /// Waits for an entry after the entry id `after` in the log at `key`. With no free connection,
+    /// or during a slot migration, it returns `false` early, and the caller reads the Stream again.
+    pub(crate) async fn wait_after(
+        &self,
+        key: &str,
+        after: &str,
+        deadline: Instant,
+    ) -> RedisResult<bool> {
+        let xread = |wait: Duration| {
+            let mut xread = redis::cmd("XREAD");
+            xread
+                .arg("COUNT")
+                .arg(1)
+                .arg("BLOCK")
+                // `BLOCK 0` waits with no end, so a read at its deadline blocks for 1 ms.
+                .arg(wait.as_millis().max(1))
+                .arg("STREAMS")
+                .arg(key)
+                .arg(after);
+            xread
+        };
+        let reply = self.query(key, deadline, xread).await?;
+        Ok(
+            matches!(reply, Some(Value::Array(ref keys)) if !keys.is_empty())
+                || matches!(reply, Some(Value::Map(ref keys)) if !keys.is_empty()),
+        )
+    }
+
+    /// Runs the command that `cmd` builds for the time left to `deadline`, which can be zero.
+    /// Returns `None` if no connection was free in time, or if the key's slot is migrating.
+    async fn query(
         &self,
         key: &str,
         deadline: Instant,
         cmd: impl Fn(Duration) -> Cmd,
     ) -> RedisResult<Option<Value>> {
-        let slot = self.endpoint.cluster.then(|| slot(key));
-        // A seed that is down may have a replica that took over its slots, which another seed
-        // knows.
-        let mut seeds = self.endpoint.seeds.iter().map(Node::of);
-        let mut node = match self.slots.get(slot) {
-            Some(node) => node,
-            None => seeds.next().expect("an endpoint has a seed"),
-        };
+        let slot = self.endpoint.cluster().then(|| slot(key));
+        let mut node = match (self.slots.get(slot), slot) {
+            (Some(node), _) => Some(node),
+            (None, Some(slot)) => self.live_primary(slot).await,
+            (None, None) => None,
+        }
+        .unwrap_or_else(|| self.endpoint.first().node.clone());
+        // When a node is down, try each other node once. After a failover the live topology has
+        // the slot's new primary, and a seed that is down may have a replica that took over.
+        let mut fallbacks: Option<std::vec::IntoIter<Node>> = None;
         let mut attempt = Attempt {
             cluster: slot.is_some(),
             ..Attempt::default()
         };
         loop {
-            // Each node that is down costs a connect timeout, so the seeds can outlast the read.
+            // Each node that is down costs a connect timeout, so the seed list can take longer than
+            // the read.
             if deadline <= Instant::now() {
                 return Ok(None);
             }
-            let error = match self.lease(&node, deadline, attempt.fresh).await {
+            let error = match self.lease(&node, deadline).await {
                 Ok(None) => return Ok(None),
                 Ok(Some(mut lease)) => {
+                    attempt.reused = lease.reused;
                     // The lease can wait up to [PERMIT_WAIT], so the block time comes from the
                     // deadline.
                     let wait = deadline.saturating_duration_since(Instant::now());
-                    if wait.is_zero() {
-                        lease.keep();
-                        return Ok(None);
-                    }
-                    attempt.reused = lease.reused;
                     let answer = tokio::time::timeout_at(
                         deadline + self.endpoint.response_timeout,
                         cmd(wait).query_async::<Value>(lease.conn()),
                     )
                     .await;
                     // A server that stopped without a reset never replies, and the read must still
-                    // end. The lease then drops the connection, which may still get the answer.
+                    // end. The lease then drops, which closes the connection.
                     let Ok(result) = answer else {
                         return Err(RedisError::from((
                             ErrorKind::Io,
                             "Redis did not answer a blocked read by its deadline",
                         )));
                     };
-                    match result {
-                        Ok(value) => {
-                            lease.keep();
-                            return Ok(Some(value));
-                        }
-                        Err(error) => {
-                            // A server error is a whole reply, so the connection is still in step.
-                            if error.code().is_some() {
-                                lease.keep();
-                            }
-                            error
-                        }
+                    match lease.settle(result) {
+                        Ok(value) => return Ok(Some(value)),
+                        Err(error) => error,
                     }
                 }
                 Err(error) => {
@@ -486,11 +660,24 @@ impl BlockingPool {
                 }
             };
             match classify(&error, attempt) {
-                Step::Fresh => attempt.fresh = true,
+                Step::Retry => {}
                 Step::NextSeed => {
                     self.slots.forget(slot, &node);
-                    node = seeds.by_ref().find(|seed| *seed != node).ok_or(error)?;
-                    attempt.fresh = false;
+                    if fallbacks.is_none() {
+                        let live = match slot {
+                            Some(slot) => self.live_primary(slot).await,
+                            None => None,
+                        };
+                        let seeds = self.endpoint.seeds().map(|seed| seed.node.clone());
+                        fallbacks = Some(
+                            live.into_iter()
+                                .chain(seeds)
+                                .collect::<Vec<_>>()
+                                .into_iter(),
+                        );
+                    }
+                    let mut nodes = fallbacks.iter_mut().flatten();
+                    node = nodes.find(|other| *other != node).ok_or(error)?;
                 }
                 Step::Redirect(target) => {
                     if let Some(slot) = slot {
@@ -508,14 +695,23 @@ impl BlockingPool {
         }
     }
 
+    /// The primary that serves `slot` now, as the shared connection of a cluster sees it.
+    async fn live_primary(&self, slot: u16) -> Option<Node> {
+        let primaries = primaries(self.cluster.as_ref()?).await;
+        let (_, node) = primaries
+            .into_iter()
+            .find(|(range, _)| range.contains(&slot))?;
+        self.slots.learn(slot, node.clone());
+        Some(node)
+    }
+
     async fn lease(
         &self,
         node: &Node,
         deadline: Instant,
-        fresh: bool,
     ) -> RedisResult<Option<Lease<MultiplexedConnection>>> {
         let node = self.node(node);
-        let until = deadline.min(Instant::now() + PERMIT_WAIT);
+        let give_up = tokio::time::sleep_until(deadline.min(Instant::now() + PERMIT_WAIT));
         let open = || async {
             // The read bounds the wait itself, so the connection sets no response timeout.
             let config = AsyncConnectionConfig::new().set_response_timeout(None);
@@ -523,17 +719,15 @@ impl BlockingPool {
                 .get_multiplexed_async_connection_with_config(&config)
                 .await
         };
-        node.pool.lease(until, fresh, open).await
+        node.pool.lease(give_up, open).await
     }
 
     fn node(&self, node: &Node) -> Arc<NodePool> {
-        self.nodes
-            .lock()
-            .unwrap()
+        lock(&self.nodes)
             .entry(node.clone())
             .or_insert_with(|| {
                 Arc::new(NodePool {
-                    info: node.info(&self.endpoint.seeds[0]),
+                    info: node.info(&self.endpoint.first().info),
                     pool: Pool::new(self.per_node, Vec::new()),
                 })
             })
@@ -552,8 +746,8 @@ fn redirect(error: &RedisError) -> Option<Node> {
     error.redirect_node()?.0.parse().ok()
 }
 
-/// Whether the cluster is moving the slot of the command's key. An `ASK` target serves the key
-/// only for a command sent after `ASKING`, and the slot can move again before the next read.
+/// Whether the cluster is migrating the slot of the command's key. An `ASK` target serves the key
+/// only after `ASKING`, and the slot can migrate again before the next read.
 fn resharding(error: &RedisError) -> bool {
     matches!(
         error.kind(),
@@ -576,7 +770,7 @@ mod tests {
     use super::*;
 
     fn node(host: &str, port: u16) -> Node {
-        Node {
+        Node::Tcp {
             host: host.to_string(),
             port,
         }
@@ -615,7 +809,7 @@ mod tests {
             redirect(&reply("MOVED 3999 127.0.0.1:7292")),
             Some(node("127.0.0.1", 7292))
         );
-        // An `ASK` target holds the slot only for one command sent after `ASKING`.
+        // An `ASK` target serves the slot only for one command after `ASKING`.
         assert_eq!(redirect(&reply("ASK 3999 127.0.0.1:7292")), None);
         assert!("127.0.0.1".parse::<Node>().is_err());
         assert!("127.0.0.1:port".parse::<Node>().is_err());
@@ -632,17 +826,10 @@ mod tests {
             ..cluster
         };
         let cases = [
-            // A reused connection that the server closed gets one retry on a new connection.
-            (io(std::io::ErrorKind::BrokenPipe), reused, Step::Fresh),
+            // A reused connection that the server closed gets a retry on a new connection.
+            (io(std::io::ErrorKind::BrokenPipe), reused, Step::Retry),
             // On a new connection, the same error means the node is down.
-            (
-                io(std::io::ErrorKind::BrokenPipe),
-                Attempt {
-                    fresh: true,
-                    ..reused
-                },
-                Step::NextSeed,
-            ),
+            (io(std::io::ErrorKind::BrokenPipe), cluster, Step::NextSeed),
             (
                 io(std::io::ErrorKind::ConnectionRefused),
                 cluster,
@@ -688,19 +875,25 @@ mod tests {
     }
 
     #[test]
-    fn an_endpoint_needs_a_url() {
-        assert!(Endpoint::parse(&[], false, Duration::from_secs(1)).is_err());
-        assert!(Endpoint::parse(&[], true, Duration::from_secs(1)).is_err());
+    fn an_endpoint_needs_a_url_and_a_standalone_one_takes_only_one() {
+        let parse = |urls: &[&str], cluster| {
+            let urls: Vec<String> = urls.iter().map(|url| url.to_string()).collect();
+            Endpoint::parse(&urls, cluster, Duration::from_secs(1))
+        };
+        assert!(parse(&[], false).is_err());
+        assert!(parse(&[], true).is_err());
+        let two = ["redis://127.0.0.1:1", "redis://127.0.0.1:2"];
+        assert!(parse(&two, false).is_err());
+        assert_eq!(parse(&two, true).unwrap().seeds().count(), 2);
     }
 
     #[tokio::test]
+    #[ignore = "needs Redis"]
     async fn a_cached_slot_on_a_dead_node_goes_back_to_the_seed() {
-        let Some(url) = crate::server::server_url("STREAMS_REDIS_URL") else {
-            return;
-        };
+        let url = crate::testing::standalone_url();
         // A standalone server answers every slot, so the seed serves the read once the dead
         // node is dropped.
-        let pool = BlockingPool::new(endpoint(&[&url], true), 1);
+        let pool = BlockingPool::new(endpoint(&[&url], true), NonZeroUsize::MIN, None);
         let key = "test:{dead-node}:log";
         pool.slots.learn(slot(key), node("127.0.0.1", dead_port()));
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -710,6 +903,47 @@ mod tests {
             Some(Value::SimpleString("PONG".to_string()))
         );
         assert_eq!(pool.slots.get(Some(slot(key))), None);
+    }
+
+    #[test]
+    fn the_cluster_slots_reply_gives_each_range_its_primary() {
+        let reply = redis::parse_redis_value(
+            b"*2\r\n*3\r\n:0\r\n:5460\r\n*3\r\n$9\r\n127.0.0.1\r\n:7001\r\n$2\r\nid\r\n\
+              *3\r\n:5461\r\n:16383\r\n*2\r\n$0\r\n\r\n:7002\r\n",
+        )
+        .unwrap();
+        // The second range has no usable host.
+        assert_eq!(
+            primaries_of(reply),
+            vec![(0..=5460, node("127.0.0.1", 7001))]
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a Redis cluster"]
+    async fn a_cluster_read_and_a_wait_connection_work_when_every_seed_is_down() {
+        let live = endpoint(&[&crate::testing::cluster_url()], true);
+        let SharedConnection::Cluster(cluster) = live.open().await.unwrap() else {
+            panic!("a cluster endpoint opens a cluster connection");
+        };
+        let dead = endpoint(&[&format!("redis://127.0.0.1:{}", dead_port())], true);
+        let key = "test:{dead-seeds}:log";
+        let _: String = redis::cmd("XADD")
+            .arg(key)
+            .arg("*")
+            .arg("x")
+            .arg("y")
+            .query_async(&mut cluster.clone())
+            .await
+            .unwrap();
+        let reads = BlockingPool::new(dead.clone(), NonZeroUsize::MIN, Some(cluster.clone()));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        assert!(reads.wait_after(key, "0-0", deadline).await.unwrap());
+        // The second lease finds no idle connection, so it opens one.
+        let first = SharedConnection::Cluster(cluster.clone());
+        let waits = WaitPool::new(first, dead, Some(cluster));
+        let (one, two) = tokio::join!(waits.take(), waits.take());
+        assert!(one.unwrap().is_some() && two.unwrap().is_some());
     }
 
     /// A port that nothing listens on.
@@ -737,55 +971,106 @@ mod tests {
         format!("redis://{address}")
     }
 
+    // The paused clock advances only on `advance`, or to the next timer when all tasks wait. The
+    // connections open before the pause, since the clock would jump past a connect.
     #[tokio::test]
     async fn the_block_time_starts_when_the_read_has_a_connection() {
-        let pool = Arc::new(BlockingPool::new(endpoint(&[&nil_server()], false), 1));
-        let start = Instant::now();
-        let seed = Node::of(&pool.endpoint.seeds[0]);
-        let mut held = pool
-            .lease(&seed, start + Duration::from_secs(1), false)
+        let pool = BlockingPool::new(endpoint(&[&nil_server()], false), NonZeroUsize::MIN, None);
+        let seed = pool.endpoint.first().node.clone();
+        let held = pool
+            .lease(&seed, Instant::now() + Duration::from_secs(1))
             .await
             .unwrap()
             .unwrap();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            held.keep();
-        });
-        let blocked = Mutex::new(Duration::ZERO);
-        let deadline = start + Duration::from_millis(500);
-        let answer = pool.query("s", deadline, |wait| {
-            *blocked.lock().unwrap() = wait;
+        tokio::time::pause();
+        let deadline = Instant::now() + Duration::from_millis(500);
+        let blocked = Mutex::new(None);
+        let read = pool.query("s", deadline, |wait| {
+            *blocked.lock().unwrap() = Some(wait);
             redis::cmd("XREAD")
         });
-        assert_eq!(answer.await.unwrap(), Some(Value::Nil));
-        assert!(*blocked.lock().unwrap() <= Duration::from_millis(200));
+        let free = async {
+            tokio::time::advance(Duration::from_millis(300)).await;
+            held.settle(Ok(())).unwrap();
+        };
+        // The paused clock can pass the read's deadline before the answer comes, so only the
+        // block time counts.
+        let _ = tokio::join!(read, free);
+        assert_eq!(*blocked.lock().unwrap(), Some(Duration::from_millis(200)));
     }
 
     #[tokio::test]
-    async fn a_lease_returns_its_connection_only_when_kept() {
-        let pool: Pool<u8> = Pool::new(1, Vec::new());
-        let until = || Instant::now() + Duration::from_secs(1);
-        let mut kept = pool
-            .lease(until(), false, || async { Ok(1) })
+    async fn a_read_with_no_free_connection_ends_after_the_permit_wait() {
+        let pool = BlockingPool::new(endpoint(&[&nil_server()], false), NonZeroUsize::MIN, None);
+        let seed = pool.endpoint.first().node.clone();
+        let deadline = || Instant::now() + Duration::from_secs(10);
+        let _held = pool.lease(&seed, deadline()).await.unwrap().unwrap();
+        tokio::time::pause();
+        let start = Instant::now();
+        let answer = pool.query("s", deadline(), |_| redis::cmd("XREAD")).await;
+        assert_eq!(answer.unwrap(), None);
+        let waited = start.elapsed();
+        assert!(
+            waited >= PERMIT_WAIT && waited < Duration::from_secs(10),
+            "{waited:?}"
+        );
+    }
+
+    async fn lease(pool: &Pool<u8>, open: u8) -> Lease<u8> {
+        pool.lease(std::future::pending(), || async move { Ok(open) })
             .await
             .unwrap()
-            .unwrap();
-        kept.keep();
-        drop(kept);
-        let dropped = pool
-            .lease(until(), false, || async { Ok(2) })
-            .await
             .unwrap()
-            .unwrap();
-        assert!(dropped.reused);
-        drop(dropped);
-        // The lease that wasn't kept took its connection with it.
-        let next = pool
-            .lease(until(), false, || async { Ok(3) })
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(!next.reused);
+    }
+
+    #[tokio::test]
+    async fn a_lease_gives_its_connection_back_only_after_a_whole_reply() {
+        let pool = Pool::new(NonZeroUsize::MIN, Vec::new());
+        // A server error is a whole reply.
+        let first = lease(&pool, 1).await;
+        assert!(first.settle::<()>(Err(reply("ERR no"))).is_err());
+        let again = lease(&pool, 2).await;
+        assert_eq!((again.conn, again.reused), (1, true));
+        assert!(again.settle(Ok(())).is_ok());
+        // After a wire error the connection closes.
+        let lost = lease(&pool, 3).await;
+        assert!(
+            lost.settle::<()>(Err(io(std::io::ErrorKind::TimedOut)))
+                .is_err()
+        );
+        let next = lease(&pool, 4).await;
+        assert_eq!((next.conn, next.reused), (4, false));
+        // A lease that drops, as a cancelled call does, closes its connection too.
+        drop(next);
+        assert_eq!(lease(&pool, 5).await.conn, 5);
+    }
+
+    #[tokio::test]
+    async fn a_dead_reused_connection_closes_the_idle_ones_but_a_slow_one_does_not() {
+        let pool = Pool::new(NonZeroUsize::new(3).unwrap(), vec![1, 2, 3]);
+        let slow = lease(&pool, 0).await;
+        assert!(
+            slow.settle::<()>(Err(io(std::io::ErrorKind::TimedOut)))
+                .is_err()
+        );
+        let dead = lease(&pool, 0).await;
+        assert_eq!((dead.conn, dead.reused), (2, true));
+        assert!(
+            dead.settle::<()>(Err(io(std::io::ErrorKind::BrokenPipe)))
+                .is_err()
+        );
+        let next = lease(&pool, 4).await;
+        assert_eq!((next.conn, next.reused), (4, false));
+    }
+
+    #[tokio::test]
+    async fn a_lease_gives_up_only_when_no_connection_is_free() {
+        let pool = Pool::new(NonZeroUsize::MIN, Vec::new());
+        let give_up = || std::future::ready(());
+        let open = || async { Ok(1) };
+        let held = pool.lease(give_up(), open).await.unwrap();
+        assert!(held.is_some());
+        assert!(pool.lease(give_up(), open).await.unwrap().is_none());
     }
 
     #[test]
@@ -794,7 +1079,7 @@ mod tests {
             .into_connection_info()
             .unwrap();
         let other = node("10.0.0.2", 7292).info(&seed);
-        assert_eq!(Node::of(&other), node("10.0.0.2", 7292));
+        assert_eq!(Node::of(&other).unwrap(), node("10.0.0.2", 7292));
         let settings = |info: &ConnectionInfo| {
             let redis = info.redis_settings();
             (

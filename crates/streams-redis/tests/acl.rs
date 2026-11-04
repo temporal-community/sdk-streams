@@ -1,23 +1,26 @@
 //! The Redis users of `docs/redis.md`, with exactly the key access and commands it lists per role,
-//! run every Store call of that role, on a standalone server and on a cluster whose slot moves.
-
-mod support;
+//! run every Store call of that role, on a standalone server and on a cluster whose slot migrates.
 
 use prost::Message;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use support::server_url;
+use std::{
+    num::NonZeroUsize,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 use temporalio_common::protos::temporal::api::common::v1::Payload;
 use temporalio_streams::{
     Reason,
     digest::batch_digest,
-    ids::{StreamKeys, client_producer_id},
+    ids::{StreamKeys, client_producer_id, local_activity_producer_id},
     proto::{
         AppendRecord, Producer, ProducerEpoch, StreamData, StreamHandle, StreamProducerKind,
-        StreamRecord, stream_record::Item,
+        StreamRecord, WorkflowTaskEpoch, stream_record::Item,
     },
-    store::{Batch, Owner, Store, Withdrawal},
+    store::{Batch, Owner, Store, TaskFacts, Withdrawal},
 };
-use temporalio_streams_redis::{RedisStore, RedisStoreOptions};
+use temporalio_streams_redis::{
+    RedisStore, RedisStoreError, RedisStoreOptions, WaitOptions,
+    testing::{cluster_url, standalone_url},
+};
 
 const PREFIX: &str = "streams-acl";
 
@@ -78,7 +81,7 @@ async fn store(url: String) -> Box<dyn Store> {
 }
 
 async fn store_with(mut options: RedisStoreOptions) -> Box<dyn Store> {
-    options.key_prefix = PREFIX.to_string();
+    options.key_prefix = PREFIX.parse().unwrap();
     Box::new(RedisStore::connect(options).await.unwrap())
 }
 
@@ -123,14 +126,42 @@ fn client_named(process: &str) -> Producer {
     }
 }
 
+/// The Workflow Task of a run that starts at the event `started`.
+fn task(started: i64) -> WorkflowTaskEpoch {
+    WorkflowTaskEpoch {
+        started_event_id: started,
+        attempt: 1,
+        started_time: Some(prost_types::Timestamp {
+            seconds: started,
+            nanos: 0,
+        }),
+    }
+}
+
+/// A Local Activity of the run `run`, dispatched by `task`.
+fn local_activity(run: &str, task: &WorkflowTaskEpoch) -> Producer {
+    Producer {
+        kind: StreamProducerKind::LocalActivity as i32,
+        id: local_activity_producer_id(run, &format!("call-{}", task.started_event_id)),
+        epoch: Some(ProducerEpoch {
+            task_started_event_id: task.started_event_id,
+            task_attempt: task.attempt,
+            task_started_time: task.started_time,
+            attempt: 1,
+            ..Default::default()
+        }),
+        run_id: run.to_string(),
+    }
+}
+
 #[tokio::test]
+#[ignore = "needs Redis"]
 async fn the_documented_commands_run_every_call_of_each_role() {
-    let Some(url) = server_url("STREAMS_REDIS_URL") else {
-        return;
-    };
+    let url = standalone_url();
     let unique = unique();
     let namespace = format!("ns-{unique}");
     let (producer_name, reader_name) = (format!("prod-{unique}"), format!("read-{unique}"));
+    let read_only_name = format!("ro-{unique}");
     let handle = StreamHandle {
         id: "s".to_string(),
         ..Default::default()
@@ -175,15 +206,18 @@ async fn the_documented_commands_run_every_call_of_each_role() {
             .len(),
         1
     );
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+    // The log has an entry after 0, so the Reader's blocking read wakes at once.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     assert!(
-        !reader
-            .wait_after(&namespace, "s", first, deadline)
+        reader
+            .wait_after(&namespace, "s", 0, deadline)
             .await
             .unwrap()
     );
-    // The Reader's user has only read access to the keys, so its write fails for good.
-    let refused = reader
+    // A user with read access to the keys can't write them, even with the Producer's commands.
+    let read_only = (READER.0, PRODUCER.1);
+    let read_only = store(user(&url, &read_only_name, &namespace, read_only).await).await;
+    let refused = read_only
         .append(
             &namespace,
             &handle,
@@ -195,19 +229,76 @@ async fn the_documented_commands_run_every_call_of_each_role() {
         .await
         .unwrap_err();
     assert_eq!(refused.reason, Reason::Invalid, "{refused}");
+    assert!(!refused.message.contains("evalsha"), "{refused}");
 
     producer
         .close(&namespace, &handle, &client(), b"")
         .await
         .unwrap();
 
-    // An append after the Retention trims the old Records and prunes the old Producers. An open
-    // Workflow Stream has the safety TTL, so it doesn't expire with the Retention.
+    // An orphan append and a retry run's create run with the Producer's commands too.
+    let retry = StreamHandle {
+        id: "retry".to_string(),
+        ..Default::default()
+    };
+    producer
+        .create(
+            &namespace,
+            &retry,
+            None,
+            Owner::Client,
+            &Withdrawal::default(),
+        )
+        .await
+        .unwrap();
+    let la_append = |task: &WorkflowTaskEpoch, completed, failed: &'static [i64]| {
+        let (producer, namespace, retry) = (&producer, &namespace, &retry);
+        let (records, digest) = (&stored, digest.clone());
+        let la = local_activity("r0", task);
+        async move {
+            let facts = TaskFacts {
+                completed,
+                failed_tasks: failed,
+                superseded: b"facts",
+            };
+            let batch = Batch {
+                producer: &la,
+                sequence: 1,
+                records,
+                digest: &digest,
+                withdrawal: Withdrawal {
+                    tasks: Some(facts),
+                    ..Withdrawal::default()
+                },
+            };
+            producer.append(namespace, retry, &batch).await.unwrap()
+        }
+    };
+    let (failed, completed, next) = (task(3), task(5), task(7));
+    la_append(&failed, None, &[]).await;
+    let orphan = la_append(&next, Some(&completed), &[3]).await;
+    assert!(orphan.flagged);
+    let withdrawn = Withdrawal {
+        withdraw_run: "r0",
+        superseded: b"run",
+        tasks: None,
+    };
+    let created = producer
+        .create(&namespace, &retry, None, Owner::Client, &withdrawn)
+        .await
+        .unwrap();
+    assert!(created.flagged);
+
+    // An append after the Retention trims the old Records and prunes the old Producers. The
+    // scripts read the server's `TIME`, so the case must wait for that clock.
     let short = StreamHandle {
         id: "short".to_string(),
         ..Default::default()
     };
-    let retention = Duration::from_secs(1);
+    // The old Record is at least 1.1 Retentions old at the last append, and the recent one 0.5, so
+    // a stall of up to 1 s leaves the result the same.
+    let retention = Duration::from_secs(2);
+    // A Workflow Stream has the safety TTL, so it doesn't expire with the Retention.
     producer
         .create(
             &namespace,
@@ -235,10 +326,10 @@ async fn the_documented_commands_run_every_call_of_each_role() {
         }
     };
     let old = append_as("old").await.offsets.unwrap().1;
-    tokio::time::sleep(retention / 2).await;
+    tokio::time::sleep(retention * 6 / 10).await;
     // A write within the Retention keeps the log key.
     append_as("recent").await;
-    tokio::time::sleep(retention * 7 / 10).await;
+    tokio::time::sleep(retention / 2).await;
     append_as("new").await;
     let (state, entries) = reader.read(&namespace, "short", 0, 10).await.unwrap();
     assert_eq!((state.trimmed, entries.len()), (old, 2));
@@ -258,8 +349,10 @@ async fn the_documented_commands_run_every_call_of_each_role() {
     // With `+wait`, too few replicas is a Store failure, not a refusal.
     let mut options =
         RedisStoreOptions::new(user(&url, &producer_name, &namespace, PRODUCER).await);
-    options.wait_replicas = 16;
-    options.wait_timeout = Duration::from_millis(50);
+    options.wait = Some(WaitOptions {
+        replicas: NonZeroUsize::new(16).unwrap(),
+        timeout: Duration::from_millis(50),
+    });
     let waits = store_with(options).await;
     let failed = waits
         .create(
@@ -275,9 +368,19 @@ async fn the_documented_commands_run_every_call_of_each_role() {
         .await
         .unwrap_err();
     assert_eq!(failed.reason, Reason::Storage, "{failed}");
+    // Without `+wait`, each write would run its script and then fail, so connect refuses it.
+    let no_wait = (PRODUCER.0, PRODUCER.1.trim_end_matches(" +wait"));
+    let mut options = RedisStoreOptions::new(user(&url, &producer_name, &namespace, no_wait).await);
+    options.key_prefix = PREFIX.parse().unwrap();
+    options.wait = Some(WaitOptions {
+        replicas: NonZeroUsize::MIN,
+        timeout: Duration::from_millis(50),
+    });
+    let refused = RedisStore::connect(options).await.unwrap_err();
+    assert!(matches!(refused, RedisStoreError::Invalid(_)), "{refused}");
 
     let mut conn = admin(&url).await;
-    for name in [producer_name, reader_name] {
+    for name in [producer_name, reader_name, read_only_name] {
         let _: () = redis::cmd("ACL")
             .arg("DELUSER")
             .arg(name)
@@ -357,13 +460,12 @@ async fn primaries(conn: &mut redis::cluster_async::ClusterConnection) -> Vec<Pr
     primaries
 }
 
-/// While a slot moves, the source answers `ASK` for the Stream's keys that it gave away, so the
+/// While a slot migrates, the source answers `ASK` for the Stream's keys that it gave away, so the
 /// Store's client sends `ASKING` to the target.
 #[tokio::test]
+#[ignore = "needs a Redis cluster"]
 async fn the_documented_commands_serve_a_cluster_while_a_slot_moves() {
-    let Some(url) = server_url("STREAMS_REDIS_CLUSTER_URL") else {
-        return;
-    };
+    let url = cluster_url();
     let unique = unique();
     let namespace = format!("ns-{unique}");
     let mut cluster = redis::cluster::ClusterClient::new(vec![url.as_str()])
@@ -373,7 +475,7 @@ async fn the_documented_commands_serve_a_cluster_while_a_slot_moves() {
         .unwrap();
     let nodes = primaries(&mut cluster).await;
     assert!(nodes.len() > 1, "a slot move needs two primaries");
-    // A Stream whose slot has no other keys, so the move takes only the Stream's keys.
+    // A Stream whose slot has no other keys, so the migration takes only the Stream's keys.
     let (stream, slot, source, target) = 'pick: {
         for i in 0.. {
             let id = format!("s{i}");
@@ -413,7 +515,7 @@ async fn the_documented_commands_serve_a_cluster_while_a_slot_moves() {
     let connect = |name: &str| {
         let mut options = RedisStoreOptions::new(login(&url, name));
         options.cluster = true;
-        options.key_prefix = PREFIX.to_string();
+        options.key_prefix = PREFIX.parse().unwrap();
         RedisStore::connect(options)
     };
     let producer = connect(&producer_name).await.unwrap();
@@ -432,11 +534,11 @@ async fn the_documented_commands_serve_a_cluster_while_a_slot_moves() {
         .await
         .unwrap();
     producer
-        .append(&namespace, &handle.id, &batch(1))
+        .append(&namespace, &handle, &batch(1))
         .await
         .unwrap();
 
-    // The move as `redis-cli --cluster reshard` makes it, stopped after the Stream's keys moved.
+    // The migration that `redis-cli --cluster reshard` runs, stopped after the Stream's keys moved.
     let set_slot = |state: &str, other: &Primary| {
         let mut cmd = redis::cmd("CLUSTER");
         cmd.arg("SETSLOT").arg(slot).arg(state).arg(&other.id);
@@ -457,7 +559,7 @@ async fn the_documented_commands_serve_a_cluster_while_a_slot_moves() {
         .arg(keys.producers());
     source.run(&migrate).await;
 
-    let appended = producer.append(&namespace, &handle.id, &batch(2)).await;
+    let appended = producer.append(&namespace, &handle, &batch(2)).await;
     let read = reader.read(&namespace, &handle.id, 0, 10).await;
     let read_back = reader.read_back(&namespace, &handle.id, i64::MAX, 10).await;
     let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
@@ -467,8 +569,8 @@ async fn the_documented_commands_serve_a_cluster_while_a_slot_moves() {
         .await
         .map(|_| ());
 
-    // The Stream's keys are only on the target, so dropping them there undoes the move. A failed
-    // drop must not keep the slot moving.
+    // The Stream's keys are only on the target, so deleting them there undoes the migration. A
+    // failed delete must not leave the slot migrating.
     let mut drop_keys = redis::pipe();
     for key in [keys.meta(), keys.log(), keys.producers()] {
         drop_keys
@@ -498,7 +600,7 @@ async fn the_documented_commands_serve_a_cluster_while_a_slot_moves() {
     let (state, entries) = read.unwrap();
     assert_eq!((state.newest, entries.len()), (appended.1, 2));
     assert_eq!(read_back.unwrap().len(), 2);
-    // A blocking read ends with no wake while the slot moves, and the service reads again.
+    // A blocking read ends with no wake while the slot migrates, and the service reads again.
     assert!(!waited.unwrap());
     closed.unwrap();
 }

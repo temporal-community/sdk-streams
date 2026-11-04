@@ -12,7 +12,7 @@ form, and the `testdata/` of `temporalio-streams` has its test vectors.
 ```
 
 - Each part is percent-encoded. The hash tag puts the three keys in one cluster slot.
-- The prefix has only letters, digits, `-`, `.`, `_` and `~`, so a key pattern names it as written.
+- The prefix has only letters, digits, `-`, `.`, `_` and `~`, so a key pattern shows it as written.
 - A create writes `:meta`. An append writes `:producers`. An append, a close or a retry run's
   create writes `:log`.
 
@@ -32,7 +32,8 @@ form, and the `testdata/` of `temporalio-streams` has its test vectors.
 | `d\|<kind>\|<producer id>` | `<epoch key>\|<sequence>\|<first id>\|<last id>\|<digest>` |
 | `h\|<kind>\|<producer id>` | The newest epoch key that still has Records here |
 | `oa\|<run>` | The run's Local Activity task keys here that may not have completed |
-| `ow\|<run>` | The task keys of the run whose Local Activity Records an orphan item withdrew |
+| `ow\|<run>\|<task key>` | Set when an orphan item withdrew the task's Local Activity Records |
+| `tf\|<run>` | The task facts of the run's highest task, as task keys back to back |
 | `run\|<run>` | Set when a Producer of the run wrote a Record here |
 | `wr\|<run>` | Set when a Workflow retry withdrew the run |
 
@@ -51,34 +52,49 @@ never get the same sequence. Nothing dedupes such a batch, so its retry writes i
 
 ## Log entries
 
-- `r` is the encoded `StreamRecord`, with no offset.
-- `s` is the encoded `StreamSuperseded` with the withdrawal facts, on the first entry of a batch
-  that withdraws. A read builds the Superseded item from it. An entry can have only `s`.
+- `r` is the encoded `StreamRecord`, with no offset. A data Record has no Producer in it.
+- `p` is the encoded `Producer` of the batch, on the batch's first data entry. The Store sets it on
+  each data Record of the batch when it reads them.
+- `b` is the seq of the batch's first entry, on each later data entry, so a read that starts inside
+  a batch gets `p` with one lookup.
+- A batch's entries share one millisecond, and a trim drops whole milliseconds, so a batch keeps
+  its `p` entry for as long as it has any entry.
+- `s` is the encoded `StreamSuperseded` with the withdrawal facts. A read builds the Superseded
+  item from it.
+- A batch that withdraws has `s` on its first entry. The orphan rule adds an entry with only `s`
+  before it, so one batch can have two.
 - An offset is the entry id `<ms>-<seq>`, packed as `ms << 20 | seq`.
 
 ## Orphaned Local Activity Records
 
-A Local Activity batch can name its run's last completed Workflow Task (`previous_completed_task`)
+A Local Activity batch can give its run's last completed Workflow Task (`previous_completed_task`)
 and failed tasks. Then the append withdraws the run's tasks in `oa` that never completed.
 
 - These are the tasks after the completed task and before the batch's task, the failed tasks, and
   the lower attempts of the batch's task and of the completed task.
 - One entry with only `s` withdraws them. Its `StreamSuperseded` is of the Workflow kind, with the
   run's Workflow Producer, the batch's task, and the completed and failed tasks.
-- The append then drops the tasks at or before the completed task from `oa`, and adds the batch's
-  task when the batch has Records.
-- `ow` keeps the withdrawn tasks, and fences a late write of each one.
-- A batch with no `previous_completed_task` skips the rule.
+- The append then drops the tasks at or before the completed task from `oa`.
+- Each Local Activity batch with Records adds its task to `oa`, also a batch with no task facts.
+- Each `ow|<run>|<task key>` fences a late write of that task.
+- A batch with no task facts skips the rule.
+- `tf|<run>` keeps the facts of the run's highest task. These are its own key, the completed
+  task's key or the zero key before the first, and the key of each failed task's started event id.
+- A write of a task that `tf|` shows never completed fails with `stream_fenced`, since a task can
+  fail before its call writes.
 
 ## Retry runs
 
-- A Workflow retry run names its previous run in `withdraw_run`, on its create and on its Local
-  Activities' appends.
+- A Workflow retry run gives its previous run in `withdraw_run`, on its create and on the first
+  batch of each of its Local Activities.
 - The first such call sets `wr|<previous run>`, also when the create makes the Stream.
 - When `run|<previous run>` is set, the call also writes `s`. A create writes it on an entry of its
-  own, and an append on its first entry.
+  own, and an append on the first entry of its batch.
+- When `run|<previous run>` isn't set, a create that finds the Stream sets only `wr|`, and `exp`
+  stays as it is.
 - When `wr|<run>` is set, each later append and close of the run's Producers fails with
-  `stream_fenced`.
+  `stream_fenced`. A resend still gets its first answer, and a close of a closed Stream gets
+  `already`.
 - An append with Records sets `run|<run>`.
 
 ## TTLs
@@ -102,6 +118,9 @@ these lists on a standalone server and on a cluster.
 - A Reader reads and describes. It needs the keys `%R~<prefix>:{<namespace>:*` and the commands
   `+evalsha_ro +script|load +time +hmget +xrange`. A read that waits also needs `+xread`, and a
   read of the last Records needs `+xrevrange`.
+- A user that lacks a command of its list can fail a script after its first write, and that write
+  stays. `connect` checks `+wait`, since without it each write would fail its `WAIT` after the
+  write happened.
 - On a cluster, each role also needs `+cluster|slots +asking +ping`, on each node.
 - A process with both roles needs both sets.
 - `+info` and `+config|get` are optional. Without `+info`, the Store skips the version check.
@@ -109,8 +128,8 @@ these lists on a standalone server and on a cluster.
 - A user with write access can write as any Producer.
 - The ACLs don't limit CPU or memory, since `+script|load` lets a user run any Lua. A Reader with no
   `+script|load` needs an admin to load the read script on each primary, after each restart,
-  failover or `SCRIPT FLUSH`. That script is the line `#!lua flags=no-writes` and then
-  `lua/read.lua`.
+  failover or `SCRIPT FLUSH`. The script's SHA is of its exact bytes, so load it with
+  `{ printf '#!lua flags=no-writes\n'; cat lua/read.lua; } | redis-cli -x SCRIPT LOAD`.
 
 ## Eviction and replication
 
@@ -118,7 +137,11 @@ these lists on a standalone server and on a cluster.
   the fence, the dedupe and the close. The Store warns about it on connect.
 - A failover can lose a write that Redis acknowledged. With `wait_replicas`, each write waits for
   that many replicas with `WAIT`. A write that they don't have after `wait_timeout` fails as a
-  Store failure, and its retry writes it once.
+  Store failure, and its retry with the same sequence writes it once.
+- `WAIT` protects only the writer's answer. A Reader can see a write before its `WAIT` ends, and
+  a failover can then lose that write.
+- On a cluster, the client sends a write again after it loses the reply. A batch with sequence 0
+  then gets two copies, and a resend answer has no flag.
 - With `WAIT`, a call that finds its write done, such as a resend, writes `v` again. Then its
   `WAIT` covers the earlier write.
 - A failover can still promote a replica that doesn't have an acknowledged write.
@@ -126,28 +149,22 @@ these lists on a standalone server and on a cluster.
 ## Known limits
 
 - Nothing closes a Workflow-owned Stream whose owner was terminated or timed out, so it stays open
-  until its safety TTL passes. The native server closes it at the owner's end.
+  until its safety TTL passes. The native server closes it when the owner's run ends.
 - A client's Stream has no owner but the kind, so any client closes it.
-- A Local Activity call of a failed Workflow Task is withdrawn only when the retry task runs that
-  call again, or when a later Local Activity write names the failed task. A call that no later
-  write covers, for example because a Signal changed the path and no Local Activity writes
-  again, keeps its Records. The memory Store has the same limit.
+- A failed task's Local Activity Records go only when the retry task runs the same call again, or
+  a later Local Activity write gives the failed task. Otherwise they stay, as in the memory Store.
 - Core sends only the last 100 failed Workflow Tasks of a run. An older failed task before the last
   completed one keeps its Local Activity Records.
-- A Local Activity that runs longer than its Workflow Task, which Core then completes as a
-  heartbeat, keeps its Records when the task where it resolves fails. Only a later run of the same
-  call withdraws them.
-- A retry run withdraws only its previous run. When that run never wrote to the Stream, the runs
-  before it keep their Records. The Store can't tell an earlier retry attempt from a
-  continue-as-new run before it.
-- A run that closes its Stream and then fails under a retry policy leaves the Stream closed, and
-  each retry run's create fails with `stream_closed`. A close can't be withdrawn, since the
-  Readers that read it have ended.
+- A Local Activity that runs longer than its Workflow Task keeps its Records when the task where it
+  resolves fails. Only a later run of the same call withdraws them.
+- A retry run withdraws only its previous run. If that run never wrote, older runs keep their
+  Records, since the Store can't tell a retry attempt from a continue-as-new run.
+- A run that closes its Stream and then fails under a retry policy leaves it closed, so each retry
+  run's create fails with `stream_closed`. The close's Readers have ended, so it can't be withdrawn.
 - A reset run doesn't withdraw the base run's Records after the reset point, and it doesn't fence
   the base run's Producers.
-- The meta keeps the `run|`, `oa|`, `ow|` and `wr|` fields of each run until the Stream expires. A
-  long run chain, such as one that continues-as-new every hour, adds fields to its Stream's meta
-  for as long as it writes.
+- The meta keeps the `run|`, `oa|`, `ow|`, `tf|` and `wr|` fields of each run until the Stream expires, so
+  a long run chain adds fields for as long as it writes.
 - Redis can't tie a run to its run chain. A run of another chain that holds the owner's handle,
   such as a child Workflow with its parent's Stream, can still close it. The native server checks
   the run.
