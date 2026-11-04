@@ -146,8 +146,8 @@ these lists on a standalone server and on a cluster.
   completed one keeps its Local Activity Records.
 - A Local Activity that runs longer than its Workflow Task keeps its Records when the task where it
   resolves fails. Only a later run of the same call withdraws them.
-- `ow` fences only the tasks that an orphan item withdrew. A failed task's Local Activity that
-  writes for the first time after a later write gave the task as failed keeps that Record.
+- `ow` fences only the tasks that an orphan item withdrew. So when a failed task's Local Activity
+  writes its first Record after another write gave the task as failed, that Record stays.
 - A Local Activity write with no task facts, as from an older Core, isn't in `oa`, so no later
   orphan item withdraws its Records.
 - A retry run withdraws only its previous run. If that run never wrote, older runs keep their
