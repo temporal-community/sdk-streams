@@ -32,7 +32,7 @@ form, and the `testdata/` of `temporalio-streams` has its test vectors.
 | `d\|<kind>\|<producer id>` | `<epoch key>\|<sequence>\|<first id>\|<last id>\|<digest>` |
 | `h\|<kind>\|<producer id>` | The newest epoch key that still has Records here |
 | `oa\|<run>` | The run's Local Activity task keys here that may not have completed |
-| `ow\|<run>` | The task keys of the run whose Local Activity Records an orphan item withdrew |
+| `ow\|<run>\|<task key>` | Set when an orphan item withdrew the task's Local Activity Records |
 | `run\|<run>` | Set when a Producer of the run wrote a Record here |
 | `wr\|<run>` | Set when a Workflow retry withdrew the run |
 

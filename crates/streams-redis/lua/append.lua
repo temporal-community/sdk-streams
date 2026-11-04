@@ -17,7 +17,7 @@ local digest, wait = ARGV[15], ARGV[16]
 local records = #ARGV - 16
 -- Only a Local Activity write with its run's task facts tells which tasks of the run completed.
 local orphans = kind == '2' and completed ~= '-' and run ~= ''
-local open_field, gone_field = 'oa|' .. run, 'ow|' .. run
+local open_field, gone_prefix = 'oa|' .. run, 'ow|' .. run .. '|'
 
 -- The script reads the dedupe entry and writes the batch in one step, so no other batch takes the
 -- same number.
@@ -81,7 +81,7 @@ local newest = redis.call('HGET', meta, 'e' .. suffix)
 if newest and epoch < newest then
   return refuse('FENCED', 'the epoch is lower than the newest one of the Producer')
 end
-if kind == '2' and run ~= '' and contains(words(redis.call('HGET', meta, gone_field)), task) then
+if kind == '2' and run ~= '' and redis.call('HGET', meta, gone_prefix .. task) then
   return refuse('FENCED', 'a Superseded item withdrew the Workflow Task of the call')
 end
 
@@ -156,12 +156,9 @@ if orphans then
   else
     redis.call('HDEL', meta, open_field)
   end
-  if #withdrawn > 0 then
-    local all = words(redis.call('HGET', meta, gone_field))
-    for _, key in ipairs(withdrawn) do
-      table.insert(all, key)
-    end
-    redis.call('HSET', meta, gone_field, table.concat(all, ' '))
+  -- One field per task, so the fence reads one field and a withdrawal writes only its new tasks.
+  for _, key in ipairs(withdrawn) do
+    redis.call('HSET', meta, gone_prefix .. key, '1')
   end
 end
 if last_id ~= '' then
