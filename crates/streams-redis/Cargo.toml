@@ -20,7 +20,7 @@ tls-aws-lc = ["temporalio-common/tls-aws-lc"]
 # Turns on `tls-aws-lc` and the FIPS mode of `aws-lc-rs`, so that the shared rustls provider links
 # `aws-lc-fips-sys`.
 fips = ["tls-aws-lc", "dep:aws-lc-rs"]
-# The test support of the crate's own tests. Nothing else needs it.
+# Only the crate's own tests use it.
 test-support = []
 
 [dependencies]

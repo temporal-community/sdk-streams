@@ -52,23 +52,25 @@ impl std::fmt::Debug for RedisStore {
 impl RedisStore {
     /// Connects to Redis and checks that it is Redis 7.0 or later.
     pub async fn connect(options: RedisStoreOptions) -> RedisStoreResult<Self> {
-        check_options(&options)?;
-        let endpoint = Endpoint::parse(&options.urls, options.cluster, options.response_timeout)
-            .map_err(|error| {
-                RedisStoreError::invalid(format!("The Redis URLs are wrong: {error}"))
-            })?;
-        let endpoint = Arc::new(endpoint);
+        let endpoint = Arc::new(check(&options)?);
         let shared = endpoint.open().await?;
         check_server(&shared).await?;
+        if options.wait.is_some() {
+            check_wait(&shared).await?;
+        }
+        let cluster = match &shared {
+            SharedConnection::Cluster(cluster) => Some(cluster.clone()),
+            SharedConnection::Single(_) => None,
+        };
         let wait = match options.wait {
             None => None,
             Some(wait) => Some(Arc::new(Wait {
                 replicas: wait.replicas,
                 timeout: wait.timeout,
-                pool: WaitPool::new(endpoint.open().await?, endpoint.clone()),
+                pool: WaitPool::new(endpoint.open().await?, endpoint.clone(), cluster.clone()),
             })),
         };
-        let blocking = BlockingPool::new(endpoint, options.blocking_reads_per_node);
+        let blocking = BlockingPool::new(endpoint, options.blocking_reads_per_node, cluster);
         Ok(Self {
             shared,
             wait,
@@ -83,7 +85,7 @@ impl RedisStore {
         StreamKeys::new(self.prefix.as_str(), namespace, stream_id)
     }
 
-    /// Runs a write script, and then `WAIT` when the options name replicas. Both are in one
+    /// Runs a write script, and then `WAIT` when the options set replicas. Both are in one
     /// pipeline on one connection, so the `WAIT` covers the script's writes.
     async fn write(&self, script: &Script, cmd: &Cmd) -> RedisStoreResult<Value> {
         let Some(wait) = &self.wait else {
@@ -100,7 +102,7 @@ impl RedisStore {
         lease.settle(reply)?
     }
 
-    /// Whether a `WAIT` follows each write. The write scripts take it as their last argument.
+    /// Whether each write runs a `WAIT` after it. The write scripts take it as their last argument.
     fn waits(&self) -> bool {
         self.wait.is_some()
     }
@@ -138,7 +140,7 @@ impl RedisStore {
 }
 
 // The trait returns Stream errors, so the runtime and lang get the same reasons on every backend.
-// A `?` turns the crate's error into one, and a Redis error goes through the crate's error first.
+// A Redis error converts through the crate's error, since this crate can't add that `From`.
 #[async_trait::async_trait]
 impl Store for RedisStore {
     // Every rule is in the Lua scripts.
@@ -148,7 +150,7 @@ impl Store for RedisStore {
 
     /// Creates a Stream, or finds it. A retry run's create withdraws its previous run. A
     /// Workflow-owned Stream stores its handle's run chain, which later creates and closes
-    /// must name.
+    /// must match.
     async fn create(
         &self,
         namespace: &str,
@@ -188,7 +190,6 @@ impl Store for RedisStore {
         })
     }
 
-    /// Appends one batch.
     async fn append(
         &self,
         namespace: &str,
@@ -327,8 +328,7 @@ impl Store for RedisStore {
             .collect::<RedisStoreResult<_>>()?)
     }
 
-    /// Waits until the log has an entry after `after`, or `deadline` passes. Returns whether an
-    /// entry came. The wait uses a dedicated connection.
+    /// The wait uses a dedicated connection, so it doesn't block the short calls.
     async fn wait_after(
         &self,
         namespace: &str,
@@ -361,14 +361,14 @@ fn script_cmd(name: &str, script: &Script, keys: &StreamKeys) -> Cmd {
     cmd
 }
 
-/// Refuses a write that fewer replicas than `wait` names have.
+/// Refuses a write that fewer than `wait.replicas` replicas have.
 fn acknowledged(wait: &Wait, acked: Value) -> RedisStoreResult<()> {
     let acked: usize = redis::from_redis_value(acked.extract_error()?)
         .map_err(|error| bad_reply("WAIT", error))?;
     if acked < wait.replicas.get() {
         return Err(RedisStoreError::storage(format!(
             "{acked} of {} replicas had the write after {:?}. A failover can lose it, and a retry \
-             writes it once",
+             with the same sequence writes it once",
             wait.replicas, wait.timeout
         )));
     }
@@ -461,8 +461,7 @@ fn read_reply(reply: Value) -> RedisStoreResult<(StreamState, Vec<Entry>)> {
     else {
         return Err(bad_reply("read", "parts that are not arrays"));
     };
-    // The script gives an empty string for a field that the Stream doesn't have, since a nil
-    // would end the array.
+    // A field that the Stream doesn't have comes back as nil, and `text` gives it as empty.
     let meta: Vec<Option<String>> = meta
         .iter()
         .map(|value| text(value).filter(|text| !text.is_empty()))
@@ -534,17 +533,32 @@ fn entry(value: Value) -> RedisStoreResult<Entry> {
     Ok(entry)
 }
 
-/// Refuses options that can't work, before any connection.
+/// Refuses options that can't work, before any connection, and parses the URLs.
+pub(crate) fn check(options: &RedisStoreOptions) -> RedisStoreResult<Endpoint> {
+    check_options(options)?;
+    Endpoint::parse(&options.urls, options.cluster, options.response_timeout)
+        .map_err(|error| RedisStoreError::invalid(format!("The Redis URLs are wrong: {error}")))
+}
+
 fn check_options(options: &RedisStoreOptions) -> RedisStoreResult<()> {
     if options.urls.is_empty() {
         return Err(RedisStoreError::invalid("The Redis Store needs a URL"));
     }
+    // The scripts take whole milliseconds, so a shorter TTL would be zero there.
     let ttls = [options.retention, options.safety_ttl];
-    if ttls.iter().any(|ttl| ttl.is_zero() || *ttl > MAX_TTL) {
+    if ttls
+        .iter()
+        .any(|ttl| ttl.as_millis() == 0 || *ttl > MAX_TTL)
+    {
         return Err(RedisStoreError::invalid(format!(
-            "The Retention and the safety TTL must be above zero and at most {} s",
+            "The Retention and the safety TTL must be at least 1 ms and at most {} s",
             MAX_TTL.as_secs()
         )));
+    }
+    if options.response_timeout.is_zero() {
+        return Err(RedisStoreError::invalid(
+            "The response timeout must be above zero",
+        ));
     }
     // A `WAIT` with a zero timeout waits for the replicas forever. The script and the round trip
     // need the other half of the response timeout, or too few replicas looks like a lost answer.
@@ -556,6 +570,23 @@ fn check_options(options: &RedisStoreOptions) -> RedisStoreResult<()> {
         ));
     }
     Ok(())
+}
+
+/// Refuses a user that can't run `WAIT`. Its write would run the script, fail the `WAIT`, and
+/// report a write that happened as a lasting failure.
+async fn check_wait(shared: &SharedConnection) -> RedisStoreResult<()> {
+    let wait: RedisResult<Value> = redis::cmd("WAIT")
+        .arg(0)
+        .arg(1)
+        .query_async(&mut shared.clone())
+        .await;
+    match wait {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::Server(ServerErrorKind::NoPerm) => Err(
+            RedisStoreError::invalid("A Store with `wait` needs a Redis user with `+wait`"),
+        ),
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// Refuses a server older than Redis 7.0, and warns about one that may evict Stream keys.
@@ -576,6 +607,9 @@ async fn check_server(shared: &SharedConnection) -> RedisStoreResult<()> {
             tracing::debug!("Could not read the Redis version: {error}");
         }
         Err(error) => return Err(error.into()),
+    }
+    if let SharedConnection::Single(_) = shared {
+        check_not_cluster(shared).await?;
     }
     let mut policy = redis::cmd("CONFIG");
     policy.arg("GET").arg("maxmemory-policy");
@@ -600,6 +634,23 @@ async fn check_server(shared: &SharedConnection) -> RedisStoreResult<()> {
         ),
     }
     Ok(())
+}
+
+/// Refuses a cluster node for a standalone Store. Its keys of other slots would answer with
+/// redirects on each call.
+async fn check_not_cluster(shared: &SharedConnection) -> RedisStoreResult<()> {
+    let reply: RedisResult<String> = redis::cmd("INFO")
+        .arg("cluster")
+        .query_async(&mut shared.clone())
+        .await;
+    match reply {
+        Ok(info) if info.lines().any(|line| line.trim() == "cluster_enabled:1") => Err(
+            RedisStoreError::invalid("The server is a Redis Cluster node, so set `cluster`"),
+        ),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::Server(ServerErrorKind::NoPerm) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn check_version(node: &str, info: &str) -> RedisStoreResult<()> {
@@ -664,6 +715,23 @@ mod tests {
             );
         }
         check(Duration::from_millis(2500)).unwrap();
+    }
+
+    #[test]
+    fn the_ttls_and_the_response_timeout_must_be_at_least_1_ms() {
+        let check = |change: fn(&mut RedisStoreOptions)| {
+            let mut options = RedisStoreOptions::new("redis://127.0.0.1:1");
+            change(&mut options);
+            check_options(&options)
+        };
+        let changes: [fn(&mut RedisStoreOptions); 3] = [
+            |options| options.retention = Duration::from_micros(500),
+            |options| options.safety_ttl = Duration::from_micros(500),
+            |options| options.response_timeout = Duration::ZERO,
+        ];
+        for change in changes {
+            assert!(matches!(check(change), Err(RedisStoreError::Invalid(_))));
+        }
     }
 
     #[test]

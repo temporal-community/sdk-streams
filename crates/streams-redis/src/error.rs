@@ -47,20 +47,26 @@ impl From<RedisStoreError> for StreamError {
     }
 }
 
-/// The Stream error of a Redis error. Scripts name their refusals with a `STREAM_` code. A refusal
+/// The Stream error of a Redis error. Scripts mark their refusals with a `STREAM_` code. A refusal
 /// that a retry can't fix is invalid, and any other failure is a Store failure that may be retried.
 fn from_redis(error: &RedisError) -> StreamError {
     let detail = error.detail().unwrap_or_default().to_string();
-    // A bad URL or bad credentials stay wrong on a retry. redis-rs names some server codes as
+    // A bad URL or bad credentials stay wrong on a retry. redis-rs gives some server codes as
     // kinds, and the rest stay strings below.
     match error.kind() {
         ErrorKind::InvalidClientConfig | ErrorKind::AuthenticationFailed => {
             return StreamError::invalid(format!("The Redis config is wrong: {error}"));
         }
-        ErrorKind::Server(ServerErrorKind::NoPerm | ServerErrorKind::NoScript) => {
-            let code = error.code().unwrap_or_default();
+        ErrorKind::Server(ServerErrorKind::NoPerm) => {
             return StreamError::invalid(format!(
-                "Redis refused the call for good: {code} {detail}"
+                "Redis refused the call for good: NOPERM {detail}"
+            ));
+        }
+        // The cluster client handles redirects, so one that reaches here is from a cluster node
+        // that the options give as one server.
+        ErrorKind::Server(ServerErrorKind::Moved) => {
+            return StreamError::invalid(format!(
+                "A Redis Cluster node answered, so set `cluster`: MOVED {detail}"
             ));
         }
         _ => {}
@@ -83,6 +89,14 @@ fn from_redis(error: &RedisError) -> StreamError {
         }
         Some("ERR") if detail.contains("user_script") => {
             return StreamError::invalid(format!("A Stream script failed: {detail}"));
+        }
+        Some("ERR") if detail.contains("unknown command") => {
+            return StreamError::invalid(format!("Redis is too old for the Store: {detail}"));
+        }
+        Some("ERR") if detail.contains("cluster support disabled") => {
+            return StreamError::invalid(format!(
+                "The server isn't a Redis Cluster, so don't set `cluster`: {detail}"
+            ));
         }
         // The code as the server wrote it, so the message has the code the Redis docs use.
         Some(code) => {
@@ -125,7 +139,8 @@ mod tests {
                 (reason, "why it refused")
             );
         }
-        for code in ["READONLY", "OOM", "LOADING", "BUSY", "TRYAGAIN"] {
+        // A script that a flush or a failover dropped again after its reload is a passing state.
+        for code in ["READONLY", "OOM", "LOADING", "BUSY", "TRYAGAIN", "NOSCRIPT"] {
             let error = server(code, "x");
             assert_eq!(error.reason, Reason::Storage, "{code}");
             assert!(error.message.contains(code), "{error}");
@@ -143,6 +158,12 @@ mod tests {
                 "ERR",
                 "value is not an integer script: 86f9, on @user_script:59.",
             ),
+            (
+                "ERR",
+                "unknown command 'EVALSHA_RO', with args beginning with:",
+            ),
+            ("ERR", "This instance has cluster support disabled"),
+            ("MOVED", "3999 127.0.0.1:7292"),
         ] {
             let error = server(code, detail);
             assert_eq!(error.reason, Reason::Invalid, "{code}");

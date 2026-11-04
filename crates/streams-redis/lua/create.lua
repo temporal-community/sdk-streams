@@ -4,7 +4,7 @@
 -- ARGV: format version, Retention ms, owner (`wf` or `client`), safety TTL ms, Tombstone ms,
 -- encoded withdrawn run, Superseded facts, the owner's run chain as
 -- `<workflow id>:<first run id>` with each part encoded (empty for a client), `1` when a `WAIT`
--- follows.
+-- runs after it.
 --
 -- Returns {outcome, stored Retention ms, '1' when flagged}. The outcome is `created` or `exists`.
 -- A Stream that exists keeps its own Retention.

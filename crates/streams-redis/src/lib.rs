@@ -1,17 +1,14 @@
 #![warn(missing_docs)]
-// A panic in a lang bridge's worker takes the process down, so the library says why it can't fail.
+// A panic in a lang bridge's worker ends the process, so the library returns errors instead.
 #![warn(
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::cast_possible_truncation
 )]
 
-//! The Redis Store of the Temporal Stream runtime. It is experimental.
-//!
-//! The crate serves the Stream service of `temporalio-streams` on the customer's Redis. One Lua
-//! script runs each create, append and close, so the checks are atomic with the write. Lang's
-//! bridge builds the runtime with [RedisStreamRuntime] and calls it as `temporalio-streams`
-//! describes.
+//! The experimental Redis Store of the Temporal Stream runtime. Lang's bridge builds it with
+//! [RedisStreamRuntime]. One Lua script runs each create, append and close, so its checks are
+//! atomic with its write.
 
 mod error;
 mod options;

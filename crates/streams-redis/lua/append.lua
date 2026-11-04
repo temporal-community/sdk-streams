@@ -3,7 +3,7 @@
 -- ARGV: format version, kind, Producer id, encoded run id, epoch key, sequence (0 takes the next
 -- one), encoded withdrawn run, Superseded facts, safety TTL ms, Tombstone ms, task key, completed
 -- task key (`-` when the write gives no task facts), failed task ids, task Superseded facts, the
--- batch digest, `1` when a `WAIT` follows, then one Record per argument.
+-- batch digest, `1` when a `WAIT` runs after it, then one Record per argument.
 --
 -- Returns {'ok' or 'resend', first id, last id, '1' when flagged}.
 local meta, log, producers = KEYS[1], KEYS[2], KEYS[3]

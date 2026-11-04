@@ -14,8 +14,8 @@ use temporalio_streams_redis::{
 
 const PREFIX: &str = "streams-wait";
 
-/// Held by each case for its whole run. The cases flush the scripts, pause the replicas and time
-/// their `WAIT`s, so one case would slow down the next.
+/// Held by each case for its whole run. The cases flush the scripts, pause the replicas and block
+/// in `WAIT`, so one case would disturb the next.
 static SERVER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// A `WAIT` that must fail gets a short timeout, and one that must pass gets a long one.
@@ -56,6 +56,33 @@ async fn replicas(url: &str) -> Vec<String> {
             Some(format!("redis://{}:{}/0", field("ip")?, field("port")?))
         })
         .collect()
+}
+
+/// The URL of each replica of the cluster.
+async fn cluster_replicas(url: &str) -> Vec<String> {
+    let client = redis::cluster::ClusterClient::new(vec![url]).unwrap();
+    let mut conn = client.get_async_connection().await.unwrap();
+    let ranges: Vec<Vec<redis::Value>> = redis::cmd("CLUSTER")
+        .arg("SLOTS")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    // Each range is its start, its end, its primary, and then its replicas.
+    let mut urls: Vec<String> = ranges
+        .iter()
+        .flat_map(|range| range.iter().skip(3))
+        .filter_map(|node| {
+            let redis::Value::Array(node) = node else {
+                return None;
+            };
+            let host: String = redis::from_redis_value(node.first()?.clone()).ok()?;
+            let port: u16 = redis::from_redis_value(node.get(1)?.clone()).ok()?;
+            Some(format!("redis://{host}:{port}/0"))
+        })
+        .collect();
+    urls.sort();
+    urls.dedup();
+    urls
 }
 
 /// Stops each replica from applying the primary's writes, until [resume] or 5 s.
@@ -161,6 +188,46 @@ async fn too_few_replicas(url: &str, cluster: bool) {
     }
 }
 
+/// A `WAIT` on a node with no write of its own returns at once, so only a `WAIT` on the write's
+/// primary fails while the replicas pause.
+#[tokio::test]
+#[ignore = "needs a Redis cluster"]
+async fn a_cluster_write_waits_for_the_replica_of_its_own_primary() {
+    let _lock = SERVER.lock().await;
+    let url = cluster_url();
+    let replicas = cluster_replicas(&url).await;
+    assert!(
+        !replicas.is_empty(),
+        "the cluster at STREAMS_REDIS_CLUSTER_URL needs replicas"
+    );
+    let namespace = unique("ns");
+    let create = |store: RedisStore, id: &'static str| {
+        let namespace = namespace.clone();
+        async move {
+            let handle = StreamHandle {
+                id: id.to_string(),
+                ..Default::default()
+            };
+            store
+                .create(
+                    &namespace,
+                    &handle,
+                    None,
+                    Owner::Client,
+                    &Withdrawal::default(),
+                )
+                .await
+        }
+    };
+    let paused = store(&url, true, 1, SHORT).await;
+    pause(&replicas).await;
+    let refused = create(paused, "paused").await;
+    resume(&replicas).await;
+    assert_eq!(refused.unwrap_err().reason, Reason::Storage);
+    let acked = create(store(&url, true, 1, LONG).await, "acked").await;
+    assert_eq!(acked.unwrap().outcome, CreateOutcome::Created);
+}
+
 /// A create, resend or close that finds its write done waits for the replicas to have that write.
 #[tokio::test]
 #[ignore = "needs Redis"]
@@ -180,7 +247,7 @@ async fn a_call_that_finds_its_write_waits_for_the_replicas() {
         },
     );
     let plain = store(&url, false, 0, SHORT).await;
-    // A Store per call, since a call's own write moves its connection's offset past the replica's.
+    // A Store per call, since a call's own write puts its connection's offset past the replica's.
     let mut waits = vec![];
     for _ in 0..3 {
         waits.push(store(&url, false, replicas.len(), SHORT).await);

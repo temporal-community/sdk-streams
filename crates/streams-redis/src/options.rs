@@ -64,7 +64,7 @@ impl Default for RedisStoreOptions {
 // The URLs can hold a password, so the debug form shows them with no user info.
 impl std::fmt::Debug for RedisStoreOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let urls: Vec<String> = self.urls.iter().map(|url| without_user_info(url)).collect();
+        let urls: Vec<String> = self.urls.iter().map(|url| redacted(url)).collect();
         f.debug_struct("RedisStoreOptions")
             .field("urls", &urls)
             .field("cluster", &self.cluster)
@@ -78,15 +78,20 @@ impl std::fmt::Debug for RedisStoreOptions {
     }
 }
 
-/// The URL with `***` in place of its user and password, if it has them.
-fn without_user_info(url: &str) -> String {
+/// The URL with `***` in place of its user info and its query. A socket URL gives its password in
+/// the query.
+fn redacted(url: &str) -> String {
+    let (url, query) = match url.split_once('?') {
+        Some((url, _)) => (url, "?***"),
+        None => (url, ""),
+    };
     let start = url.find("://").map_or(0, |scheme| scheme + 3);
     let authority = url[start..]
         .find('/')
         .map_or(url.len(), |path| start + path);
     match url[start..authority].rfind('@') {
-        Some(at) => format!("{}***{}", &url[..start], &url[start + at..]),
-        None => url.to_string(),
+        Some(at) => format!("{}***{}{query}", &url[..start], &url[start + at..]),
+        None => format!("{url}{query}"),
     }
 }
 
@@ -111,7 +116,7 @@ impl WaitOptions {
 pub struct KeyPrefix(String);
 
 impl KeyPrefix {
-    /// The prefix as the keys and the ACL key patterns write it.
+    /// The prefix as it appears in the keys and in the ACL key patterns.
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -131,7 +136,7 @@ impl TryFrom<String> for KeyPrefix {
             return Err(RedisStoreError::invalid("The key prefix must not be empty"));
         }
         // The keys hold the prefix percent-encoded, but the ACL key patterns of `docs/redis.md`
-        // name it as written, so a prefix that encoding changes could widen or miss a pattern.
+        // show it as written, so a prefix that encoding changes could widen or miss a pattern.
         if encode_part(&prefix) != prefix {
             return Err(RedisStoreError::invalid(
                 "The key prefix must have only letters, digits, '-', '.', '_' and '~'",
@@ -192,6 +197,10 @@ mod tests {
             debug.contains("rediss://***@redis.example:6380/0"),
             "{debug}"
         );
-        assert_eq!(without_user_info("redis://h:1/0"), "redis://h:1/0");
+        assert_eq!(redacted("redis://h:1/0"), "redis://h:1/0");
+        assert_eq!(
+            redacted("redis+unix:///tmp/redis.sock?db=0&pass=secret"),
+            "redis+unix:///tmp/redis.sock?***"
+        );
     }
 }
