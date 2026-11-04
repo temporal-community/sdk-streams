@@ -140,16 +140,6 @@ local function prune(meta, producers, now)
   end
 end
 
-local function words(text)
-  local list = {}
-  if text then
-    for word in string.gmatch(text, '%S+') do
-      table.insert(list, word)
-    end
-  end
-  return list
-end
-
 local function contains(list, value)
   for _, item in ipairs(list) do
     if item == value then
@@ -303,11 +293,20 @@ local function never_completed(key, t, c, failed_set)
     or (c ~= nil and s == cs and bytes_below(key, c))
 end
 
+-- The started event ids of the failed tasks argument, 8 bytes each, big-endian.
+local function failed_ids(failed)
+  local ids = {}
+  for at = 1, #failed, 8 do
+    table.insert(ids, (struct.unpack('>i8', failed, at)))
+  end
+  return ids
+end
+
 -- A task at or before c that the rule doesn't withdraw completed, so `oa` drops it.
 local function orphan_tasks(open, t, c, failed)
   local failed_set = {}
-  for _, id in ipairs(words(failed)) do
-    failed_set[tonumber(id)] = true
+  for _, id in ipairs(failed) do
+    failed_set[id] = true
   end
   local withdrawn, kept = {}, {}
   for _, key in ipairs(open) do
