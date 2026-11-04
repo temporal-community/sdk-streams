@@ -173,29 +173,56 @@ local function task_key(text)
   return string.match(text, TASK_KEY) ~= nil
 end
 
+-- Whether the facts of task t show that task key never completed. `docs/redis.md` has the rule.
+local function never_completed(key, t, c, failed_set)
+  local s, ts = started(key), started(t)
+  local cs = 0
+  if c ~= '' then
+    cs = started(c)
+  end
+  return failed_set[s] == true or (cs < s and s < ts) or (s == ts and key < t)
+    or (c ~= '' and s == cs and key < c)
+end
+
 -- A task at or before c that the rule doesn't withdraw completed, so `oa` drops it.
--- `docs/redis.md` has the rule.
 local function orphan_tasks(open, t, c, failed)
   local failed_set = {}
   for _, id in ipairs(words(failed)) do
     failed_set[tonumber(id)] = true
   end
-  local ts = started(t)
-  local cs = 0
-  if c ~= '' then
-    cs = started(c)
-  end
   local withdrawn, kept = {}, {}
   for _, key in ipairs(open) do
-    local s = started(key)
-    if failed_set[s] or (cs < s and s < ts) or (s == ts and key < t)
-        or (c ~= '' and s == cs and key < c) then
+    if never_completed(key, t, c, failed_set) then
       table.insert(withdrawn, key)
     elseif c == '' or key > c then
       table.insert(kept, key)
     end
   end
   return withdrawn, kept
+end
+
+-- The task key of the Workflow Task with this started event id, with no attempt and no time.
+local function started_key(id)
+  return string.format('%016x', math.max(0, id)) .. '.00000000.0000000000000000.00000000'
+end
+
+local ZERO_KEY = started_key(0)
+
+-- Whether the task facts in `tf|<run>` show that task key never completed. The zero key in the
+-- completed place works as no completed task, since no task key is below it.
+local function fenced_by_facts(facts, key)
+  local width, keys = #ZERO_KEY, {}
+  for at = 1, #facts - width + 1, width do
+    table.insert(keys, string.sub(facts, at, at + width - 1))
+  end
+  if #keys < 2 then
+    return false
+  end
+  local failed_set = {}
+  for i = 3, #keys do
+    failed_set[started(keys[i])] = true
+  end
+  return never_completed(key, keys[1], keys[2], failed_set)
 end
 
 -- A run that never wrote here needs the fence but no Superseded item.

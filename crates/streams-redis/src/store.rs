@@ -780,11 +780,12 @@ mod tests {
         let store = RedisStore::connect(options).await.unwrap();
         let namespace = format!("ns-{}", std::process::id());
         let task = task_key(&Default::default());
-        // A task key that isn't an epoch key, a failed list that isn't event ids, and a completed
-        // task key that isn't an epoch key.
+        // A task key that isn't an epoch key, a failed list that isn't event ids, a failed id past
+        // 2^53 - 1, and a completed task key that isn't an epoch key.
         let cases = [
             ("zz", "", "1"),
             (task.as_str(), "", "x"),
+            (task.as_str(), "", "9007199254740992"),
             (task.as_str(), "zz", "1"),
         ];
         for (i, (task, completed, failed)) in cases.into_iter().enumerate() {

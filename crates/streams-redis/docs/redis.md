@@ -33,6 +33,7 @@ form, and the `testdata/` of `temporalio-streams` has its test vectors.
 | `h\|<kind>\|<producer id>` | The newest epoch key that still has Records here |
 | `oa\|<run>` | The run's Local Activity task keys here that may not have completed |
 | `ow\|<run>\|<task key>` | Set when an orphan item withdrew the task's Local Activity Records |
+| `tf\|<run>` | The task facts of the run's highest task, as task keys back to back |
 | `run\|<run>` | Set when a Producer of the run wrote a Record here |
 | `wr\|<run>` | Set when a Workflow retry withdrew the run |
 
@@ -77,6 +78,10 @@ and failed tasks. Then the append withdraws the run's tasks in `oa` that never c
 - Each Local Activity batch with Records adds its task to `oa`, also a batch with no task facts.
 - Each `ow|<run>|<task key>` fences a late write of that task.
 - A batch with no task facts skips the rule.
+- `tf|<run>` keeps the facts of the run's highest task. These are its own key, the completed
+  task's key or the zero key before the first, and the key of each failed task's started event id.
+- A write of a task that `tf|` shows never completed fails with `stream_fenced`, since a task can
+  fail before its call writes.
 
 ## Retry runs
 
@@ -152,15 +157,13 @@ these lists on a standalone server and on a cluster.
   completed one keeps its Local Activity Records.
 - A Local Activity that runs longer than its Workflow Task keeps its Records when the task where it
   resolves fails. Only a later run of the same call withdraws them.
-- `ow` fences only the tasks that an orphan item withdrew. So when a failed task's Local Activity
-  writes its first Record after another write gave the task as failed, that Record stays.
 - A retry run withdraws only its previous run. If that run never wrote, older runs keep their
   Records, since the Store can't tell a retry attempt from a continue-as-new run.
 - A run that closes its Stream and then fails under a retry policy leaves it closed, so each retry
   run's create fails with `stream_closed`. The close's Readers have ended, so it can't be withdrawn.
 - A reset run doesn't withdraw the base run's Records after the reset point, and it doesn't fence
   the base run's Producers.
-- The meta keeps the `run|`, `oa|`, `ow|` and `wr|` fields of each run until the Stream expires, so
+- The meta keeps the `run|`, `oa|`, `ow|`, `tf|` and `wr|` fields of each run until the Stream expires, so
   a long run chain adds fields for as long as it writes.
 - Redis can't tie a run to its run chain. A run of another chain that holds the owner's handle,
   such as a child Workflow with its parent's Stream, can still close it. The native server checks

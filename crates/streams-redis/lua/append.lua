@@ -19,7 +19,7 @@ local records = #ARGV - 17
 local tracked = kind == '2' and run ~= ''
 -- Only a Local Activity write with its run's task facts tells which tasks of the run completed.
 local facts = tracked and completed ~= '-'
-local open_field, gone_prefix = 'oa|' .. run, 'ow|' .. run .. '|'
+local open_field, gone_prefix, facts_field = 'oa|' .. run, 'ow|' .. run .. '|', 'tf|' .. run
 
 -- The script reads the dedupe entry and writes the batch in one step, so no other batch takes the
 -- same number.
@@ -43,8 +43,9 @@ if facts then
   if completed ~= '' and not task_key(completed) then
     return refuse('INVALID', 'the completed task must be a task key')
   end
+  -- A Lua number past 2^53 - 1 loses digits, so `started_key` can't format such an id.
   for _, id in ipairs(words(failed)) do
-    if not string.match(id, '^%-?%d+$') then
+    if not string.match(id, '^%-?%d+$') or math.abs(tonumber(id)) > 9007199254740991 then
       return refuse('INVALID', 'the failed tasks must be started event ids')
     end
   end
@@ -88,6 +89,14 @@ if newest and epoch < newest then
 end
 if tracked and redis.call('HGET', meta, gone_prefix .. task) then
   return refuse('FENCED', 'a Superseded item withdrew the Workflow Task of the call')
+end
+-- A task can fail before its call writes, so no orphan item withdrew it.
+if tracked then
+  local stored = redis.call('HGET', meta, facts_field)
+  if stored and fenced_by_facts(stored, task) then
+    return refuse('FENCED',
+      "the run's task facts show that the Workflow Task of the call never completed")
+  end
 end
 
 refused = check_ids_fit(meta, log, now, records + 2)
@@ -180,6 +189,20 @@ if tracked then
   -- One field per task, so the fence reads one field and a withdrawal writes only its new tasks.
   for _, key in ipairs(withdrawn) do
     redis.call('HSET', meta, gone_prefix .. key, '1')
+  end
+end
+if facts then
+  -- A long Local Activity of an earlier task writes with older facts.
+  local stored = redis.call('HGET', meta, facts_field)
+  if not stored or string.sub(stored, 1, #task) < task then
+    local value = {task, completed}
+    if completed == '' then
+      value[2] = ZERO_KEY
+    end
+    for _, id in ipairs(words(failed)) do
+      table.insert(value, started_key(tonumber(id)))
+    end
+    redis.call('HSET', meta, facts_field, table.concat(value))
   end
 end
 if last_id ~= '' then
