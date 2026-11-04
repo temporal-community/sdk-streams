@@ -10,6 +10,7 @@ use redis::{
     cluster::ClusterClient,
     cluster_async::ClusterConnection,
     cluster_routing::{MultipleNodeRoutingInfo, RoutingInfo},
+    streams::{StreamReadOptions, StreamReadReply},
 };
 use std::{
     collections::HashMap, fmt, future::Future, num::NonZeroUsize, ops::RangeInclusive,
@@ -630,26 +631,10 @@ impl BlockedRead<'_> {
     /// block time comes from the deadline once the read has its connection.
     fn xread(&self) -> Cmd {
         let wait = self.deadline.saturating_duration_since(Instant::now());
-        let mut xread = redis::cmd("XREAD");
-        xread
-            .arg("COUNT")
-            .arg(1)
-            .arg("BLOCK")
-            // `BLOCK 0` waits with no end, so a read at its deadline blocks for 1 ms.
-            .arg(wait.as_millis().max(1))
-            .arg("STREAMS")
-            .arg(self.key)
-            .arg(self.after);
-        xread
-    }
-}
-
-/// Whether an `XREAD` reply has an entry. A read that ends with no entry gives nil.
-fn woke(reply: &Value) -> bool {
-    match reply {
-        Value::Array(keys) => !keys.is_empty(),
-        Value::Map(keys) => !keys.is_empty(),
-        _ => false,
+        // `BLOCK 0` waits with no end, so a read at its deadline blocks for 1 ms.
+        let block = usize::try_from(wait.as_millis().max(1)).unwrap_or(usize::MAX);
+        let options = StreamReadOptions::default().count(1).block(block);
+        Cmd::xread_options(&[self.key], &[self.after], &options)
     }
 }
 
@@ -798,10 +783,11 @@ impl BlockingPool {
         conn: &mut MultiplexedConnection,
         read: &BlockedRead<'_>,
     ) -> RedisResult<RedisResult<bool>> {
-        // A server that stopped without a reset never replies, and the read must still end.
+        // A server that stopped without a reset never replies, and the read must still end. A read
+        // that ends with no entry gives nil.
         let reply = tokio::time::timeout_at(
             read.deadline + self.endpoint.response_timeout,
-            read.xread().query_async::<Value>(conn),
+            read.xread().query_async::<Option<StreamReadReply>>(conn),
         )
         .await
         .map_err(|_| {
@@ -810,7 +796,7 @@ impl BlockingPool {
                 "Redis did not answer a blocked read by its deadline",
             ))
         })?;
-        Ok(reply.map(|reply| woke(&reply)))
+        Ok(reply.map(|reply| reply.is_some_and(|reply| !reply.keys.is_empty())))
     }
 
     /// The primary that serves `slot` now, as the shared connection of a cluster sees it.
@@ -1100,7 +1086,8 @@ mod tests {
             .iter()
             .find(|command| command.first().is_some_and(|name| name == "XREAD"))
             .unwrap();
-        assert_eq!(xread[1..5], ["COUNT", "1", "BLOCK", "200"]);
+        let block = xread.iter().position(|arg| arg == "BLOCK").unwrap();
+        assert_eq!(xread[block + 1], "200");
     }
 
     #[tokio::test]
