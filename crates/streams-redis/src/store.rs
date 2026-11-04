@@ -765,8 +765,14 @@ mod tests {
         let store = RedisStore::connect(options).await.unwrap();
         let namespace = format!("ns-{}", std::process::id());
         let task = task_key(&Default::default());
-        // A task key that isn't an epoch key, and a failed list that isn't event ids.
-        for (i, (task, failed)) in [("zz", "1"), (task.as_str(), "x")].into_iter().enumerate() {
+        // A task key that isn't an epoch key, a failed list that isn't event ids, and a completed
+        // task key that isn't an epoch key.
+        let cases = [
+            ("zz", "", "1"),
+            (task.as_str(), "", "x"),
+            (task.as_str(), "zz", "1"),
+        ];
+        for (i, (task, completed, failed)) in cases.into_iter().enumerate() {
             let handle = StreamHandle {
                 id: format!("s{i}"),
                 ..Default::default()
@@ -798,7 +804,7 @@ mod tests {
                 .arg(DEFAULT_SAFETY_TTL.as_millis())
                 .arg(TOMBSTONE.as_millis())
                 .arg(task)
-                .arg("")
+                .arg(completed)
                 .arg(failed)
                 .arg(b"")
                 .arg("d")
