@@ -22,7 +22,7 @@ mod store;
 pub mod testing;
 
 pub use error::{RedisStoreError, RedisStoreResult};
-pub use options::{KeyPrefix, RedisStoreOptions, WaitOptions};
+pub use options::{KeyPrefix, RedisStoreOptions, Topology, WaitOptions};
 pub use runtime::{REDIS_RUNTIME_NAME, RedisStreamRuntime, RuntimeOptions};
 pub use store::RedisStore;
 

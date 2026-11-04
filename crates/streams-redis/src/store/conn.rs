@@ -2,7 +2,7 @@
 //! connection, so each one gets a dedicated connection, and the short calls share one.
 
 use crate::{
-    RedisStoreOptions,
+    RedisStoreOptions, Topology,
     slots::{SlotNode, SlotRange},
 };
 use parking_lot::Mutex;
@@ -40,15 +40,8 @@ const WAIT_CONNECTIONS: NonZeroUsize = match NonZeroUsize::new(8) {
 
 /// Where the Store's Redis is, parsed once from the URLs of the options.
 pub(crate) struct Endpoint {
-    topology: Topology,
+    topology: Topology<Seed>,
     response_timeout: Duration,
-}
-
-/// One server, or the seeds of a cluster. Each kind has a first URL, since every node gets its
-/// credentials and TLS.
-enum Topology {
-    Standalone(Seed),
-    Cluster { first: Seed, rest: Vec<Seed> },
 }
 
 /// A URL of the options, and the node at that URL.
@@ -72,27 +65,8 @@ impl TryFrom<&RedisStoreOptions> for Endpoint {
     type Error = RedisError;
 
     fn try_from(options: &RedisStoreOptions) -> RedisResult<Self> {
-        let mut seeds = options.urls.iter().map(|url| url.parse::<Seed>());
-        let Some(first) = seeds.next().transpose()? else {
-            return Err(RedisError::from((
-                ErrorKind::InvalidClientConfig,
-                "no Redis URL",
-            )));
-        };
-        let rest = seeds.collect::<RedisResult<Vec<_>>>()?;
-        let topology = match (options.cluster, rest.is_empty()) {
-            (true, _) => Topology::Cluster { first, rest },
-            (false, true) => Topology::Standalone(first),
-            // A standalone Store connects to one server, so the other URLs would have no effect.
-            (false, false) => {
-                return Err(RedisError::from((
-                    ErrorKind::InvalidClientConfig,
-                    "a standalone Redis takes one URL, and a cluster's seeds need `cluster`",
-                )));
-            }
-        };
         Ok(Self {
-            topology,
+            topology: options.topology.try_map(|url| url.parse::<Seed>())?,
             response_timeout: options.response_timeout,
         })
     }
@@ -116,11 +90,7 @@ impl Endpoint {
 
     /// The server, or each seed of the cluster, with the first one first.
     fn seeds(&self) -> impl Iterator<Item = &Seed> {
-        let rest = match &self.topology {
-            Topology::Standalone(_) => &[][..],
-            Topology::Cluster { rest, .. } => rest.as_slice(),
-        };
-        std::iter::once(self.first()).chain(rest)
+        self.topology.servers()
     }
 
     /// Opens a connection for short calls, which the client reconnects when it drops.
@@ -854,17 +824,23 @@ mod tests {
         RedisError::from(std::io::Error::new(kind, "test"))
     }
 
-    fn options(urls: &[&str], cluster: bool) -> RedisStoreOptions {
-        RedisStoreOptions {
-            urls: urls.iter().map(|url| url.to_string()).collect(),
-            cluster,
-            response_timeout: Duration::from_secs(1),
-            ..RedisStoreOptions::default()
+    fn standalone_at(url: &str) -> Topology {
+        Topology::Standalone(url.to_string())
+    }
+
+    fn cluster_at(url: &str) -> Topology {
+        Topology::Cluster {
+            first: url.to_string(),
+            rest: Vec::new(),
         }
     }
 
-    fn endpoint(urls: &[&str], cluster: bool) -> Arc<Endpoint> {
-        Arc::new(Endpoint::try_from(&options(urls, cluster)).unwrap())
+    fn endpoint(topology: Topology) -> Arc<Endpoint> {
+        let options = RedisStoreOptions {
+            response_timeout: Duration::from_secs(1),
+            ..RedisStoreOptions::from(topology)
+        };
+        Arc::new(Endpoint::try_from(&options).unwrap())
     }
 
     #[test]
@@ -938,13 +914,14 @@ mod tests {
     }
 
     #[test]
-    fn an_endpoint_needs_a_url_and_a_standalone_one_takes_only_one() {
-        let parse = |urls: &[&str], cluster| Endpoint::try_from(&options(urls, cluster));
-        assert!(parse(&[], false).is_err());
-        assert!(parse(&[], true).is_err());
-        let two = ["redis://127.0.0.1:1", "redis://127.0.0.1:2"];
-        assert!(parse(&two, false).is_err());
-        assert_eq!(parse(&two, true).unwrap().seeds().count(), 2);
+    fn an_endpoint_keeps_each_seed_and_refuses_a_bad_url() {
+        let two = Topology::Cluster {
+            first: "redis://127.0.0.1:1".to_string(),
+            rest: vec!["redis://127.0.0.1:2".to_string()],
+        };
+        assert_eq!(endpoint(two).seeds().count(), 2);
+        let bad = RedisStoreOptions::new("http://127.0.0.1:1");
+        assert!(Endpoint::try_from(&bad).is_err());
     }
 
     #[tokio::test]
@@ -953,7 +930,7 @@ mod tests {
         let url = crate::testing::standalone_url();
         // A standalone server answers every slot, so the seed serves the read once the dead
         // node is dropped.
-        let pool = BlockingPool::new(endpoint(&[&url], true), NonZeroUsize::MIN, None);
+        let pool = BlockingPool::new(endpoint(cluster_at(&url)), NonZeroUsize::MIN, None);
         let key = "test:{dead-node}:log";
         let mut conn = Client::open(url.as_str())
             .unwrap()
@@ -998,11 +975,11 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs a Redis cluster"]
     async fn a_cluster_read_and_a_wait_connection_work_when_every_seed_is_down() {
-        let live = endpoint(&[&crate::testing::cluster_url()], true);
+        let live = endpoint(cluster_at(&crate::testing::cluster_url()));
         let SharedConnection::Cluster(cluster) = live.open().await.unwrap() else {
             panic!("a cluster endpoint opens a cluster connection");
         };
-        let dead = endpoint(&[&format!("redis://127.0.0.1:{}", dead_port())], true);
+        let dead = endpoint(cluster_at(&format!("redis://127.0.0.1:{}", dead_port())));
         let key = "test:{dead-seeds}:log";
         let _: String = redis::cmd("XADD")
             .arg(key)
@@ -1059,7 +1036,7 @@ mod tests {
     #[tokio::test]
     async fn the_block_time_starts_when_the_read_has_a_connection() {
         let (url, commands) = nil_server();
-        let pool = BlockingPool::new(endpoint(&[&url], false), NonZeroUsize::MIN, None);
+        let pool = BlockingPool::new(endpoint(standalone_at(&url)), NonZeroUsize::MIN, None);
         let seed = pool.endpoint.first().node.clone();
         let held = new(pool
             .node(&seed)
@@ -1087,7 +1064,7 @@ mod tests {
     #[tokio::test]
     async fn a_read_with_no_free_connection_ends_after_the_permit_wait() {
         let (url, _) = nil_server();
-        let pool = BlockingPool::new(endpoint(&[&url], false), NonZeroUsize::MIN, None);
+        let pool = BlockingPool::new(endpoint(standalone_at(&url)), NonZeroUsize::MIN, None);
         let seed = pool.endpoint.first().node.clone();
         let deadline = || Instant::now() + Duration::from_secs(10);
         let _held = new(pool.node(&seed).lease(deadline()).await.unwrap());

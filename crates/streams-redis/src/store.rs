@@ -403,9 +403,6 @@ pub(crate) fn check(options: &RedisStoreOptions) -> RedisStoreResult<Endpoint> {
 }
 
 fn check_options(options: &RedisStoreOptions) -> RedisStoreResult<()> {
-    if options.urls.is_empty() {
-        return Err(RedisStoreError::invalid("The Redis Store needs a URL"));
-    }
     // The scripts take whole milliseconds, so a shorter TTL would be zero there.
     let ttls = [options.retention, options.safety_ttl];
     if ttls
