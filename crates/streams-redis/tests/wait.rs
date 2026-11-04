@@ -1,15 +1,16 @@
 //! A Store with `wait_replicas` refuses a write that too few replicas have, even one that it finds
 //! done, and its writes wait for their replicas in parallel.
 
+use prost::Message;
 use std::{num::NonZeroUsize, time::Duration};
 use temporalio_streams::{
     Reason,
-    proto::{Producer, ProducerEpoch, StreamHandle, StreamProducerKind},
+    proto::{Producer, ProducerEpoch, StreamHandle, StreamProducerKind, StreamRecord},
     store::{Batch, CreateOutcome, Owner, Store, Withdrawal},
 };
 use temporalio_streams_redis::{
-    RedisStore, RedisStoreOptions, WaitOptions,
-    testing::{cluster_url, standalone_url},
+    RedisStore, RedisStoreOptions, Topology, WaitOptions,
+    testing::{SlotRange, cluster_url, standalone_url},
 };
 
 const PREFIX: &str = "streams-wait";
@@ -20,15 +21,29 @@ static SERVER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// A `WAIT` that must fail gets a short timeout, and one that must pass gets a long one.
 const SHORT: Duration = Duration::from_millis(50);
-const LONG: Duration = Duration::from_secs(1);
+const LONG: Duration = Duration::from_secs(5);
 
-async fn store(url: &str, cluster: bool, wait_replicas: usize, timeout: Duration) -> RedisStore {
-    let mut options = RedisStoreOptions::new(url);
-    options.cluster = cluster;
+async fn store(topology: &Topology, wait: Option<WaitOptions>) -> RedisStore {
+    let mut options = RedisStoreOptions::from(topology.clone());
     options.key_prefix = PREFIX.parse().unwrap();
-    options.wait =
-        NonZeroUsize::new(wait_replicas).map(|replicas| WaitOptions { replicas, timeout });
+    options.response_timeout = 2 * LONG;
+    options.wait = wait;
     RedisStore::connect(options).await.unwrap()
+}
+
+/// A `WAIT` for `replicas` replicas, which must be at least one.
+fn wait_for(replicas: usize, timeout: Duration) -> Option<WaitOptions> {
+    Some(WaitOptions {
+        replicas: NonZeroUsize::new(replicas).unwrap(),
+        timeout,
+    })
+}
+
+fn cluster_at(url: &str) -> Topology {
+    Topology::Cluster {
+        first: url.to_string(),
+        rest: Vec::new(),
+    }
 }
 
 async fn admin(url: &str) -> redis::aio::MultiplexedConnection {
@@ -62,49 +77,54 @@ async fn replicas(url: &str) -> Vec<String> {
 async fn cluster_replicas(url: &str) -> Vec<String> {
     let client = redis::cluster::ClusterClient::new(vec![url]).unwrap();
     let mut conn = client.get_async_connection().await.unwrap();
-    let ranges: Vec<Vec<redis::Value>> = redis::cmd("CLUSTER")
+    let ranges: Vec<SlotRange> = redis::cmd("CLUSTER")
         .arg("SLOTS")
         .query_async(&mut conn)
         .await
         .unwrap();
-    // Each range is its start, its end, its primary, and then its replicas.
     let mut urls: Vec<String> = ranges
         .iter()
-        .flat_map(|range| range.iter().skip(3))
-        .filter_map(|node| {
-            let redis::Value::Array(node) = node else {
-                return None;
-            };
-            let host: String = redis::from_redis_value(node.first()?.clone()).ok()?;
-            let port: u16 = redis::from_redis_value(node.get(1)?.clone()).ok()?;
-            Some(format!("redis://{host}:{port}/0"))
-        })
+        .flat_map(|range| &range.replicas)
+        .map(|node| format!("redis://{}:{}/0", node.host, node.port))
         .collect();
     urls.sort();
     urls.dedup();
     urls
 }
 
-/// Stops each replica from applying the primary's writes, until [resume] or 5 s.
-async fn pause(replicas: &[String]) {
+/// Stops each replica from applying the primary's writes until the guard drops. The pause has a
+/// long bound, so it can't end before the case does.
+async fn pause(replicas: &[String]) -> Paused {
     for replica in replicas {
         let _: () = redis::cmd("CLIENT")
             .arg("PAUSE")
-            .arg(5000)
+            .arg(600_000)
             .arg("WRITE")
             .query_async(&mut admin(replica).await)
             .await
             .unwrap();
     }
+    Paused(replicas.to_vec())
 }
 
-async fn resume(replicas: &[String]) {
-    for replica in replicas {
-        let _: () = redis::cmd("CLIENT")
-            .arg("UNPAUSE")
-            .query_async(&mut admin(replica).await)
-            .await
-            .unwrap();
+/// Paused replicas. The drop unpauses them, also when the case panics, so the next case finds them
+/// live.
+struct Paused(Vec<String>);
+
+impl Drop for Paused {
+    fn drop(&mut self) {
+        // A drop can't wait on a future, so it uses blocking connections.
+        let unpause = |replica: &str| -> redis::RedisResult<()> {
+            let mut conn = redis::Client::open(replica)?.get_connection()?;
+            redis::cmd("CLIENT").arg("UNPAUSE").query(&mut conn)
+        };
+        let unpaused: Vec<_> = self.0.iter().map(|replica| unpause(replica)).collect();
+        // A second panic would abort the test binary, so the drop checks only on a clean path.
+        if !std::thread::panicking() {
+            for unpaused in unpaused {
+                unpaused.unwrap();
+            }
+        }
     }
 }
 
@@ -132,17 +152,17 @@ fn client() -> Producer {
 #[ignore = "needs Redis"]
 async fn a_write_that_too_few_replicas_have_fails_and_its_retry_finds_it() {
     let _lock = SERVER.lock().await;
-    too_few_replicas(&standalone_url(), false).await;
+    too_few_replicas(Topology::Standalone(standalone_url())).await;
 }
 
 #[tokio::test]
 #[ignore = "needs a Redis cluster"]
 async fn a_write_that_too_few_replicas_have_fails_on_a_redis_cluster() {
     let _lock = SERVER.lock().await;
-    too_few_replicas(&cluster_url(), true).await;
+    too_few_replicas(cluster_at(&cluster_url())).await;
 }
 
-async fn too_few_replicas(url: &str, cluster: bool) {
+async fn too_few_replicas(topology: Topology) {
     let handle = StreamHandle {
         id: format!("s-{}", std::process::id()),
         ..Default::default()
@@ -163,24 +183,28 @@ async fn too_few_replicas(url: &str, cluster: bool) {
         }
     };
     // No test server has this many replicas.
-    let waits = store(url, cluster, 16, SHORT).await;
+    let waits = store(&topology, wait_for(16, SHORT)).await;
     // So the write reloads its script between the script call and its `WAIT`.
     let flush = redis::cmd("SCRIPT").arg("FLUSH").clone();
-    if cluster {
-        let client = redis::cluster::ClusterClient::new(vec![url]).unwrap();
-        let mut conn = client.get_async_connection().await.unwrap();
-        let _: () = flush.query_async(&mut conn).await.unwrap();
-    } else {
-        let _: () = flush.query_async(&mut admin(url).await).await.unwrap();
+    match &topology {
+        Topology::Cluster { .. } => {
+            let client =
+                redis::cluster::ClusterClient::new(topology.servers().map(String::as_str)).unwrap();
+            let mut conn = client.get_async_connection().await.unwrap();
+            let _: () = flush.query_async(&mut conn).await.unwrap();
+        }
+        Topology::Standalone(url) => {
+            let _: () = flush.query_async(&mut admin(url).await).await.unwrap();
+        }
     }
     let refused = create(&waits).await.unwrap_err();
     assert_eq!(refused.reason, Reason::Storage, "{refused}");
-    let plain = store(url, cluster, 0, SHORT).await;
+    let plain = store(&topology, None).await;
     assert_eq!(create(&plain).await.unwrap().outcome, CreateOutcome::Exists);
-    if !cluster {
+    if let Topology::Standalone(url) = &topology {
         let count = replicas(url).await.len();
         assert!(count > 0, "the server at STREAMS_REDIS_URL needs a replica");
-        let enough = store(url, cluster, count, LONG).await;
+        let enough = store(&topology, wait_for(count, LONG)).await;
         assert_eq!(
             create(&enough).await.unwrap().outcome,
             CreateOutcome::Exists
@@ -219,12 +243,12 @@ async fn a_cluster_write_waits_for_the_replica_of_its_own_primary() {
                 .await
         }
     };
-    let paused = store(&url, true, 1, SHORT).await;
-    pause(&replicas).await;
-    let refused = create(paused, "paused").await;
-    resume(&replicas).await;
+    let short = store(&cluster_at(&url), wait_for(1, SHORT)).await;
+    let paused = pause(&replicas).await;
+    let refused = create(short, "paused").await;
+    drop(paused);
     assert_eq!(refused.unwrap_err().reason, Reason::Storage);
-    let acked = create(store(&url, true, 1, LONG).await, "acked").await;
+    let acked = create(store(&cluster_at(&url), wait_for(1, LONG)).await, "acked").await;
     assert_eq!(acked.unwrap().outcome, CreateOutcome::Created);
 }
 
@@ -246,20 +270,21 @@ async fn a_call_that_finds_its_write_waits_for_the_replicas() {
             ..Default::default()
         },
     );
-    let plain = store(&url, false, 0, SHORT).await;
+    let standalone = Topology::Standalone(url.clone());
+    let plain = store(&standalone, None).await;
     // A Store per call, since a call's own write puts its connection's offset past the replica's.
     let mut waits = vec![];
     for _ in 0..3 {
-        waits.push(store(&url, false, replicas.len(), SHORT).await);
+        waits.push(store(&standalone, wait_for(replicas.len(), SHORT)).await);
     }
     let none = Withdrawal::default;
     let producer = client();
-    let records = [b"x".to_vec()];
+    let records = [StreamRecord::default().encode_to_vec()];
     let batch = Batch {
         producer: &producer,
         sequence: 1,
         records: &records,
-        digest: "d",
+        digest: [0; 16],
         withdrawal: none(),
     };
     let other = StreamHandle {
@@ -270,7 +295,7 @@ async fn a_call_that_finds_its_write_waits_for_the_replicas() {
         .create(&namespace, &handle, None, Owner::Client, &none())
         .await
         .unwrap();
-    pause(&replicas).await;
+    let paused = pause(&replicas).await;
     plain.append(&namespace, &handle, &batch).await.unwrap();
     let resent = waits[0]
         .append(&namespace, &handle, &batch)
@@ -292,11 +317,11 @@ async fn a_call_that_finds_its_write_waits_for_the_replicas() {
         .create(&namespace, &other, None, Owner::Client, &none())
         .await
         .map(|_| ());
-    resume(&replicas).await;
+    drop(paused);
     for result in [resent, closed, found] {
         assert_eq!(result.unwrap_err().reason, Reason::Storage);
     }
-    let enough = store(&url, false, replicas.len(), LONG).await;
+    let enough = store(&standalone, wait_for(replicas.len(), LONG)).await;
     let resent = enough.append(&namespace, &handle, &batch).await.unwrap();
     assert!(resent.resend);
     let closed = enough
@@ -324,7 +349,7 @@ async fn writes_wait_for_their_replicas_at_once() {
     let waits = RedisStore::connect(options).await.unwrap();
     let namespace = unique("ns");
     // A write that finds no script runs its `WAIT` twice, so load the script first.
-    store(&url, false, 0, SHORT)
+    store(&Topology::Standalone(url.clone()), None)
         .await
         .create(
             &namespace,

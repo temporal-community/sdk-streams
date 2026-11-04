@@ -1,10 +1,7 @@
 //! The Redis backends of the shared suites, on a standalone server and on a cluster. The
 //! standalone server's replica also runs them with `WAIT`.
 
-#![allow(dead_code)]
-
 use prost::Message;
-use redis::AsyncCommands;
 use std::{num::NonZeroUsize, sync::Arc, time::Duration};
 use temporalio_streams::{
     StreamRuntime,
@@ -13,7 +10,7 @@ use temporalio_streams::{
     testing::{Needs, RawKeys, TestBackend},
 };
 use temporalio_streams_redis::{
-    RedisStore, RedisStoreOptions, RedisStreamRuntime, WaitOptions,
+    RedisStore, RedisStoreOptions, RedisStreamRuntime, Topology, WaitOptions,
     proto::RedisStreamConfig,
     testing::{cluster_url, standalone_url},
 };
@@ -28,32 +25,29 @@ pub(crate) fn standalone() -> Vec<Arc<dyn TestBackend>> {
         has_replica(&url),
         "the server at STREAMS_REDIS_URL needs a replica"
     );
-    // Each write then goes through the `WAIT` pipeline, refusals too.
-    let waits = RedisBackend {
-        url: url.clone(),
-        cluster: false,
-        wait_replicas: 1,
-    };
-    let plain = RedisBackend {
-        url,
-        cluster: false,
-        wait_replicas: 0,
-    };
-    vec![Arc::new(waits), Arc::new(plain)]
+    backends(Topology::Standalone(url))
 }
 
 /// The backends of the cluster, with `WAIT` on each primary's replica and with none.
 pub(crate) fn cluster() -> Vec<Arc<dyn TestBackend>> {
-    let url = cluster_url();
+    backends(Topology::Cluster {
+        first: cluster_url(),
+        rest: Vec::new(),
+    })
+}
+
+// Each write of the first backend goes through the `WAIT` pipeline, refusals too.
+fn backends(topology: Topology) -> Vec<Arc<dyn TestBackend>> {
     let waits = RedisBackend {
-        url: url.clone(),
-        cluster: true,
-        wait_replicas: 1,
+        topology: topology.clone(),
+        wait: Some(WaitOptions {
+            replicas: NonZeroUsize::MIN,
+            timeout: WAIT_TIMEOUT,
+        }),
     };
     let plain = RedisBackend {
-        url,
-        cluster: true,
-        wait_replicas: 0,
+        topology,
+        wait: None,
     };
     vec![Arc::new(waits), Arc::new(plain)]
 }
@@ -61,34 +55,29 @@ pub(crate) fn cluster() -> Vec<Arc<dyn TestBackend>> {
 /// Whether a standalone server has a replica that is online.
 pub(crate) fn has_replica(url: &str) -> bool {
     let mut conn = redis::Client::open(url).unwrap().get_connection().unwrap();
-    let info: String = redis::cmd("INFO")
+    let info: redis::InfoDict = redis::cmd("INFO")
         .arg("replication")
         .query(&mut conn)
         .unwrap();
-    info.lines()
-        .find_map(|line| line.trim().strip_prefix("connected_slaves:"))
-        .is_some_and(|count| count != "0")
+    info.get::<u64>("connected_slaves")
+        .is_some_and(|count| count > 0)
 }
 
-/// One Redis server, standalone or the seed of a cluster.
+/// The Redis of a backend, and its `WAIT`, if any.
 pub(crate) struct RedisBackend {
-    url: String,
-    cluster: bool,
-    wait_replicas: usize,
+    topology: Topology,
+    wait: Option<WaitOptions>,
 }
 
-/// Long enough for a replica on a busy test host.
-const WAIT_TIMEOUT: Duration = Duration::from_secs(1);
+/// Long enough for a replica on a busy test host. The response timeout is twice this.
+const WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl RedisBackend {
     fn options(&self) -> RedisStoreOptions {
-        let mut options = RedisStoreOptions::new(self.url.clone());
-        options.cluster = self.cluster;
+        let mut options = RedisStoreOptions::from(self.topology.clone());
         options.key_prefix = PREFIX.parse().unwrap();
-        options.wait = NonZeroUsize::new(self.wait_replicas).map(|replicas| WaitOptions {
-            replicas,
-            timeout: WAIT_TIMEOUT,
-        });
+        options.response_timeout = 2 * WAIT_TIMEOUT;
+        options.wait = self.wait;
         options
     }
 }
@@ -101,145 +90,96 @@ impl TestBackend for RedisBackend {
 
     async fn connect(&self) -> (Arc<dyn Store>, Arc<dyn RawKeys>) {
         let store = Arc::new(RedisStore::connect(self.options()).await.unwrap());
-        let raw = Arc::new(Raw {
-            url: self.url.clone(),
-            cluster: self.cluster,
-        });
+        let raw = Arc::new(Raw::open(&self.topology).await);
         (store, raw)
     }
 
     // Through the config bytes, as a bridge builds it.
     fn runtime(&self, backend: &str) -> Arc<StreamRuntime> {
+        let seconds = |duration: Duration| prost_types::Duration {
+            seconds: i64::try_from(duration.as_secs()).unwrap(),
+            nanos: 0,
+        };
         let config = RedisStreamConfig {
-            urls: vec![self.url.clone()],
-            cluster: self.cluster,
+            urls: self.topology.servers().cloned().collect(),
+            cluster: matches!(self.topology, Topology::Cluster { .. }),
             key_prefix: PREFIX.to_string(),
             backend: backend.to_string(),
-            wait_replicas: self.wait_replicas as i32,
-            wait_timeout: Some(prost_types::Duration {
-                seconds: WAIT_TIMEOUT.as_secs() as i64,
-                nanos: 0,
-            }),
+            wait_replicas: self
+                .wait
+                .map_or(0, |wait| i32::try_from(wait.replicas.get()).unwrap()),
+            wait_timeout: Some(seconds(WAIT_TIMEOUT)),
+            response_timeout: Some(seconds(2 * WAIT_TIMEOUT)),
             // The writer cases leave megabytes of Records, which a local server keeps for the
             // Retention.
-            retention: Some(prost_types::Duration {
-                seconds: 300,
-                nanos: 0,
-            }),
+            retention: Some(seconds(Duration::from_secs(300))),
             ..Default::default()
         };
         RedisStreamRuntime::from_config_bytes(&config.encode_to_vec(), None).unwrap()
     }
 }
 
-/// The keys under the Store's calls, which the cases read and change with plain commands.
-struct Raw {
-    url: String,
-    cluster: bool,
+/// The keys under the Store's calls, which the cases read and change with plain commands. A cluster
+/// connection sends each command to the node of its key.
+#[derive(Clone)]
+enum Raw {
+    Standalone(redis::aio::ConnectionManager),
+    Cluster(redis::cluster_async::ClusterConnection),
 }
 
 impl Raw {
-    /// A plain connection to the node of the Stream's slot.
-    async fn conn(&self, keys: &StreamKeys) -> redis::aio::ConnectionManager {
-        let url = if self.cluster {
-            let client = redis::cluster::ClusterClient::new(vec![self.url.as_str()]).unwrap();
-            let mut conn = client.get_async_connection().await.unwrap();
-            let slot: u16 = redis::cmd("CLUSTER")
-                .arg("KEYSLOT")
-                .arg(keys.meta())
-                .query_async::<i64>(&mut conn)
-                .await
-                .unwrap() as u16;
-            let shards: redis::Value = redis::cmd("CLUSTER")
-                .arg("SLOTS")
-                .query_async(&mut conn)
-                .await
-                .unwrap();
-            node_of(&shards, slot).expect("a node serves the slot")
-        } else {
-            self.url.clone()
-        };
-        redis::Client::open(url)
-            .unwrap()
-            .get_connection_manager()
-            .await
-            .unwrap()
+    async fn open(topology: &Topology) -> Self {
+        match topology {
+            Topology::Standalone(url) => {
+                let client = redis::Client::open(url.as_str()).unwrap();
+                Raw::Standalone(client.get_connection_manager().await.unwrap())
+            }
+            Topology::Cluster { .. } => {
+                let client =
+                    redis::cluster::ClusterClient::new(topology.servers().map(String::as_str))
+                        .unwrap();
+                Raw::Cluster(client.get_async_connection().await.unwrap())
+            }
+        }
+    }
+
+    async fn query<T: redis::FromRedisValue>(&self, cmd: &redis::Cmd) -> T {
+        match self.clone() {
+            Raw::Standalone(mut conn) => cmd.query_async(&mut conn).await.unwrap(),
+            Raw::Cluster(mut conn) => cmd.query_async(&mut conn).await.unwrap(),
+        }
     }
 }
 
 #[async_trait::async_trait]
 impl RawKeys for Raw {
-    async fn set_meta(&self, namespace: &str, stream: &str, field: &str, value: &str) {
+    async fn set_meta(&self, namespace: &str, stream: &str, field: &[u8], value: &[u8]) {
         let keys = StreamKeys::new(PREFIX, namespace, stream);
-        let mut conn = self.conn(&keys).await;
-        let _: () = conn.hset(keys.meta(), field, value).await.unwrap();
+        self.query::<()>(redis::cmd("HSET").arg(keys.meta()).arg(field).arg(value))
+            .await;
     }
 
-    async fn meta(&self, namespace: &str, stream: &str, field: &str) -> Option<String> {
+    async fn meta(&self, namespace: &str, stream: &str, field: &[u8]) -> Option<Vec<u8>> {
         let keys = StreamKeys::new(PREFIX, namespace, stream);
-        let mut conn = self.conn(&keys).await;
-        conn.hget(keys.meta(), field).await.unwrap()
+        self.query(redis::cmd("HGET").arg(keys.meta()).arg(field))
+            .await
     }
 
     async fn ttls(&self, namespace: &str, stream: &str) -> (i64, i64) {
         let keys = StreamKeys::new(PREFIX, namespace, stream);
-        let mut conn = self.conn(&keys).await;
-        let log: i64 = conn.pttl(keys.log()).await.unwrap();
-        let meta: i64 = conn.pttl(keys.meta()).await.unwrap();
+        let log = self.query(redis::cmd("PTTL").arg(keys.log())).await;
+        let meta = self.query(redis::cmd("PTTL").arg(keys.meta())).await;
         (log, meta)
     }
 
     async fn add_raw_entry(&self, namespace: &str, stream: &str, id: &str) {
         let keys = StreamKeys::new(PREFIX, namespace, stream);
-        let mut conn = self.conn(&keys).await;
-        let _: String = redis::cmd("XADD")
-            .arg(keys.log())
-            .arg(id)
-            .arg("x")
-            .arg("y")
-            .query_async(&mut conn)
-            .await
-            .unwrap();
+        self.query::<String>(redis::cmd("XADD").arg(keys.log()).arg(id).arg("x").arg("y"))
+            .await;
     }
 
     async fn log_len(&self, namespace: &str, stream: &str) -> usize {
         let keys = StreamKeys::new(PREFIX, namespace, stream);
-        let mut conn = self.conn(&keys).await;
-        conn.xlen(keys.log()).await.unwrap()
+        self.query(redis::cmd("XLEN").arg(keys.log())).await
     }
-}
-
-fn node_of(slots: &redis::Value, slot: u16) -> Option<String> {
-    let redis::Value::Array(ranges) = slots else {
-        return None;
-    };
-    for range in ranges {
-        let redis::Value::Array(parts) = range else {
-            continue;
-        };
-        let number = |value: &redis::Value| match value {
-            redis::Value::Int(n) => Some(*n),
-            _ => None,
-        };
-        let (Some(start), Some(end)) = (number(&parts[0]), number(&parts[1])) else {
-            continue;
-        };
-        if (start..=end).contains(&(slot as i64)) {
-            let redis::Value::Array(node) = &parts[2] else {
-                continue;
-            };
-            let host = match &node[0] {
-                redis::Value::BulkString(bytes) => String::from_utf8(bytes.clone()).ok()?,
-                _ => return None,
-            };
-            let port = number(&node[1])?;
-            let host = if host.is_empty() {
-                "127.0.0.1".to_string()
-            } else {
-                host
-            };
-            return Some(format!("redis://{host}:{port}/0"));
-        }
-    }
-    None
 }

@@ -12,7 +12,8 @@ Lang sends the options as a `RedisStreamConfig`, from
 `crates/streams-redis/protos/temporal/sdk/streams/v1/redis.proto`. Rust code can call
 `RedisStore::connect` with `RedisStoreOptions`. The Store needs Redis 7.0 or later. The table
 lists the main config fields. `RedisStoreOptions` has the same ones, except that
-`wait: Option<WaitOptions>` replaces the two `wait_` fields.
+`topology: Topology` replaces `urls` and `cluster`, and `wait: Option<WaitOptions>` replaces the two
+`wait_` fields.
 
 | Option | Default | Use |
 |---|---|---|

@@ -1,8 +1,8 @@
 //! The Stream runtime on Redis.
 
 use crate::{
-    KeyPrefix, RedisStore, RedisStoreError, RedisStoreOptions, RedisStoreResult, WaitOptions,
-    proto::RedisStreamConfig,
+    KeyPrefix, RedisStore, RedisStoreError, RedisStoreOptions, RedisStoreResult, Topology,
+    WaitOptions, proto::RedisStreamConfig,
 };
 use prost::Message;
 use std::{num::NonZeroUsize, sync::Arc, time::Duration};
@@ -27,12 +27,24 @@ impl TryFrom<RedisStreamConfig> for RuntimeOptions {
     type Error = RedisStoreError;
 
     fn try_from(config: RedisStreamConfig) -> RedisStoreResult<Self> {
-        if config.urls.is_empty() {
-            return Err(RedisStoreError::invalid(
-                "The Redis Stream backend needs a URL",
-            ));
-        }
-        let defaults = RedisStoreOptions::default();
+        let mut urls = config.urls.into_iter();
+        let first = urls
+            .next()
+            .ok_or_else(|| RedisStoreError::invalid("The Redis Stream backend needs a URL"))?;
+        let topology = match (config.cluster, urls.len()) {
+            (true, _) => Topology::Cluster {
+                first,
+                rest: urls.collect(),
+            },
+            (false, 0) => Topology::Standalone(first),
+            // A standalone Store connects to one server, so the other URLs would have no effect.
+            (false, _) => {
+                return Err(RedisStoreError::invalid(
+                    "A standalone Redis takes one URL, and a cluster's seeds need `cluster`",
+                ));
+            }
+        };
+        let defaults = RedisStoreOptions::from(topology);
         // A bad timeout is refused even with no replicas, since the config is wrong either way.
         let wait_timeout = duration("wait_timeout", config.wait_timeout)?;
         let wait = count("wait_replicas", config.wait_replicas)?.map(|replicas| WaitOptions {
@@ -44,8 +56,6 @@ impl TryFrom<RedisStreamConfig> for RuntimeOptions {
             _ => KeyPrefix::try_from(config.key_prefix)?,
         };
         let store = RedisStoreOptions {
-            urls: config.urls,
-            cluster: config.cluster,
             key_prefix,
             retention: duration("retention", config.retention)?.unwrap_or(defaults.retention),
             safety_ttl: duration("safety_ttl", config.safety_ttl)?.unwrap_or(defaults.safety_ttl),
@@ -57,6 +67,7 @@ impl TryFrom<RedisStreamConfig> for RuntimeOptions {
             response_timeout: duration("response_timeout", config.response_timeout)?
                 .unwrap_or(defaults.response_timeout),
             wait,
+            ..defaults
         };
         // A bridge builds the runtime at startup and connects later, so a bad config fails here.
         crate::store::check(&store)?;

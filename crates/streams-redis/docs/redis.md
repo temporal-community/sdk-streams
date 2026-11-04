@@ -28,35 +28,55 @@ form, and the `testdata/` of `temporalio-streams` has its test vectors.
 | `closed`, `close_id` | Set by the close, with the entry id of the close Record |
 | `newest` | The entry id of the newest entry |
 | `trimmed` | The entry id of the newest entry that Retention or the log's expiry dropped |
-| `e\|<kind>\|<producer id>` | The newest epoch key of the Producer, the fence |
-| `d\|<kind>\|<producer id>` | `<epoch key>\|<sequence>\|<first id>\|<last id>\|<digest>` |
-| `h\|<kind>\|<producer id>` | The newest epoch key that still has Records here |
+| `p\|<kind>\|<producer id>` | The Producer's fence, held epoch and last batch, 129 bytes |
 | `oa\|<run>` | The run's Local Activity task keys here that may not have completed |
 | `ow\|<run>\|<task key>` | Set when an orphan item withdrew the task's Local Activity Records |
 | `tf\|<run>` | The task facts of the run's highest task, as task keys back to back |
 | `run\|<run>` | Set when a Producer of the run wrote a Record here |
 | `wr\|<run>` | Set when a Workflow retry withdrew the run |
 
-`<kind>` is the `ProducerKind` number, and `<run>` is the percent-encoded run id. `d` is the
-Producer's last batch. An epoch key is the epoch's fields as fixed-width hex, so two keys compare as
-strings.
+`<kind>` is the `ProducerKind` number, and `<run>` is the percent-encoded run id. The `p|` value
+has big-endian numbers in this order.
+
+| Bytes | Field |
+|---|---|
+| 1 | Flags. Bit 0 is set when the held epoch is present, and the other bits are zero. |
+| 40 | The fence, the Producer's newest epoch key. It is also the epoch of the last batch. |
+| 40 | The held epoch key, the newest one that still has Records here, or zeros |
+| 8 | The last batch's sequence |
+| 12 | The last batch's first entry id, the ms in 8 bytes and the seq in 4 |
+| 12 | The last batch's last entry id, in the same form |
+| 16 | The last batch's digest, which a resend must match |
+
+- The ids are zero when the last batch wrote no entry. A real entry id is never `0-0`.
+- A call that finds a value of another length, another flag bit, or only one zero id fails with
+  `stream_storage`, since a later format may write it.
+- A task key is the started event id 8, the attempt 4, and the started seconds 8 and nanos 4.
+- An epoch key is the task key, then the attempt's scheduled seconds 8 and nanos 4 and the
+  attempt 4. A negative field is zero.
+- `oa|` and `tf|` hold 24-byte task keys back to back, and `ow|` ends in the raw task key. A call
+  that finds `oa|` or `tf|` ending in a partial key, or `tf|` with fewer than two keys, fails with
+  `stream_storage`.
+- The scripts compare two keys byte by byte. Lua's `<` collates with the server's locale.
+- The digest is the first 16 bytes of the batch's SHA-256.
 
 `:producers` scores each `<kind>|<producer id>` with the ms of its last append. An append drops the
-`e|`, `d|` and `h|` fields of up to 64 Producers with no append for one Retention. A resend of such
-a Producer's last batch then writes the batch again, and a lower epoch of the Producer is accepted.
-So the fence lasts one Retention after the last append.
+`p|` field of up to 64 Producers with no append for one Retention. A resend of such a Producer's
+last batch then writes the batch again, and a lower epoch of the Producer is accepted. So the fence
+lasts one Retention after the last append.
 
-An append with sequence 0 takes the sequence after the one in `d` when `d` has the batch's epoch
-key, and 1 otherwise. The script reads `d` and writes the batch in one step, so two such batches
-never get the same sequence. Nothing dedupes such a batch, so its retry writes it again.
+An append with sequence 0 takes the sequence after the last batch's when the fence is the batch's
+epoch key, and 1 otherwise. The script reads `p|` and writes the batch in one step, so two such
+batches never get the same sequence. Nothing dedupes such a batch, so its retry writes it again.
 
 ## Log entries
 
-- `r` is the encoded `StreamRecord`, with no offset. A data Record has no Producer in it.
+- `r` is the encoded `StreamRecord`, with no offset. A data Record has no Producer in it. An
+  append refuses a Record that isn't an encoded `StreamRecord`, since each read decodes it.
 - `p` is the encoded `Producer` of the batch, on the batch's first data entry. The Store sets it on
   each data Record of the batch when it reads them.
 - `b` is the seq of the batch's first entry, on each later data entry, so a read that starts inside
-  a batch gets `p` with one lookup.
+  a batch gets `p` with one lookup. An entry never has both `p` and `b`.
 - A batch's entries share one millisecond, and a trim drops whole milliseconds, so a batch keeps
   its `p` entry for as long as it has any entry.
 - `s` is the encoded `StreamSuperseded` with the withdrawal facts. A read builds the Superseded
@@ -163,8 +183,8 @@ these lists on a standalone server and on a cluster.
   run's create fails with `stream_closed`. The close's Readers have ended, so it can't be withdrawn.
 - A reset run doesn't withdraw the base run's Records after the reset point, and it doesn't fence
   the base run's Producers.
-- The meta keeps the `run|`, `oa|`, `ow|`, `tf|` and `wr|` fields of each run until the Stream expires, so
-  a long run chain adds fields for as long as it writes.
+- The meta keeps the `run|`, `oa|`, `ow|`, `tf|` and `wr|` fields of each run until the Stream
+  expires, so a long run chain adds fields for as long as it writes.
 - Redis can't tie a run to its run chain. A run of another chain that holds the owner's handle,
   such as a child Workflow with its parent's Stream, can still close it. The native server checks
   the run.

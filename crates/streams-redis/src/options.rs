@@ -7,15 +7,67 @@ use temporalio_streams::{
     store::{DEFAULT_RETENTION, DEFAULT_SAFETY_TTL},
 };
 
-/// The Redis connection options and the Stream TTLs.
+/// Where the Store's Redis is. Each server is a `redis://` or `rediss://` URL, which also sets the
+/// credentials and TLS.
 #[derive(Clone, PartialEq, Eq)]
+pub enum Topology<T = String> {
+    /// One server.
+    Standalone(T),
+    /// The seeds of a Redis Cluster. Every node gets the credentials and TLS of the first one.
+    Cluster {
+        /// The first seed.
+        first: T,
+        /// The other seeds.
+        rest: Vec<T>,
+    },
+}
+
+impl<T> Topology<T> {
+    /// The server, or each seed with the first one first.
+    pub fn servers(&self) -> impl Iterator<Item = &T> {
+        let (first, rest) = match self {
+            Topology::Standalone(first) => (first, &[][..]),
+            Topology::Cluster { first, rest } => (first, rest.as_slice()),
+        };
+        std::iter::once(first).chain(rest)
+    }
+
+    /// The same topology with `f` applied to each server, or the first error.
+    pub(crate) fn try_map<U, E>(
+        &self,
+        mut f: impl FnMut(&T) -> Result<U, E>,
+    ) -> Result<Topology<U>, E> {
+        Ok(match self {
+            Topology::Standalone(server) => Topology::Standalone(f(server)?),
+            Topology::Cluster { first, rest } => Topology::Cluster {
+                first: f(first)?,
+                rest: rest.iter().map(&mut f).collect::<Result<_, _>>()?,
+            },
+        })
+    }
+}
+
+// The URLs can hold a password, so the debug form shows them with no user info.
+impl std::fmt::Debug for Topology {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.try_map(|url| Ok::<_, std::convert::Infallible>(redacted(url))) {
+            Ok(Topology::Standalone(url)) => f.debug_tuple("Standalone").field(&url).finish(),
+            Ok(Topology::Cluster { first, rest }) => f
+                .debug_struct("Cluster")
+                .field("first", &first)
+                .field("rest", &rest)
+                .finish(),
+            Err(never) => match never {},
+        }
+    }
+}
+
+/// The Redis connection options and the Stream TTLs.
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct RedisStoreOptions {
-    /// One `redis://` or `rediss://` URL, or the seed nodes of a cluster. Credentials and TLS
-    /// come from the URL.
-    pub urls: Vec<String>,
-    /// Whether `urls` are the seeds of a Redis Cluster.
-    pub cluster: bool,
+    /// Where the Redis is.
+    pub topology: Topology,
     /// The prefix of every key.
     pub key_prefix: KeyPrefix,
     /// The Retention of a Stream whose create sets none.
@@ -38,19 +90,15 @@ const DEFAULT_BLOCKING_READS_PER_NODE: NonZeroUsize = match NonZeroUsize::new(25
 impl RedisStoreOptions {
     /// The defaults for one Redis at `url`.
     pub fn new(url: impl Into<String>) -> Self {
-        Self {
-            urls: vec![url.into()],
-            ..Self::default()
-        }
+        Topology::Standalone(url.into()).into()
     }
 }
 
-/// The defaults with no URL. A Store needs at least one before it connects.
-impl Default for RedisStoreOptions {
-    fn default() -> Self {
+/// The defaults for the Redis at `topology`.
+impl From<Topology> for RedisStoreOptions {
+    fn from(topology: Topology) -> Self {
         Self {
-            urls: Vec::new(),
-            cluster: false,
+            topology,
             key_prefix: KeyPrefix::default(),
             retention: DEFAULT_RETENTION,
             safety_ttl: DEFAULT_SAFETY_TTL,
@@ -58,23 +106,6 @@ impl Default for RedisStoreOptions {
             response_timeout: Duration::from_secs(5),
             wait: None,
         }
-    }
-}
-
-// The URLs can hold a password, so the debug form shows them with no user info.
-impl std::fmt::Debug for RedisStoreOptions {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let urls: Vec<String> = self.urls.iter().map(|url| redacted(url)).collect();
-        f.debug_struct("RedisStoreOptions")
-            .field("urls", &urls)
-            .field("cluster", &self.cluster)
-            .field("key_prefix", &self.key_prefix)
-            .field("retention", &self.retention)
-            .field("safety_ttl", &self.safety_ttl)
-            .field("blocking_reads_per_node", &self.blocking_reads_per_node)
-            .field("response_timeout", &self.response_timeout)
-            .field("wait", &self.wait)
-            .finish()
     }
 }
 
