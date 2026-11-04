@@ -10,7 +10,7 @@ use temporalio_streams::{
 };
 use temporalio_streams_redis::{
     RedisStore, RedisStoreOptions, WaitOptions,
-    testing::{cluster_url, standalone_url},
+    testing::{SlotRange, cluster_url, standalone_url},
 };
 
 const PREFIX: &str = "streams-wait";
@@ -63,23 +63,15 @@ async fn replicas(url: &str) -> Vec<String> {
 async fn cluster_replicas(url: &str) -> Vec<String> {
     let client = redis::cluster::ClusterClient::new(vec![url]).unwrap();
     let mut conn = client.get_async_connection().await.unwrap();
-    let ranges: Vec<Vec<redis::Value>> = redis::cmd("CLUSTER")
+    let ranges: Vec<SlotRange> = redis::cmd("CLUSTER")
         .arg("SLOTS")
         .query_async(&mut conn)
         .await
         .unwrap();
-    // Each range is its start, its end, its primary, and then its replicas.
     let mut urls: Vec<String> = ranges
         .iter()
-        .flat_map(|range| range.iter().skip(3))
-        .filter_map(|node| {
-            let redis::Value::Array(node) = node else {
-                return None;
-            };
-            let host: String = redis::from_redis_value(node.first()?.clone()).ok()?;
-            let port: u16 = redis::from_redis_value(node.get(1)?.clone()).ok()?;
-            Some(format!("redis://{host}:{port}/0"))
-        })
+        .flat_map(|range| &range.replicas)
+        .map(|node| format!("redis://{}:{}/0", node.host, node.port))
         .collect();
     urls.sort();
     urls.dedup();

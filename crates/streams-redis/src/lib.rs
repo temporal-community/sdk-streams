@@ -14,6 +14,9 @@ mod error;
 mod options;
 mod protos;
 mod runtime;
+// `testing` exports these types for the tests, so only a build with it reaches them.
+#[cfg_attr(not(any(test, feature = "test-support")), allow(unreachable_pub))]
+mod slots;
 mod store;
 #[cfg(any(test, feature = "test-support"))]
 pub mod testing;

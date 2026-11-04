@@ -1,6 +1,8 @@
 //! Test support. The cases that need Redis are `#[ignore]`, so a plain `cargo test` skips them.
 //! `cargo test -- --include-ignored` runs them on the servers of `scripts/redis-test-servers.sh`.
 
+pub use crate::slots::{SlotNode, SlotRange};
+
 /// The URL of the standalone test server, which has one replica.
 pub fn standalone_url() -> String {
     url("STREAMS_REDIS_URL")

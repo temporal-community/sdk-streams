@@ -4,6 +4,7 @@
 use prost::Message;
 use std::{
     num::NonZeroUsize,
+    ops::RangeInclusive,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use temporalio_common::protos::temporal::api::common::v1::Payload;
@@ -20,7 +21,7 @@ use temporalio_streams::{
 };
 use temporalio_streams_redis::{
     RedisStore, RedisStoreError, RedisStoreOptions, WaitOptions,
-    testing::{cluster_url, standalone_url},
+    testing::{SlotNode, SlotRange, cluster_url, standalone_url},
 };
 
 const PREFIX: &str = "streams-acl";
@@ -316,23 +317,27 @@ async fn the_documented_commands_run_every_call_of_each_role() {
     }
 }
 
-/// A cluster primary, from `CLUSTER SLOTS`.
+/// A cluster primary and its slot ranges.
 struct Primary {
-    host: String,
-    port: i64,
-    id: String,
-    slots: Vec<(i64, i64)>,
+    node: SlotNode,
+    slots: Vec<RangeInclusive<u16>>,
 }
 
 impl Primary {
-    fn url(&self) -> String {
-        format!("redis://{}:{}/0", self.host, self.port)
+    /// An empty host is the node that answered, which is local in the test cluster.
+    fn host(&self) -> &str {
+        match self.node.host.as_str() {
+            "" => "127.0.0.1",
+            host => host,
+        }
     }
 
-    fn owns(&self, slot: i64) -> bool {
-        self.slots
-            .iter()
-            .any(|&(start, end)| start <= slot && slot <= end)
+    fn url(&self) -> String {
+        format!("redis://{}:{}/0", self.host(), self.node.port)
+    }
+
+    fn owns(&self, slot: u16) -> bool {
+        self.slots.iter().any(|range| range.contains(&slot))
     }
 
     async fn run(&self, cmd: &redis::Cmd) -> redis::Value {
@@ -343,43 +348,21 @@ impl Primary {
 }
 
 async fn primaries(conn: &mut redis::cluster_async::ClusterConnection) -> Vec<Primary> {
-    let reply: redis::Value = redis::cmd("CLUSTER")
+    let ranges: Vec<SlotRange> = redis::cmd("CLUSTER")
         .arg("SLOTS")
         .query_async(conn)
         .await
         .unwrap();
-    let redis::Value::Array(ranges) = reply else {
-        panic!("CLUSTER SLOTS gave {reply:?}");
-    };
     let mut primaries: Vec<Primary> = vec![];
     for range in ranges {
-        let redis::Value::Array(parts) = range else {
-            continue;
-        };
-        let (redis::Value::Int(start), redis::Value::Int(end), redis::Value::Array(node)) =
-            (&parts[0], &parts[1], &parts[2])
-        else {
-            continue;
-        };
-        let [
-            redis::Value::BulkString(host),
-            redis::Value::Int(port),
-            redis::Value::BulkString(id),
-        ] = &node[..3]
-        else {
-            panic!("CLUSTER SLOTS gave {node:?}");
-        };
-        let id = String::from_utf8_lossy(id).into_owned();
-        match primaries.iter_mut().find(|primary| primary.id == id) {
-            Some(primary) => primary.slots.push((*start, *end)),
+        match primaries
+            .iter_mut()
+            .find(|primary| primary.node.id == range.primary.id)
+        {
+            Some(primary) => primary.slots.push(range.slots),
             None => primaries.push(Primary {
-                host: match String::from_utf8_lossy(host).into_owned() {
-                    host if host.is_empty() => "127.0.0.1".to_string(),
-                    host => host,
-                },
-                port: *port,
-                id,
-                slots: vec![(*start, *end)],
+                node: range.primary,
+                slots: vec![range.slots],
             }),
         }
     }
@@ -406,7 +389,7 @@ async fn the_documented_commands_serve_a_cluster_while_a_slot_moves() {
         for i in 0.. {
             let id = format!("s{i}");
             let keys = StreamKeys::new(PREFIX, &namespace, &id);
-            let slot: i64 = redis::cmd("CLUSTER")
+            let slot: u16 = redis::cmd("CLUSTER")
                 .arg("KEYSLOT")
                 .arg(keys.meta())
                 .query_async(&mut cluster)
@@ -417,7 +400,10 @@ async fn the_documented_commands_serve_a_cluster_while_a_slot_moves() {
                 .run(redis::cmd("CLUSTER").arg("COUNTKEYSINSLOT").arg(slot))
                 .await;
             if count == redis::Value::Int(0) {
-                let target = nodes.iter().find(|node| node.id != source.id).unwrap();
+                let target = nodes
+                    .iter()
+                    .find(|node| node.node.id != source.node.id)
+                    .unwrap();
                 break 'pick (id, slot, source, target);
             }
         }
@@ -467,15 +453,15 @@ async fn the_documented_commands_serve_a_cluster_while_a_slot_moves() {
     // The migration that `redis-cli --cluster reshard` runs, stopped after the Stream's keys moved.
     let set_slot = |state: &str, other: &Primary| {
         let mut cmd = redis::cmd("CLUSTER");
-        cmd.arg("SETSLOT").arg(slot).arg(state).arg(&other.id);
+        cmd.arg("SETSLOT").arg(slot).arg(state).arg(&other.node.id);
         cmd
     };
     target.run(&set_slot("IMPORTING", source)).await;
     source.run(&set_slot("MIGRATING", target)).await;
     let mut migrate = redis::cmd("MIGRATE");
     migrate
-        .arg(&target.host)
-        .arg(target.port)
+        .arg(target.host())
+        .arg(target.node.port)
         .arg("")
         .arg(0)
         .arg(5000)

@@ -1,7 +1,10 @@
 //! The connections of the Redis Store. A blocked `XREAD` or `WAIT` stops all later commands on its
 //! connection, so each one gets a dedicated connection, and the short calls share one.
 
-use crate::RedisStoreOptions;
+use crate::{
+    RedisStoreOptions,
+    slots::{SlotNode, SlotRange},
+};
 use parking_lot::Mutex;
 use redis::{
     AsyncConnectionConfig, Client, Cmd, ConnectionAddr, ConnectionInfo, ErrorKind, FromRedisValue,
@@ -411,7 +414,7 @@ impl WaitPool {
         let open = || async {
             let live: Vec<Node> = match &self.cluster {
                 Some(cluster) => primaries(cluster)
-                    .await
+                    .await?
                     .into_iter()
                     .map(|(_, node)| node)
                     .collect(),
@@ -423,55 +426,25 @@ impl WaitPool {
     }
 }
 
-/// The primary of each slot range, from a live node of the cluster. An empty list when the
-/// cluster doesn't answer, so the caller falls back to the seeds.
-async fn primaries(cluster: &ClusterConnection) -> Vec<(RangeInclusive<u16>, Node)> {
-    let reply = redis::cmd("CLUSTER")
+/// The primary of each slot range, from a live node of the cluster. A cluster that doesn't
+/// answer gives none, so the caller falls back to the seeds. A refusal, such as from a user with no
+/// `+cluster|slots`, is an error.
+async fn primaries(cluster: &ClusterConnection) -> RedisResult<Vec<(RangeInclusive<u16>, Node)>> {
+    let ranges = redis::cmd("CLUSTER")
         .arg("SLOTS")
-        .query_async::<Value>(&mut cluster.clone())
+        .query_async::<Vec<SlotRange>>(&mut cluster.clone())
         .await;
-    reply.map(primaries_of).unwrap_or_default()
-}
-
-fn primaries_of(reply: Value) -> Vec<(RangeInclusive<u16>, Node)> {
-    let Value::Array(ranges) = reply else {
-        return Vec::new();
-    };
-    let range = |range: Value| {
-        let Value::Array(range) = range else {
-            return None;
-        };
-        let [
-            Value::Int(start),
-            Value::Int(end),
-            Value::Array(primary),
-            ..,
-        ] = range.as_slice()
-        else {
-            return None;
-        };
-        let [host, Value::Int(port), ..] = primary.as_slice() else {
-            return None;
-        };
-        let host = match host {
-            Value::BulkString(host) => String::from_utf8(host.clone()).ok()?,
-            Value::SimpleString(host) => host.clone(),
-            _ => return None,
-        };
-        // An empty host is the node that answered, and `?` is unknown, so neither one is usable.
-        if host.is_empty() || host == "?" {
-            return None;
+    match ranges {
+        Ok(ranges) => Ok(ranges
+            .into_iter()
+            .filter_map(|range| Some((range.slots, Node::reachable(&range.primary)?)))
+            .collect()),
+        Err(error) if unreachable(&error) || error.is_timeout() => {
+            tracing::debug!("The cluster gave no slot ranges: {error}");
+            Ok(Vec::new())
         }
-        let node = Node::Tcp {
-            host,
-            port: u16::try_from(*port).ok()?,
-        };
-        Some((
-            u16::try_from(*start).ok()?..=u16::try_from(*end).ok()?,
-            node,
-        ))
-    };
-    ranges.into_iter().filter_map(range).collect()
+        Err(error) => Err(error),
+    }
 }
 
 /// A Redis node from a seed or a redirect. A standalone server can also be a local socket.
@@ -504,6 +477,15 @@ impl TryFrom<&ConnectionInfo> for Node {
 }
 
 impl Node {
+    /// The node of a slot range. An empty host is the node that answered, and `?` is unknown, so
+    /// neither one is reachable.
+    fn reachable(node: &SlotNode) -> Option<Self> {
+        (!node.host.is_empty() && node.host != "?").then(|| Self::Tcp {
+            host: node.host.clone(),
+            port: node.port,
+        })
+    }
+
     /// The seed's connection settings, with its credentials and TLS, for this node.
     fn info(&self, seed: &ConnectionInfo) -> ConnectionInfo {
         let addr = match (self, seed.addr()) {
@@ -702,7 +684,7 @@ impl BlockingPool {
         let mut node = match route.slot() {
             Some(slot) => match self.slots.get(slot) {
                 Some(node) => Some(node),
-                None => self.live_primary(slot).await,
+                None => self.live_primary(slot).await?,
             },
             None => None,
         }
@@ -727,7 +709,7 @@ impl BlockingPool {
                     }
                     if fallbacks.is_none() {
                         let live = match route.slot() {
-                            Some(slot) => self.live_primary(slot).await,
+                            Some(slot) => self.live_primary(slot).await?,
                             None => None,
                         };
                         let seeds = self.endpoint.seeds().map(|seed| seed.node.clone());
@@ -800,13 +782,18 @@ impl BlockingPool {
     }
 
     /// The primary that serves `slot` now, as the shared connection of a cluster sees it.
-    async fn live_primary(&self, slot: u16) -> Option<Node> {
-        let primaries = primaries(self.cluster.as_ref()?).await;
-        let (_, node) = primaries
+    async fn live_primary(&self, slot: u16) -> RedisResult<Option<Node>> {
+        let Some(cluster) = &self.cluster else {
+            return Ok(None);
+        };
+        let node = primaries(cluster)
+            .await?
             .into_iter()
-            .find(|(range, _)| range.contains(&slot))?;
-        self.slots.learn(slot, node.clone());
-        Some(node)
+            .find_map(|(range, node)| range.contains(&slot).then_some(node));
+        if let Some(node) = &node {
+            self.slots.learn(slot, node.clone());
+        }
+        Ok(node)
     }
 
     fn node(&self, node: &Node) -> Arc<NodePool> {
@@ -990,15 +977,22 @@ mod tests {
     #[test]
     fn the_cluster_slots_reply_gives_each_range_its_primary() {
         let reply = redis::parse_redis_value(
-            b"*2\r\n*3\r\n:0\r\n:5460\r\n*3\r\n$9\r\n127.0.0.1\r\n:7001\r\n$2\r\nid\r\n\
-              *3\r\n:5461\r\n:16383\r\n*2\r\n$0\r\n\r\n:7002\r\n",
+            b"*2\r\n*4\r\n:0\r\n:5460\r\n*3\r\n$9\r\n127.0.0.1\r\n:7001\r\n$1\r\na\r\n\
+              *3\r\n$9\r\n127.0.0.1\r\n:7004\r\n$1\r\nb\r\n\
+              *3\r\n:5461\r\n:16383\r\n*3\r\n$0\r\n\r\n:7002\r\n$1\r\nc\r\n",
         )
         .unwrap();
+        let ranges: Vec<SlotRange> = redis::from_redis_value(reply).unwrap();
+        assert_eq!(ranges[0].slots, 0..=5460);
+        assert_eq!(ranges[0].replicas[0].port, 7004);
+        let reachable: Vec<_> = ranges
+            .iter()
+            .map(|range| Node::reachable(&range.primary))
+            .collect();
         // The second range has no usable host.
-        assert_eq!(
-            primaries_of(reply),
-            vec![(0..=5460, node("127.0.0.1", 7001))]
-        );
+        assert_eq!(reachable, [Some(node("127.0.0.1", 7001)), None]);
+        let short = redis::parse_redis_value(b"*1\r\n*2\r\n:0\r\n:1\r\n").unwrap();
+        assert!(redis::from_redis_value::<Vec<SlotRange>>(short).is_err());
     }
 
     #[tokio::test]
