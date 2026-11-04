@@ -214,7 +214,9 @@ async fn the_documented_commands_run_every_call_of_each_role() {
         id: "short".to_string(),
         ..Default::default()
     };
-    let retention = Duration::from_secs(1);
+    // The old Record is at least 1.1 Retentions old at the last append, and the recent one 0.5, so
+    // a stall of up to 1 s leaves the result the same.
+    let retention = Duration::from_secs(2);
     // A Workflow Stream has the safety TTL, so it doesn't expire with the Retention.
     producer
         .create(
@@ -243,10 +245,10 @@ async fn the_documented_commands_run_every_call_of_each_role() {
         }
     };
     let old = append_as("old").await.offsets.unwrap().1;
-    tokio::time::sleep(retention / 2).await;
+    tokio::time::sleep(retention * 6 / 10).await;
     // A write within the Retention keeps the log key.
     append_as("recent").await;
-    tokio::time::sleep(retention * 7 / 10).await;
+    tokio::time::sleep(retention / 2).await;
     append_as("new").await;
     let (state, entries) = reader.read(&namespace, "short", 0, 10).await.unwrap();
     assert_eq!((state.trimmed, entries.len()), (old, 2));
