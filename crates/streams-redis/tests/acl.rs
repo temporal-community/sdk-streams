@@ -369,6 +369,50 @@ async fn primaries(conn: &mut redis::cluster_async::ClusterConnection) -> Vec<Pr
     primaries
 }
 
+/// A slot that migrates from `source` to `target`. The drop undoes the migration, also when the
+/// case panics, so the next case finds the slot stable.
+struct Migration {
+    slot: u16,
+    source: String,
+    target: String,
+    keys: [String; 3],
+}
+
+impl Drop for Migration {
+    fn drop(&mut self) {
+        // A drop can't wait on a future, so it uses blocking connections.
+        let run = |url: &str, pipe: &redis::Pipeline| -> redis::RedisResult<()> {
+            pipe.query(&mut redis::Client::open(url)?.get_connection()?)
+        };
+        // The Stream's keys are only on the target, so deleting them there undoes the migration.
+        let mut drop_keys = redis::pipe();
+        for key in &self.keys {
+            drop_keys
+                .cmd("ASKING")
+                .ignore()
+                .cmd("DEL")
+                .arg(key)
+                .ignore();
+        }
+        let dropped = run(&self.target, &drop_keys);
+        let mut stable = redis::pipe();
+        stable
+            .cmd("CLUSTER")
+            .arg("SETSLOT")
+            .arg(self.slot)
+            .arg("STABLE")
+            .ignore();
+        let stabled = [&self.target, &self.source].map(|url| run(url, &stable));
+        // A second panic would abort the test binary, so the drop checks only on a clean path.
+        if !std::thread::panicking() {
+            dropped.unwrap();
+            for stabled in stabled {
+                stabled.unwrap();
+            }
+        }
+    }
+}
+
 /// While a slot migrates, the source answers `ASK` for the Stream's keys that it gave away, so the
 /// Store's client sends `ASKING` to the target.
 #[tokio::test]
@@ -458,6 +502,12 @@ async fn the_documented_commands_serve_a_cluster_while_a_slot_moves() {
         cmd.arg("SETSLOT").arg(slot).arg(state).arg(&other.node.id);
         cmd
     };
+    let migration = Migration {
+        slot,
+        source: source.url(),
+        target: target.url(),
+        keys: [keys.meta(), keys.log(), keys.producers()],
+    };
     target.run(&set_slot("IMPORTING", source)).await;
     source.run(&set_slot("MIGRATING", target)).await;
     let mut migrate = redis::cmd("MIGRATE");
@@ -483,23 +533,7 @@ async fn the_documented_commands_serve_a_cluster_while_a_slot_moves() {
         .await
         .map(|_| ());
 
-    // The Stream's keys are only on the target, so deleting them there undoes the migration. A
-    // failed delete must not leave the slot migrating.
-    let mut drop_keys = redis::pipe();
-    for key in [keys.meta(), keys.log(), keys.producers()] {
-        drop_keys
-            .cmd("ASKING")
-            .ignore()
-            .cmd("DEL")
-            .arg(key)
-            .ignore();
-    }
-    let dropped: redis::RedisResult<()> =
-        drop_keys.query_async(&mut admin(&target.url()).await).await;
-    for node in [target, source] {
-        node.run(redis::cmd("CLUSTER").arg("SETSLOT").arg(slot).arg("STABLE"))
-            .await;
-    }
+    drop(migration);
     for name in [&producer_name, &reader_name] {
         let _: () = redis::cmd("ACL")
             .arg("DELUSER")
@@ -508,8 +542,6 @@ async fn the_documented_commands_serve_a_cluster_while_a_slot_moves() {
             .await
             .unwrap();
     }
-    dropped.unwrap();
-
     let appended = appended.unwrap().offsets.unwrap();
     let (state, entries) = read.unwrap();
     assert_eq!((state.newest, entries.len()), (appended.1, 2));

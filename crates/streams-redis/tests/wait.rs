@@ -92,26 +92,39 @@ async fn cluster_replicas(url: &str) -> Vec<String> {
     urls
 }
 
-/// Stops each replica from applying the primary's writes, until [resume] or 5 s.
-async fn pause(replicas: &[String]) {
+/// Stops each replica from applying the primary's writes until the guard drops. The pause has a
+/// long bound, so it can't end before the case does.
+async fn pause(replicas: &[String]) -> Paused {
     for replica in replicas {
         let _: () = redis::cmd("CLIENT")
             .arg("PAUSE")
-            .arg(5000)
+            .arg(600_000)
             .arg("WRITE")
             .query_async(&mut admin(replica).await)
             .await
             .unwrap();
     }
+    Paused(replicas.to_vec())
 }
 
-async fn resume(replicas: &[String]) {
-    for replica in replicas {
-        let _: () = redis::cmd("CLIENT")
-            .arg("UNPAUSE")
-            .query_async(&mut admin(replica).await)
-            .await
-            .unwrap();
+/// Paused replicas. The drop unpauses them, also when the case panics, so the next case finds them
+/// live.
+struct Paused(Vec<String>);
+
+impl Drop for Paused {
+    fn drop(&mut self) {
+        // A drop can't wait on a future, so it uses blocking connections.
+        let unpause = |replica: &str| -> redis::RedisResult<()> {
+            let mut conn = redis::Client::open(replica)?.get_connection()?;
+            redis::cmd("CLIENT").arg("UNPAUSE").query(&mut conn)
+        };
+        let unpaused: Vec<_> = self.0.iter().map(|replica| unpause(replica)).collect();
+        // A second panic would abort the test binary, so the drop checks only on a clean path.
+        if !std::thread::panicking() {
+            for unpaused in unpaused {
+                unpaused.unwrap();
+            }
+        }
     }
 }
 
@@ -230,10 +243,10 @@ async fn a_cluster_write_waits_for_the_replica_of_its_own_primary() {
                 .await
         }
     };
-    let paused = store(&cluster_at(&url), wait_for(1, SHORT)).await;
-    pause(&replicas).await;
-    let refused = create(paused, "paused").await;
-    resume(&replicas).await;
+    let short = store(&cluster_at(&url), wait_for(1, SHORT)).await;
+    let paused = pause(&replicas).await;
+    let refused = create(short, "paused").await;
+    drop(paused);
     assert_eq!(refused.unwrap_err().reason, Reason::Storage);
     let acked = create(store(&cluster_at(&url), wait_for(1, LONG)).await, "acked").await;
     assert_eq!(acked.unwrap().outcome, CreateOutcome::Created);
@@ -282,7 +295,7 @@ async fn a_call_that_finds_its_write_waits_for_the_replicas() {
         .create(&namespace, &handle, None, Owner::Client, &none())
         .await
         .unwrap();
-    pause(&replicas).await;
+    let paused = pause(&replicas).await;
     plain.append(&namespace, &handle, &batch).await.unwrap();
     let resent = waits[0]
         .append(&namespace, &handle, &batch)
@@ -304,7 +317,7 @@ async fn a_call_that_finds_its_write_waits_for_the_replicas() {
         .create(&namespace, &other, None, Owner::Client, &none())
         .await
         .map(|_| ());
-    resume(&replicas).await;
+    drop(paused);
     for result in [resent, closed, found] {
         assert_eq!(result.unwrap_err().reason, Reason::Storage);
     }

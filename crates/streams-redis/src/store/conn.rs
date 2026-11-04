@@ -1071,9 +1071,11 @@ mod tests {
         tokio::time::pause();
         let start = Instant::now();
         assert!(!pool.wait_after("s", "0-0", deadline()).await.unwrap());
+        // The paused clock moves only to the read's give-up, which the timer rounds up to the
+        // next ms.
         let waited = start.elapsed();
         assert!(
-            waited >= PERMIT_WAIT && waited < Duration::from_secs(10),
+            (PERMIT_WAIT..=PERMIT_WAIT + Duration::from_millis(1)).contains(&waited),
             "{waited:?}"
         );
     }
