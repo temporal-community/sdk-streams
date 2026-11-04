@@ -574,6 +574,9 @@ async fn check_server(shared: &SharedConnection) -> RedisStoreResult<()> {
         }
         Err(error) => return Err(error.into()),
     }
+    if let SharedConnection::Single(_) = shared {
+        check_not_cluster(shared).await?;
+    }
     let mut policy = redis::cmd("CONFIG");
     policy.arg("GET").arg("maxmemory-policy");
     match shared.on_each_primary(policy).await {
@@ -597,6 +600,23 @@ async fn check_server(shared: &SharedConnection) -> RedisStoreResult<()> {
         ),
     }
     Ok(())
+}
+
+/// Refuses a cluster node for a standalone Store. Its keys of other slots would answer with
+/// redirects on each call.
+async fn check_not_cluster(shared: &SharedConnection) -> RedisStoreResult<()> {
+    let reply: RedisResult<String> = redis::cmd("INFO")
+        .arg("cluster")
+        .query_async(&mut shared.clone())
+        .await;
+    match reply {
+        Ok(info) if info.lines().any(|line| line.trim() == "cluster_enabled:1") => Err(
+            RedisStoreError::invalid("The server is a Redis Cluster node, so set `cluster`"),
+        ),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::Server(ServerErrorKind::NoPerm) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn check_version(node: &str, info: &str) -> RedisStoreResult<()> {
