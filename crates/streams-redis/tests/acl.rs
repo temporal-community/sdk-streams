@@ -10,12 +10,12 @@ use temporalio_common::protos::temporal::api::common::v1::Payload;
 use temporalio_streams::{
     Reason,
     digest::batch_digest,
-    ids::{StreamKeys, client_producer_id},
+    ids::{StreamKeys, client_producer_id, local_activity_producer_id},
     proto::{
         AppendRecord, Producer, ProducerEpoch, StreamData, StreamHandle, StreamProducerKind,
-        StreamRecord, stream_record::Item,
+        StreamRecord, WorkflowTaskEpoch, stream_record::Item,
     },
-    store::{Batch, Owner, Store, Withdrawal},
+    store::{Batch, Owner, Store, TaskFacts, Withdrawal},
 };
 use temporalio_streams_redis::{
     RedisStore, RedisStoreError, RedisStoreOptions, WaitOptions,
@@ -126,6 +126,34 @@ fn client_named(process: &str) -> Producer {
     }
 }
 
+/// The Workflow Task of a run that starts at the event `started`.
+fn task(started: i64) -> WorkflowTaskEpoch {
+    WorkflowTaskEpoch {
+        started_event_id: started,
+        attempt: 1,
+        started_time: Some(prost_types::Timestamp {
+            seconds: started,
+            nanos: 0,
+        }),
+    }
+}
+
+/// A Local Activity of the run `run`, dispatched by `task`.
+fn local_activity(run: &str, task: &WorkflowTaskEpoch) -> Producer {
+    Producer {
+        kind: StreamProducerKind::LocalActivity as i32,
+        id: local_activity_producer_id(run, &format!("call-{}", task.started_event_id)),
+        epoch: Some(ProducerEpoch {
+            task_started_event_id: task.started_event_id,
+            task_attempt: task.attempt,
+            task_started_time: task.started_time,
+            attempt: 1,
+            ..Default::default()
+        }),
+        run_id: run.to_string(),
+    }
+}
+
 #[tokio::test]
 #[ignore = "needs Redis"]
 async fn the_documented_commands_run_every_call_of_each_role() {
@@ -207,6 +235,59 @@ async fn the_documented_commands_run_every_call_of_each_role() {
         .close(&namespace, &handle, &client(), b"")
         .await
         .unwrap();
+
+    // An orphan append and a retry run's create run with the Producer's commands too.
+    let retry = StreamHandle {
+        id: "retry".to_string(),
+        ..Default::default()
+    };
+    producer
+        .create(
+            &namespace,
+            &retry,
+            None,
+            Owner::Client,
+            &Withdrawal::default(),
+        )
+        .await
+        .unwrap();
+    let la_append = |task: &WorkflowTaskEpoch, completed, failed: &'static [i64]| {
+        let (producer, namespace, retry) = (&producer, &namespace, &retry);
+        let (records, digest) = (&stored, digest.clone());
+        let la = local_activity("r0", task);
+        async move {
+            let facts = TaskFacts {
+                completed,
+                failed_tasks: failed,
+                superseded: b"facts",
+            };
+            let batch = Batch {
+                producer: &la,
+                sequence: 1,
+                records,
+                digest: &digest,
+                withdrawal: Withdrawal {
+                    tasks: Some(facts),
+                    ..Withdrawal::default()
+                },
+            };
+            producer.append(namespace, retry, &batch).await.unwrap()
+        }
+    };
+    let (failed, completed, next) = (task(3), task(5), task(7));
+    la_append(&failed, None, &[]).await;
+    let orphan = la_append(&next, Some(&completed), &[3]).await;
+    assert!(orphan.flagged);
+    let withdrawn = Withdrawal {
+        withdraw_run: "r0",
+        superseded: b"run",
+        tasks: None,
+    };
+    let created = producer
+        .create(&namespace, &retry, None, Owner::Client, &withdrawn)
+        .await
+        .unwrap();
+    assert!(created.flagged);
 
     // An append after the Retention trims the old Records and prunes the old Producers. The
     // scripts read the server's `TIME`, so the case must wait for that clock.
