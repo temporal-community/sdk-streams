@@ -1,10 +1,11 @@
 //! The log keeps the Producer of a batch once, on its first data entry. The Store takes it off
 //! each data Record before the append and puts it back on each one after a read.
 
-use super::{bad_reply, text};
+use super::bad_reply;
 use crate::RedisStoreResult;
 use prost::Message;
-use redis::Value;
+use redis::{FromRedisValue, ParsingError, Value};
+use std::{collections::HashMap, fmt, str::FromStr};
 use temporalio_streams::{
     offset::offset_of_entry_id,
     proto::{Producer, StreamRecord, stream_record::Item},
@@ -25,79 +26,121 @@ pub(super) fn without_producer(record: &[u8], producer: &Producer) -> Vec<u8> {
     }
 }
 
+/// The id of a log entry, `<ms>-<seq>`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct EntryId {
+    ms: u64,
+    seq: u64,
+}
+
+impl FromStr for EntryId {
+    type Err = ParsingError;
+
+    fn from_str(id: &str) -> Result<Self, ParsingError> {
+        let bad = || ParsingError::from(format!("{id:?} isn't an entry id"));
+        let (ms, seq) = id.split_once('-').ok_or_else(bad)?;
+        Ok(Self {
+            ms: ms.parse().map_err(|_| bad())?,
+            seq: seq.parse().map_err(|_| bad())?,
+        })
+    }
+}
+
+impl fmt::Display for EntryId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}-{}", self.ms, self.seq)
+    }
+}
+
+/// What a log entry holds. Each data Record has a place in its batch, since the log keeps the
+/// batch's Producer only on the first one.
+#[derive(Debug, PartialEq)]
+pub(super) enum Body {
+    /// A Record that the log keeps whole, such as a close Record, or no Record.
+    Whole(Option<Vec<u8>>),
+    /// The first data Record of a batch, with the batch's Producer.
+    First { record: Vec<u8>, producer: Producer },
+    /// A later data Record of a batch, with the id of the batch's first entry.
+    Later { record: Vec<u8>, first: EntryId },
+}
+
 /// One log entry as Redis keeps it.
+#[derive(Debug, PartialEq)]
 pub(super) struct LogEntry {
-    pub(super) id: String,
-    record: Option<Vec<u8>>,
+    pub(super) offset: i64,
+    pub(super) body: Body,
     superseded: Option<Vec<u8>>,
-    /// The encoded Producer of the batch, on its first data entry.
-    producer: Option<Vec<u8>>,
-    /// The seq of the batch's first entry, on each later data entry.
-    pub(super) batch_start: Option<String>,
 }
 
 impl LogEntry {
-    pub(super) fn parse(value: Value) -> RedisStoreResult<Self> {
-        let Value::Array(pair) = value else {
-            return Err(bad_reply("read", value));
-        };
-        let [id, Value::Array(fields)] =
-            <[Value; 2]>::try_from(pair).map_err(|pair| bad_reply("read", pair))?
-        else {
-            return Err(bad_reply("read", "an entry with no field array"));
-        };
-        let mut entry = Self {
-            id: text(&id).ok_or_else(|| bad_reply("read", &id))?,
-            record: None,
-            superseded: None,
-            producer: None,
-            batch_start: None,
-        };
-        for pair in fields.chunks(2) {
-            let (Some(Value::BulkString(name)), Some(Value::BulkString(value))) =
-                (pair.first(), pair.get(1))
-            else {
-                continue;
-            };
-            match name.as_slice() {
-                b"r" => entry.record = Some(value.clone()),
-                b"s" => entry.superseded = Some(value.clone()),
-                b"p" => entry.producer = Some(value.clone()),
-                b"b" => entry.batch_start = String::from_utf8(value.clone()).ok(),
-                _ => {}
-            }
+    /// The batch's Producer, when this is the batch's first data entry.
+    pub(super) fn producer(self) -> Option<Producer> {
+        match self.body {
+            Body::First { producer, .. } => Some(producer),
+            Body::Whole(_) | Body::Later { .. } => None,
         }
-        Ok(entry)
     }
+}
 
-    /// The encoded Producer of the batch, when this is the batch's first data entry.
-    pub(super) fn producer(&self) -> Option<&[u8]> {
-        self.producer.as_deref()
+/// An entry of an `XRANGE` reply, `[id, [field, value, ...]]`. `docs/redis.md` has the fields.
+impl FromRedisValue for LogEntry {
+    fn from_redis_value(value: Value) -> Result<Self, ParsingError> {
+        let (text, mut fields): (String, HashMap<String, Vec<u8>>) =
+            FromRedisValue::from_redis_value(value)?;
+        let id: EntryId = text.parse()?;
+        let offset = offset_of_entry_id(&text).map_err(|error| error.to_string())?;
+        let record = fields.remove("r");
+        let body = match (record, fields.remove("p"), fields.remove("b")) {
+            (record, None, None) => Body::Whole(record),
+            (Some(record), Some(producer), None) => Body::First {
+                record,
+                producer: Producer::decode(producer.as_slice())
+                    .map_err(|error| format!("{id} has a bad Producer: {error}"))?,
+            },
+            (Some(record), None, Some(seq)) => Body::Later {
+                record,
+                first: EntryId {
+                    seq: String::from_utf8(seq)?
+                        .parse()
+                        .map_err(|_| format!("{id} has a bad batch start"))?,
+                    ..id
+                },
+            },
+            _ => return Err(format!("{id} has batch fields that don't fit together").into()),
+        };
+        Ok(Self {
+            offset,
+            body,
+            superseded: fields.remove("s"),
+        })
     }
 }
 
 /// The entries, oldest first, with the batch's Producer on each data Record. `earlier` is the
-/// encoded Producer of the first entry's batch, when that batch starts before the first entry.
+/// Producer of the first entry's batch, when that batch starts before the first entry.
 pub(super) fn with_producers(
     entries: Vec<LogEntry>,
-    earlier: Option<&[u8]>,
+    earlier: Option<Producer>,
 ) -> RedisStoreResult<Vec<Entry>> {
-    let decode = |bytes: &[u8]| Producer::decode(bytes).map_err(|error| bad_reply("read", error));
-    let mut producer = earlier.map(decode).transpose()?;
+    let mut producer = earlier;
     entries
         .into_iter()
         .map(|entry| {
-            if let Some(bytes) = &entry.producer {
-                producer = Some(decode(bytes)?);
-            }
-            // A Record that the log keeps whole, such as a close Record, has neither field.
-            let split = entry.producer.is_some() || entry.batch_start.is_some();
-            let record = match entry.record {
-                Some(record) if split => Some(restored(&record, producer.as_ref())?),
-                other => other,
+            let record = match entry.body {
+                Body::Whole(record) => record,
+                Body::First {
+                    record,
+                    producer: first,
+                } => Some(restored(&record, producer.insert(first))?),
+                Body::Later { record, .. } => {
+                    let producer = producer
+                        .as_ref()
+                        .ok_or_else(|| bad_reply("read", "a Record with no Producer"))?;
+                    Some(restored(&record, producer)?)
+                }
             };
             Ok(Entry {
-                offset: offset_of_entry_id(&entry.id)?,
+                offset: entry.offset,
                 record,
                 superseded: entry.superseded,
             })
@@ -105,12 +148,11 @@ pub(super) fn with_producers(
         .collect()
 }
 
-fn restored(record: &[u8], producer: Option<&Producer>) -> RedisStoreResult<Vec<u8>> {
+fn restored(record: &[u8], producer: &Producer) -> RedisStoreResult<Vec<u8>> {
     let mut stored = StreamRecord::decode(record).map_err(|error| bad_reply("read", error))?;
     if let Some(Item::Data(data)) = &mut stored.item
         && data.producer.is_none()
     {
-        let producer = producer.ok_or_else(|| bad_reply("read", "a Record with no Producer"))?;
         data.producer = Some(producer.clone());
     }
     Ok(stored.encode_to_vec())
@@ -143,18 +185,11 @@ mod tests {
         .encode_to_vec()
     }
 
-    fn entry(
-        seq: u32,
-        record: Vec<u8>,
-        producer: Option<&Producer>,
-        start: Option<u32>,
-    ) -> LogEntry {
+    fn entry(seq: i64, body: Body) -> LogEntry {
         LogEntry {
-            id: format!("1-{seq}"),
-            record: Some(record),
+            offset: seq,
+            body,
             superseded: None,
-            producer: producer.map(Message::encode_to_vec),
-            batch_start: start.map(|start| start.to_string()),
         }
     }
 
@@ -168,15 +203,24 @@ mod tests {
             without_producer(&data(Some(b.clone())), &a),
             data(Some(b.clone()))
         );
+        let later = |record| Body::Later {
+            record,
+            first: EntryId { ms: 1, seq: 0 },
+        };
         let entries = vec![
-            entry(1, bare.clone(), None, Some(0)),
-            entry(2, data(None), Some(&b), None),
-            entry(3, data(None), None, Some(2)),
-            // A whole Record, as an older writer or a close keeps it.
-            entry(4, data(Some(a.clone())), None, None),
+            entry(1, later(bare.clone())),
+            entry(
+                2,
+                Body::First {
+                    record: data(None),
+                    producer: b.clone(),
+                },
+            ),
+            entry(3, later(data(None))),
+            // A whole Record, as a close keeps it.
+            entry(4, Body::Whole(Some(data(Some(a.clone()))))),
         ];
-        let earlier = a.encode_to_vec();
-        let records: Vec<_> = with_producers(entries, Some(&earlier))
+        let records: Vec<_> = with_producers(entries, Some(a.clone()))
             .unwrap()
             .into_iter()
             .map(|entry| entry.record.unwrap())
@@ -190,5 +234,45 @@ mod tests {
                 data(Some(a))
             ]
         );
+    }
+
+    #[test]
+    fn an_entry_reply_gives_its_place_in_the_batch() {
+        let reply = |fields: &[(&str, &[u8])]| {
+            let fields = fields
+                .iter()
+                .flat_map(|(name, value)| {
+                    [
+                        Value::BulkString(name.as_bytes().to_vec()),
+                        Value::BulkString(value.to_vec()),
+                    ]
+                })
+                .collect();
+            LogEntry::from_redis_value(Value::Array(vec![
+                Value::BulkString(b"7-3".to_vec()),
+                Value::Array(fields),
+            ]))
+        };
+        let encoded = producer("a").encode_to_vec();
+        assert_eq!(
+            reply(&[("r", b"x"), ("b", b"1")]).unwrap().body,
+            Body::Later {
+                record: b"x".to_vec(),
+                first: EntryId { ms: 7, seq: 1 },
+            }
+        );
+        assert_eq!(
+            reply(&[("r", b"x"), ("p", &encoded)]).unwrap().producer(),
+            Some(producer("a"))
+        );
+        assert_eq!(reply(&[("s", b"y")]).unwrap().body, Body::Whole(None));
+        // A data entry has a Record and one place in its batch, and a batch start is a number.
+        for fields in [
+            &[("r", b"x".as_slice()), ("p", &encoded), ("b", b"1")][..],
+            &[("p", &encoded)],
+            &[("r", b"x"), ("b", b"one")],
+        ] {
+            assert!(reply(fields).is_err(), "{fields:?}");
+        }
     }
 }
