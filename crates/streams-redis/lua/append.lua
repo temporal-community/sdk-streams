@@ -16,8 +16,9 @@ local safety, tombstone = tonumber(ARGV[9]), tonumber(ARGV[10])
 local task, completed, failed, task_superseded = ARGV[11], ARGV[12], ARGV[13], ARGV[14]
 local digest, wait, encoded_producer = ARGV[15], ARGV[16], ARGV[17]
 local records = #ARGV - 17
+local tracked = kind == '2' and run ~= ''
 -- Only a Local Activity write with its run's task facts tells which tasks of the run completed.
-local orphans = kind == '2' and completed ~= '-' and run ~= ''
+local facts = tracked and completed ~= '-'
 local open_field, gone_prefix = 'oa|' .. run, 'ow|' .. run .. '|'
 
 -- The script reads the dedupe entry and writes the batch in one step, so no other batch takes the
@@ -35,9 +36,12 @@ end
 if not string.match(sequence_text, '^[1-9]%d*$') or sequence > 9007199254740991 then
   return refuse('INVALID', 'the sequence must be from 1 to 2^53 - 1')
 end
-if orphans then
-  if not task_key(task) or (completed ~= '' and not task_key(completed)) then
-    return refuse('INVALID', 'the task and the completed task must be task keys')
+if tracked and not task_key(task) then
+  return refuse('INVALID', 'the task must be a task key')
+end
+if facts then
+  if completed ~= '' and not task_key(completed) then
+    return refuse('INVALID', 'the completed task must be a task key')
   end
   for _, id in ipairs(words(failed)) do
     if not string.match(id, '^%-?%d+$') then
@@ -82,7 +86,7 @@ local newest = redis.call('HGET', meta, 'e' .. suffix)
 if newest and epoch < newest then
   return refuse('FENCED', 'the epoch is lower than the newest one of the Producer')
 end
-if kind == '2' and run ~= '' and redis.call('HGET', meta, gone_prefix .. task) then
+if tracked and redis.call('HGET', meta, gone_prefix .. task) then
   return refuse('FENCED', 'a Superseded item withdrew the Workflow Task of the call')
 end
 
@@ -97,9 +101,11 @@ local holds = redis.call('HGET', meta, 'h' .. suffix)
 local newer = kind ~= '4' and holds ~= false and holds < epoch
 local flagged = newer
 local withdrawn, open = {}, {}
-if orphans then
-  withdrawn, open = orphan_tasks(words(redis.call('HGET', meta, open_field)), task, completed,
-    failed)
+if tracked then
+  open = words(redis.call('HGET', meta, open_field))
+end
+if facts then
+  withdrawn, open = orphan_tasks(open, task, completed, failed)
 end
 
 -- `prune` reads `:producers` first, so a key of another type there fails before any write.
@@ -157,14 +163,19 @@ end
 if run ~= '' and records > 0 and not redis.call('HGET', meta, 'run|' .. run) then
   redis.call('HSET', meta, 'run|' .. run, '1')
 end
-if orphans then
-  if records > 0 and not contains(open, task) then
+if tracked then
+  -- A write with no task facts, as from an older Core, goes in `oa` too, so that a later write's
+  -- facts can withdraw it.
+  local added = records > 0 and not contains(open, task)
+  if added then
     table.insert(open, task)
   end
-  if #open > 0 then
-    redis.call('HSET', meta, open_field, table.concat(open, ' '))
-  else
-    redis.call('HDEL', meta, open_field)
+  if facts or added then
+    if #open > 0 then
+      redis.call('HSET', meta, open_field, table.concat(open, ' '))
+    else
+      redis.call('HDEL', meta, open_field)
+    end
   end
   -- One field per task, so the fence reads one field and a withdrawal writes only its new tasks.
   for _, key in ipairs(withdrawn) do

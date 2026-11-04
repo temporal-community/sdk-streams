@@ -164,7 +164,7 @@ local function started(key)
 end
 
 -- The lowercase form of `task_key` in `temporalio-streams`, since keys compare as bytes. A script
--- refuses task facts of another form before its first write, since `orphan_tasks` raises on them.
+-- refuses task keys of another form before its first write, since `orphan_tasks` raises on them.
 local HEX = '[0-9a-f]'
 local TASK_KEY = '^' .. string.rep(HEX, 16) .. '%.' .. string.rep(HEX, 8) .. '%.' ..
   string.rep(HEX, 16) .. '%.' .. string.rep(HEX, 8) .. '$'

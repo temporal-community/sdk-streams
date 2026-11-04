@@ -73,10 +73,10 @@ and failed tasks. Then the append withdraws the run's tasks in `oa` that never c
   the lower attempts of the batch's task and of the completed task.
 - One entry with only `s` withdraws them. Its `StreamSuperseded` is of the Workflow kind, with the
   run's Workflow Producer, the batch's task, and the completed and failed tasks.
-- The append then drops the tasks at or before the completed task from `oa`, and adds the batch's
-  task when the batch has Records.
+- The append then drops the tasks at or before the completed task from `oa`.
+- Each Local Activity batch with Records adds its task to `oa`, also a batch with no task facts.
 - Each `ow|<run>|<task key>` fences a late write of that task.
-- A batch with no `previous_completed_task` skips the rule.
+- A batch with no task facts skips the rule.
 
 ## Retry runs
 
@@ -154,8 +154,6 @@ these lists on a standalone server and on a cluster.
   resolves fails. Only a later run of the same call withdraws them.
 - `ow` fences only the tasks that an orphan item withdrew. So when a failed task's Local Activity
   writes its first Record after another write gave the task as failed, that Record stays.
-- A Local Activity write with no task facts, as from an older Core, isn't in `oa`, so no later
-  orphan item withdraws its Records.
 - A retry run withdraws only its previous run. If that run never wrote, older runs keep their
   Records, since the Store can't tell a retry attempt from a continue-as-new run.
 - A run that closes its Stream and then fails under a retry policy leaves it closed, so each retry
