@@ -6,7 +6,7 @@ mod records;
 mod scripts;
 
 use crate::{KeyPrefix, RedisStoreError, RedisStoreOptions, RedisStoreResult};
-use conn::{BlockingPool, Endpoint, SharedConnection, WaitPool};
+use conn::{BlockingPool, Endpoint, Lease, Leased, SharedConnection, WaitPool};
 use prost::Message;
 use records::{LogEntry, with_producers, without_producer};
 use redis::{Cmd, ErrorKind, RedisResult, Script, ServerErrorKind, Value};
@@ -96,10 +96,15 @@ impl RedisStore {
                 .await
                 .map_err(RedisStoreError::from);
         };
-        let Some(mut lease) = wait.pool.take().await? else {
-            return Err(RedisStoreError::storage(
-                "Every connection for writes with WAIT stayed busy for the response timeout",
-            ));
+        let mut lease = match wait.pool.take().await? {
+            Leased::Busy => {
+                return Err(RedisStoreError::storage(
+                    "Every connection for writes with WAIT stayed busy for the response timeout",
+                ));
+            }
+            // A write runs once, since the server may have run it before its connection closed.
+            Leased::Idle(lease) => Lease::from(lease),
+            Leased::New(lease) => lease,
         };
         let reply = Self::write_and_wait(wait, script, cmd, lease.conn()).await;
         lease.settle(reply)?

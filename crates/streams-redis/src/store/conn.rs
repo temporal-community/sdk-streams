@@ -1,6 +1,7 @@
 //! The connections of the Redis Store. A blocked `XREAD` or `WAIT` stops all later commands on its
 //! connection, so each one gets a dedicated connection, and the short calls share one.
 
+use parking_lot::Mutex;
 use redis::{
     AsyncConnectionConfig, Client, Cmd, ConnectionAddr, ConnectionInfo, ErrorKind,
     IntoConnectionInfo, Pipeline, RedisError, RedisFuture, RedisResult, ServerErrorKind, Value,
@@ -10,16 +11,9 @@ use redis::{
     cluster_routing::{MultipleNodeRoutingInfo, RoutingInfo},
 };
 use std::{
-    collections::HashMap,
-    future::Future,
-    num::NonZeroUsize,
-    ops::RangeInclusive,
-    path::PathBuf,
-    str::FromStr,
-    sync::Arc,
-    time::Duration,
+    collections::HashMap, future::Future, num::NonZeroUsize, ops::RangeInclusive, path::PathBuf,
+    str::FromStr, sync::Arc, time::Duration,
 };
-use parking_lot::Mutex;
 use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore},
     time::Instant,
@@ -224,6 +218,16 @@ struct Pool<C> {
     idle: Arc<Mutex<Vec<C>>>,
 }
 
+/// What [Pool::lease] gives.
+pub(crate) enum Leased<C> {
+    /// A connection that was idle in the pool.
+    Idle(IdleLease<C>),
+    /// A connection that the pool opened for this lease.
+    New(Lease<C>),
+    /// Every connection stayed busy until the caller gave up.
+    Busy,
+}
+
 impl<C> Pool<C> {
     fn new(size: NonZeroUsize, idle: Vec<C>) -> Self {
         Self {
@@ -232,13 +236,13 @@ impl<C> Pool<C> {
         }
     }
 
-    /// Takes an idle connection, or opens one. Returns `None` if `give_up` ends first, so the
-    /// caller sets the wait and the pool reads no clock.
+    /// Takes an idle connection, or opens one. The caller's `give_up` ends the wait for a free
+    /// connection, so the pool reads no clock.
     async fn lease<F>(
         &self,
         give_up: impl Future<Output = ()>,
         open: impl FnOnce() -> F,
-    ) -> RedisResult<Option<Lease<C>>>
+    ) -> RedisResult<Leased<C>>
     where
         F: Future<Output = RedisResult<C>>,
     {
@@ -246,61 +250,104 @@ impl<C> Pool<C> {
             // Take a free connection even when `give_up` is also ready.
             biased;
             permit = self.permits.clone().acquire_owned() => permit,
-            () = give_up => return Ok(None),
+            () = give_up => return Ok(Leased::Busy),
         };
-        let Ok(permit) = permit else {
-            return Ok(None);
-        };
-        let idle = self.idle.lock().pop();
-        let reused = idle.is_some();
-        let conn = match idle {
-            Some(conn) => conn,
-            None => open().await?,
-        };
-        Ok(Some(Lease {
-            conn,
-            reused,
+        // Nothing closes the semaphore, so a failed acquire is a bug, not a busy pool.
+        let permit = permit
+            .map_err(|_| RedisError::from((ErrorKind::Client, "the connection pool is closed")))?;
+        let permit = Permit {
             idle: self.idle.clone(),
             _permit: permit,
-        }))
+        };
+        let idle = self.idle.lock().pop();
+        Ok(match idle {
+            Some(conn) => Leased::Idle(IdleLease(Held { conn, permit })),
+            None => Leased::New(permit.open(open()).await?),
+        })
     }
 }
 
-/// A connection from a [Pool]. A dropped call doesn't stop its command on the server, and the next
-/// call would wait behind it. So a drop closes the connection, and only [Lease::settle] returns it.
-pub(crate) struct Lease<C> {
-    conn: C,
-    /// Taken idle from the pool, so the server may have closed it since its last call.
-    reused: bool,
+/// The right to one connection of a [Pool], with the idle list that the connection goes back to.
+pub(crate) struct Permit<C> {
     idle: Arc<Mutex<Vec<C>>>,
     _permit: OwnedSemaphorePermit,
 }
 
+impl<C> Permit<C> {
+    /// Opens a new connection with this permit.
+    pub(crate) async fn open(
+        self,
+        open: impl Future<Output = RedisResult<C>>,
+    ) -> RedisResult<Lease<C>> {
+        Ok(Lease(Held {
+            conn: open.await?,
+            permit: self,
+        }))
+    }
+}
+
+/// A connection and its permit.
+struct Held<C> {
+    conn: C,
+    permit: Permit<C>,
+}
+
+/// A connection from a [Pool]. A dropped call doesn't stop its command on the server, and the next
+/// call would wait behind it. So a drop closes the connection, and only [Lease::settle] returns it.
+pub(crate) struct Lease<C>(Held<C>);
+
 impl<C> Lease<C> {
     pub(crate) fn conn(&mut self) -> &mut C {
-        &mut self.conn
+        &mut self.0.conn
     }
 
     /// Returns the connection to the pool after a whole reply, which is an answer or a server
     /// error. A wire error closes it.
     pub(crate) fn settle<T>(self, result: RedisResult<T>) -> RedisResult<T> {
-        let Lease {
-            conn,
-            reused,
-            idle,
-            _permit,
-        } = self;
-        match &result {
-            Err(error) if error.code().is_none() => {
-                // A server restart also closed the other idle connections.
-                if reused && stale(error) {
-                    idle.lock().clear();
-                }
-            }
+        let Held { conn, permit } = self.0;
+        if !matches!(&result, Err(error) if error.code().is_none()) {
             // Push it back before the permit drops, so the next lease finds it.
-            _ => idle.lock().push(conn),
+            permit.idle.lock().push(conn);
         }
         result
+    }
+}
+
+/// A connection that was idle in a [Pool]. The server may have closed it since its last call, so
+/// its call can end with a permit for a new connection.
+pub(crate) struct IdleLease<C>(Held<C>);
+
+/// How a call on an [IdleLease] ended.
+pub(crate) enum Settled<T, C> {
+    /// The call's result, as [Lease::settle] gives it.
+    Done(RedisResult<T>),
+    /// The server closed the connection, and the other idle ones with it. The pool dropped them,
+    /// so the permit opens a new connection. That try tells a dead connection from a dead server.
+    Stale(Permit<C>),
+}
+
+impl<C> IdleLease<C> {
+    pub(crate) fn conn(&mut self) -> &mut C {
+        &mut self.0.conn
+    }
+
+    pub(crate) fn settle<T>(self, result: RedisResult<T>) -> Settled<T, C> {
+        match result {
+            Err(error) if stale(&error) => {
+                let Held { conn, permit } = self.0;
+                drop(conn);
+                permit.idle.lock().clear();
+                Settled::Stale(permit)
+            }
+            result => Settled::Done(Lease(self.0).settle(result)),
+        }
+    }
+}
+
+/// A caller that doesn't retry uses an idle connection as any other.
+impl<C> From<IdleLease<C>> for Lease<C> {
+    fn from(lease: IdleLease<C>) -> Self {
+        Lease(lease.0)
     }
 }
 
@@ -332,9 +379,9 @@ impl WaitPool {
         }
     }
 
-    /// Takes an idle connection, or opens one. Returns `None` when every connection stays busy
-    /// for the response timeout.
-    pub(crate) async fn take(&self) -> RedisResult<Option<Lease<SharedConnection>>> {
+    /// Takes an idle connection, or opens one. Gives [Leased::Busy] when every connection stays
+    /// busy for the response timeout.
+    pub(crate) async fn take(&self) -> RedisResult<Leased<SharedConnection>> {
         let give_up = tokio::time::sleep(self.endpoint.response_timeout);
         let open = || async {
             let live: Vec<Node> = match &self.cluster {
@@ -494,8 +541,6 @@ impl SlotCache {
 #[derive(Clone, Copy, Debug, Default)]
 struct Attempt {
     cluster: bool,
-    /// The connection came idle from the pool.
-    reused: bool,
     /// The read already used one redirect.
     redirected: bool,
 }
@@ -503,9 +548,6 @@ struct Attempt {
 /// What a blocking read does after a failed try.
 #[derive(Debug, PartialEq, Eq)]
 enum Step {
-    /// Try the node again. The pool closed its idle connections with the dead one, so the try
-    /// opens a new connection.
-    Retry,
     /// The node is down, so try the next seed.
     NextSeed,
     /// Try the node that the redirect gives.
@@ -518,11 +560,6 @@ enum Step {
 
 /// The retry policy of a blocking read. It has no I/O, so a table test covers it.
 fn classify(error: &RedisError, attempt: Attempt) -> Step {
-    // A server restart closes every idle connection. So a retry on a new connection tells a
-    // dead connection from a dead server.
-    if attempt.reused && stale(error) {
-        return Step::Retry;
-    }
     if unreachable(error) {
         return Step::NextSeed;
     }
@@ -551,6 +588,22 @@ pub(crate) struct BlockingPool {
 struct NodePool {
     info: ConnectionInfo,
     pool: Pool<MultiplexedConnection>,
+}
+
+impl NodePool {
+    /// Takes a connection. It waits for a free one up to [PERMIT_WAIT], or up to the deadline.
+    async fn lease(&self, deadline: Instant) -> RedisResult<Leased<MultiplexedConnection>> {
+        let give_up = tokio::time::sleep_until(deadline.min(Instant::now() + PERMIT_WAIT));
+        self.pool.lease(give_up, || self.open()).await
+    }
+
+    async fn open(&self) -> RedisResult<MultiplexedConnection> {
+        // The read bounds the wait itself, so the connection sets no response timeout.
+        let config = AsyncConnectionConfig::new().set_response_timeout(None);
+        Client::open(self.info.clone())?
+            .get_multiplexed_async_connection_with_config(&config)
+            .await
+    }
 }
 
 impl BlockingPool {
@@ -624,38 +677,11 @@ impl BlockingPool {
             if deadline <= Instant::now() {
                 return Ok(None);
             }
-            let error = match self.lease(&node, deadline).await {
-                Ok(None) => return Ok(None),
-                Ok(Some(mut lease)) => {
-                    attempt.reused = lease.reused;
-                    // The lease can wait up to [PERMIT_WAIT], so the block time comes from the
-                    // deadline.
-                    let wait = deadline.saturating_duration_since(Instant::now());
-                    let answer = tokio::time::timeout_at(
-                        deadline + self.endpoint.response_timeout,
-                        cmd(wait).query_async::<Value>(lease.conn()),
-                    )
-                    .await;
-                    // A server that stopped without a reset never replies, and the read must still
-                    // end. The lease then drops, which closes the connection.
-                    let Ok(result) = answer else {
-                        return Err(RedisError::from((
-                            ErrorKind::Io,
-                            "Redis did not answer a blocked read by its deadline",
-                        )));
-                    };
-                    match lease.settle(result) {
-                        Ok(value) => return Ok(Some(value)),
-                        Err(error) => error,
-                    }
-                }
-                Err(error) => {
-                    attempt.reused = false;
-                    error
-                }
+            let error = match self.try_node(&node, deadline, &cmd).await {
+                Ok(answer) => return Ok(answer),
+                Err(error) => error,
             };
             match classify(&error, attempt) {
-                Step::Retry => {}
                 Step::NextSeed => {
                     self.slots.forget(slot, &node);
                     if fallbacks.is_none() {
@@ -690,6 +716,54 @@ impl BlockingPool {
         }
     }
 
+    /// One try of the command on `node`. A connection from the idle list that the server closed
+    /// gets one more try on a new connection.
+    async fn try_node(
+        &self,
+        node: &Node,
+        deadline: Instant,
+        cmd: &impl Fn(Duration) -> Cmd,
+    ) -> RedisResult<Option<Value>> {
+        let node = self.node(node);
+        let mut lease = match node.lease(deadline).await? {
+            Leased::Busy => return Ok(None),
+            Leased::New(lease) => lease,
+            Leased::Idle(mut lease) => {
+                let answer = self.run(lease.conn(), deadline, cmd).await?;
+                match lease.settle(answer) {
+                    Settled::Done(answer) => return answer.map(Some),
+                    Settled::Stale(permit) => permit.open(node.open()).await?,
+                }
+            }
+        };
+        let answer = self.run(lease.conn(), deadline, cmd).await?;
+        lease.settle(answer).map(Some)
+    }
+
+    /// Runs the command that `cmd` builds for the time left to `deadline`. The outer error is a
+    /// read that Redis didn't answer in time. Then the lease drops, which closes the connection.
+    async fn run(
+        &self,
+        conn: &mut MultiplexedConnection,
+        deadline: Instant,
+        cmd: &impl Fn(Duration) -> Cmd,
+    ) -> RedisResult<RedisResult<Value>> {
+        // The lease can wait up to [PERMIT_WAIT], so the block time comes from the deadline.
+        let wait = deadline.saturating_duration_since(Instant::now());
+        // A server that stopped without a reset never replies, and the read must still end.
+        tokio::time::timeout_at(
+            deadline + self.endpoint.response_timeout,
+            cmd(wait).query_async::<Value>(conn),
+        )
+        .await
+        .map_err(|_| {
+            RedisError::from((
+                ErrorKind::Io,
+                "Redis did not answer a blocked read by its deadline",
+            ))
+        })
+    }
+
     /// The primary that serves `slot` now, as the shared connection of a cluster sees it.
     async fn live_primary(&self, slot: u16) -> Option<Node> {
         let primaries = primaries(self.cluster.as_ref()?).await;
@@ -700,25 +774,9 @@ impl BlockingPool {
         Some(node)
     }
 
-    async fn lease(
-        &self,
-        node: &Node,
-        deadline: Instant,
-    ) -> RedisResult<Option<Lease<MultiplexedConnection>>> {
-        let node = self.node(node);
-        let give_up = tokio::time::sleep_until(deadline.min(Instant::now() + PERMIT_WAIT));
-        let open = || async {
-            // The read bounds the wait itself, so the connection sets no response timeout.
-            let config = AsyncConnectionConfig::new().set_response_timeout(None);
-            Client::open(node.info.clone())?
-                .get_multiplexed_async_connection_with_config(&config)
-                .await
-        };
-        node.pool.lease(give_up, open).await
-    }
-
     fn node(&self, node: &Node) -> Arc<NodePool> {
-        self.nodes.lock()
+        self.nodes
+            .lock()
             .entry(node.clone())
             .or_insert_with(|| {
                 Arc::new(NodePool {
@@ -816,14 +874,9 @@ mod tests {
             cluster: true,
             ..Attempt::default()
         };
-        let reused = Attempt {
-            reused: true,
-            ..cluster
-        };
         let cases = [
-            // A reused connection that the server closed gets a retry on a new connection.
-            (io(std::io::ErrorKind::BrokenPipe), reused, Step::Retry),
-            // On a new connection, the same error means the node is down.
+            // The pool already tried a new connection, so a connection error means the node is
+            // down.
             (io(std::io::ErrorKind::BrokenPipe), cluster, Step::NextSeed),
             (
                 io(std::io::ErrorKind::ConnectionRefused),
@@ -938,7 +991,9 @@ mod tests {
         let first = SharedConnection::Cluster(cluster.clone());
         let waits = WaitPool::new(first, dead, Some(cluster));
         let (one, two) = tokio::join!(waits.take(), waits.take());
-        assert!(one.unwrap().is_some() && two.unwrap().is_some());
+        for leased in [one.unwrap(), two.unwrap()] {
+            assert!(!matches!(leased, Leased::Busy));
+        }
     }
 
     /// A port that nothing listens on.
@@ -972,11 +1027,11 @@ mod tests {
     async fn the_block_time_starts_when_the_read_has_a_connection() {
         let pool = BlockingPool::new(endpoint(&[&nil_server()], false), NonZeroUsize::MIN, None);
         let seed = pool.endpoint.first().node.clone();
-        let held = pool
-            .lease(&seed, Instant::now() + Duration::from_secs(1))
+        let held = new(pool
+            .node(&seed)
+            .lease(Instant::now() + Duration::from_secs(1))
             .await
-            .unwrap()
-            .unwrap();
+            .unwrap());
         tokio::time::pause();
         let deadline = Instant::now() + Duration::from_millis(500);
         let blocked = Mutex::new(None);
@@ -999,7 +1054,7 @@ mod tests {
         let pool = BlockingPool::new(endpoint(&[&nil_server()], false), NonZeroUsize::MIN, None);
         let seed = pool.endpoint.first().node.clone();
         let deadline = || Instant::now() + Duration::from_secs(10);
-        let _held = pool.lease(&seed, deadline()).await.unwrap().unwrap();
+        let _held = new(pool.node(&seed).lease(deadline()).await.unwrap());
         tokio::time::pause();
         let start = Instant::now();
         let answer = pool.query("s", deadline(), |_| redis::cmd("XREAD")).await;
@@ -1011,51 +1066,69 @@ mod tests {
         );
     }
 
-    async fn lease(pool: &Pool<u8>, open: u8) -> Lease<u8> {
+    async fn lease(pool: &Pool<u8>, open: u8) -> Leased<u8> {
         pool.lease(std::future::pending(), || async move { Ok(open) })
             .await
             .unwrap()
-            .unwrap()
+    }
+
+    fn new<C>(leased: Leased<C>) -> Lease<C> {
+        match leased {
+            Leased::New(lease) => lease,
+            _ => panic!("the pool had an idle connection"),
+        }
+    }
+
+    fn idle<C>(leased: Leased<C>) -> IdleLease<C> {
+        match leased {
+            Leased::Idle(lease) => lease,
+            _ => panic!("the pool had no idle connection"),
+        }
     }
 
     #[tokio::test]
     async fn a_lease_gives_its_connection_back_only_after_a_whole_reply() {
         let pool = Pool::new(NonZeroUsize::MIN, Vec::new());
         // A server error is a whole reply.
-        let first = lease(&pool, 1).await;
+        let first = new(lease(&pool, 1).await);
         assert!(first.settle::<()>(Err(reply("ERR no"))).is_err());
-        let again = lease(&pool, 2).await;
-        assert_eq!((again.conn, again.reused), (1, true));
-        assert!(again.settle(Ok(())).is_ok());
+        let mut again = idle(lease(&pool, 2).await);
+        assert_eq!(*again.conn(), 1);
+        assert!(matches!(again.settle(Ok(())), Settled::Done(Ok(()))));
         // After a wire error the connection closes.
-        let lost = lease(&pool, 3).await;
-        assert!(
-            lost.settle::<()>(Err(io(std::io::ErrorKind::TimedOut)))
-                .is_err()
-        );
-        let next = lease(&pool, 4).await;
-        assert_eq!((next.conn, next.reused), (4, false));
+        let lost = idle(lease(&pool, 3).await);
+        let timeout = io(std::io::ErrorKind::TimedOut);
+        assert!(matches!(
+            lost.settle::<()>(Err(timeout)),
+            Settled::Done(Err(_))
+        ));
+        let mut next = new(lease(&pool, 4).await);
+        assert_eq!(*next.conn(), 4);
         // A lease that drops, as a cancelled call does, closes its connection too.
         drop(next);
-        assert_eq!(lease(&pool, 5).await.conn, 5);
+        assert_eq!(*new(lease(&pool, 5).await).conn(), 5);
     }
 
     #[tokio::test]
-    async fn a_dead_reused_connection_closes_the_idle_ones_but_a_slow_one_does_not() {
+    async fn a_dead_idle_connection_closes_the_idle_ones_but_a_slow_one_does_not() {
         let pool = Pool::new(NonZeroUsize::new(3).unwrap(), vec![1, 2, 3]);
-        let slow = lease(&pool, 0).await;
-        assert!(
-            slow.settle::<()>(Err(io(std::io::ErrorKind::TimedOut)))
-                .is_err()
-        );
-        let dead = lease(&pool, 0).await;
-        assert_eq!((dead.conn, dead.reused), (2, true));
-        assert!(
-            dead.settle::<()>(Err(io(std::io::ErrorKind::BrokenPipe)))
-                .is_err()
-        );
-        let next = lease(&pool, 4).await;
-        assert_eq!((next.conn, next.reused), (4, false));
+        let slow = idle(lease(&pool, 0).await);
+        let timeout = io(std::io::ErrorKind::TimedOut);
+        assert!(matches!(
+            slow.settle::<()>(Err(timeout)),
+            Settled::Done(Err(_))
+        ));
+        let mut dead = idle(lease(&pool, 0).await);
+        assert_eq!(*dead.conn(), 2);
+        let Settled::Stale(permit) = dead.settle::<()>(Err(io(std::io::ErrorKind::BrokenPipe)))
+        else {
+            panic!("a dead idle connection gives its permit back");
+        };
+        let mut retry = permit.open(async { Ok(4) }).await.unwrap();
+        assert_eq!(*retry.conn(), 4);
+        // The pool dropped connection 1 with the dead one.
+        drop(retry);
+        assert_eq!(*new(lease(&pool, 5).await).conn(), 5);
     }
 
     #[tokio::test]
@@ -1064,8 +1137,9 @@ mod tests {
         let give_up = || std::future::ready(());
         let open = || async { Ok(1) };
         let held = pool.lease(give_up(), open).await.unwrap();
-        assert!(held.is_some());
-        assert!(pool.lease(give_up(), open).await.unwrap().is_none());
+        assert!(matches!(held, Leased::New(_)));
+        let busy = pool.lease(give_up(), open).await.unwrap();
+        assert!(matches!(busy, Leased::Busy));
     }
 
     #[test]
