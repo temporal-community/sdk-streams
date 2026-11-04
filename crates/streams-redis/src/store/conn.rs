@@ -366,7 +366,6 @@ async fn primaries(cluster: &ClusterConnection) -> Vec<(RangeInclusive<u16>, Nod
     reply.map(primaries_of).unwrap_or_default()
 }
 
-/// Parses a `CLUSTER SLOTS` reply.
 fn primaries_of(reply: Value) -> Vec<(RangeInclusive<u16>, Node)> {
     let Value::Array(ranges) = reply else {
         return Vec::new();

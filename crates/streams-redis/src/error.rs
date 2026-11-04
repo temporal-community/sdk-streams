@@ -62,8 +62,8 @@ fn from_redis(error: &RedisError) -> StreamError {
                 "Redis refused the call for good: NOPERM {detail}"
             ));
         }
-        // The Store follows redirects on a cluster, so one that reaches here is from a cluster
-        // node that the options give as one server.
+        // The cluster client handles redirects, so one that reaches here is from a cluster node
+        // that the options give as one server.
         ErrorKind::Server(ServerErrorKind::Moved) => {
             return StreamError::invalid(format!(
                 "A Redis Cluster node answered, so set `cluster`: MOVED {detail}"
