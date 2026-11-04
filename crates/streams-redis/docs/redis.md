@@ -45,7 +45,13 @@ never get the same sequence. Nothing dedupes such a batch, so its retry writes i
 
 ## Log entries
 
-- `r` is the encoded `StreamRecord`, with no offset.
+- `r` is the encoded `StreamRecord`, with no offset. A data Record has no Producer in it.
+- `p` is the encoded `Producer` of the batch, on the batch's first data entry. The Store sets it on
+  each data Record of the batch when it reads them.
+- `b` is the seq of the batch's first entry, on each later data entry, so a read that starts inside
+  a batch gets `p` with one lookup.
+- A batch's entries share one millisecond, and a trim drops whole milliseconds, so a batch keeps
+  its `p` entry for as long as it has any entry.
 - `s` is the encoded `StreamSuperseded` with the withdrawal facts, on the first entry of a batch
   that withdraws. A read builds the Superseded item from it. An entry can have only `s`.
 - An offset is the entry id `<ms>-<seq>`, packed as `ms << 20 | seq`.
