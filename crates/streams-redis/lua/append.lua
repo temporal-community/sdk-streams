@@ -3,7 +3,8 @@
 -- ARGV: format version, kind, Producer id, encoded run id, epoch key, sequence (0 takes the next
 -- one), encoded withdrawn run, Superseded facts, safety TTL ms, Tombstone ms, task key, completed
 -- task key (`-` when the write gives no task facts), failed task ids, task Superseded facts, the
--- batch digest, `1` when a `WAIT` runs after it, then one Record per argument.
+-- batch digest, `1` when a `WAIT` runs after it, the encoded Producer, then one Record with no
+-- Producer per argument.
 --
 -- Returns {'ok' or 'resend', first id, last id, '1' when flagged}.
 local meta, log, producers = KEYS[1], KEYS[2], KEYS[3]
@@ -13,8 +14,8 @@ local sequence = tonumber(sequence_text)
 local withdrawn_run, superseded = ARGV[7], ARGV[8]
 local safety, tombstone = tonumber(ARGV[9]), tonumber(ARGV[10])
 local task, completed, failed, task_superseded = ARGV[11], ARGV[12], ARGV[13], ARGV[14]
-local digest, wait = ARGV[15], ARGV[16]
-local records = #ARGV - 16
+local digest, wait, encoded_producer = ARGV[15], ARGV[16], ARGV[17]
+local records = #ARGV - 17
 -- Only a Local Activity write with its run's task facts tells which tasks of the run completed.
 local orphans = kind == '2' and completed ~= '-' and run ~= ''
 local open_field, gone_prefix = 'oa|' .. run, 'ow|' .. run .. '|'
@@ -120,10 +121,17 @@ if records == 0 and flagged then
     first_id = last_id
   end
 end
-for i = 17, #ARGV do
-  local fields = {'r', ARGV[i]}
-  if i == 17 and flagged then
-    fields = {'s', superseded, 'r', ARGV[i]}
+-- Only the batch's first Record keeps the Producer. Each later one keeps the seq of that first
+-- entry, so a read that starts inside the batch finds the Producer with one lookup.
+local first_seq = next_seq
+for i = 18, #ARGV do
+  local fields = {'r', ARGV[i], 'b', first_seq}
+  if i == 18 then
+    fields = {'r', ARGV[i], 'p', encoded_producer}
+    if flagged then
+      table.insert(fields, 1, 's')
+      table.insert(fields, 2, superseded)
+    end
   end
   last_id = add(log, fields)
   if first_id == '' then

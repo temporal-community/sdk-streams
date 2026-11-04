@@ -2,10 +2,13 @@
 //! close checks are atomic with the write. `docs/redis.md` has the layout of the stored data.
 
 mod conn;
+mod records;
 mod scripts;
 
 use crate::{KeyPrefix, RedisStoreError, RedisStoreOptions, RedisStoreResult};
 use conn::{BlockingPool, Endpoint, SharedConnection, WaitPool};
+use prost::Message;
+use records::{LogEntry, with_producers, without_producer};
 use redis::{Cmd, ErrorKind, RedisResult, Script, ServerErrorKind, Value};
 use std::{num::NonZeroUsize, sync::Arc, time::Duration};
 use temporalio_streams::{
@@ -102,7 +105,34 @@ impl RedisStore {
         lease.settle(reply)?
     }
 
-    /// Whether each write runs a `WAIT` after it. The write scripts take it as their last argument.
+    /// The encoded Producer of the batch of `entry`, when the batch starts before `entry`.
+    async fn batch_producer(
+        &self,
+        keys: &StreamKeys,
+        entry: &LogEntry,
+    ) -> RedisStoreResult<Option<Vec<u8>>> {
+        let (Some(start), Some((ms, _))) = (&entry.batch_start, entry.id.split_once('-')) else {
+            return Ok(None);
+        };
+        let id = format!("{ms}-{start}");
+        let reply: Value = redis::cmd("XRANGE")
+            .arg(keys.log())
+            .arg(&id)
+            .arg(&id)
+            .query_async(&mut self.shared.clone())
+            .await?;
+        let Value::Array(entries) = reply else {
+            return Err(bad_reply("read back", reply));
+        };
+        let first = entries
+            .into_iter()
+            .next()
+            .map(LogEntry::parse)
+            .transpose()?;
+        Ok(first.and_then(|first| first.producer().map(<[u8]>::to_vec)))
+    }
+
+    /// Whether each write runs a `WAIT` after it. Each write script takes it as an argument.
     fn waits(&self) -> bool {
         self.wait.is_some()
     }
@@ -216,9 +246,10 @@ impl Store for RedisStore {
             .arg(failed_list(withdrawal))
             .arg(withdrawal.tasks.map_or(&[][..], |tasks| tasks.superseded))
             .arg(batch.digest)
-            .arg(self.waits());
+            .arg(self.waits())
+            .arg(producer.encode_to_vec());
         for record in batch.records {
-            cmd.arg(record.as_slice());
+            cmd.arg(without_producer(record, producer));
         }
         let reply = self.write(&scripts::APPEND_SCRIPT, &cmd).await?;
         let [outcome, first, last, flag] = strings::<4>(reply, "append")?;
@@ -322,10 +353,19 @@ impl Store for RedisStore {
         let Value::Array(entries) = reply else {
             return Err(bad_reply("read back", reply).into());
         };
-        Ok(entries
+        let mut entries = entries
             .into_iter()
-            .map(entry)
-            .collect::<RedisStoreResult<_>>()?)
+            .map(LogEntry::parse)
+            .collect::<RedisStoreResult<Vec<_>>>()?;
+        entries.reverse();
+        // The oldest entry's batch can start below the page, so its Producer comes from there.
+        let earlier = match entries.first() {
+            Some(oldest) => self.batch_producer(&keys, oldest).await?,
+            None => None,
+        };
+        let mut entries = with_producers(entries, earlier.as_deref())?;
+        entries.reverse();
+        Ok(entries)
     }
 
     /// The wait uses a dedicated connection, so it doesn't block the short calls.
@@ -457,9 +497,14 @@ fn read_reply(reply: Value) -> RedisStoreResult<(StreamState, Vec<Entry>)> {
         Value::Array(meta),
         Value::Array(time),
         Value::Array(entries),
-    ] = <[Value; 3]>::try_from(parts).map_err(|parts| bad_reply("read", parts))?
+        producer,
+    ] = <[Value; 4]>::try_from(parts).map_err(|parts| bad_reply("read", parts))?
     else {
         return Err(bad_reply("read", "parts that are not arrays"));
+    };
+    let earlier = match producer {
+        Value::BulkString(producer) if !producer.is_empty() => Some(producer),
+        _ => None,
     };
     // A field that the Stream doesn't have comes back as nil, and `text` gives it as empty.
     let meta: Vec<Option<String>> = meta
@@ -498,39 +543,9 @@ fn read_reply(reply: Value) -> RedisStoreResult<(StreamState, Vec<Entry>)> {
     };
     let entries = entries
         .into_iter()
-        .map(entry)
+        .map(LogEntry::parse)
         .collect::<RedisStoreResult<Vec<_>>>()?;
-    Ok((state, entries))
-}
-
-fn entry(value: Value) -> RedisStoreResult<Entry> {
-    let Value::Array(pair) = value else {
-        return Err(bad_reply("read", value));
-    };
-    let [id, Value::Array(fields)] =
-        <[Value; 2]>::try_from(pair).map_err(|pair| bad_reply("read", pair))?
-    else {
-        return Err(bad_reply("read", "an entry with no field array"));
-    };
-    let id = text(&id).ok_or_else(|| bad_reply("read", &id))?;
-    let mut entry = Entry {
-        offset: offset_of_entry_id(&id)?,
-        record: None,
-        superseded: None,
-    };
-    for pair in fields.chunks(2) {
-        let (Some(Value::BulkString(name)), Some(Value::BulkString(value))) =
-            (pair.first(), pair.get(1))
-        else {
-            continue;
-        };
-        match name.as_slice() {
-            b"r" => entry.record = Some(value.clone()),
-            b"s" => entry.superseded = Some(value.clone()),
-            _ => {}
-        }
-    }
-    Ok(entry)
+    Ok((state, with_producers(entries, earlier.as_deref())?))
 }
 
 /// Refuses options that can't work, before any connection, and parses the URLs.
@@ -809,6 +824,7 @@ mod tests {
                 .arg(b"")
                 .arg("d")
                 .arg("")
+                .arg(b"")
                 .arg(b"r");
             let error = run_script(&scripts::APPEND_SCRIPT, &cmd, &mut shared)
                 .await
@@ -822,5 +838,69 @@ mod tests {
                 .unwrap();
             assert_eq!(fence, None);
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "needs Redis"]
+    async fn a_read_inside_a_batch_gets_the_producer_of_the_batch() {
+        use temporalio_streams::proto::{
+            StreamData, StreamProducerKind, StreamRecord, stream_record::Item,
+        };
+        let mut options = RedisStoreOptions::new(crate::testing::standalone_url());
+        options.key_prefix = "streams-unit".parse().unwrap();
+        let store = RedisStore::connect(options).await.unwrap();
+        let (namespace, handle) = (
+            format!("ns-{}", std::process::id()),
+            StreamHandle {
+                id: "batch".to_string(),
+                ..Default::default()
+            },
+        );
+        store
+            .create(
+                &namespace,
+                &handle,
+                None,
+                Owner::Client,
+                &Withdrawal::default(),
+            )
+            .await
+            .unwrap();
+        let producer = Producer {
+            kind: StreamProducerKind::Client as i32,
+            id: "client:unit".to_string(),
+            ..Default::default()
+        };
+        let record = StreamRecord {
+            item: Some(Item::Data(StreamData {
+                producer: Some(producer.clone()),
+                ..Default::default()
+            })),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let records = vec![record.clone(); 5];
+        let batch = Batch {
+            producer: &producer,
+            sequence: 1,
+            records: &records,
+            digest: "d",
+            withdrawal: Withdrawal::default(),
+        };
+        let (first, last) = store
+            .append(&namespace, &handle, &batch)
+            .await
+            .unwrap()
+            .offsets
+            .unwrap();
+        let (_, forward) = store.read(&namespace, "batch", first + 2, 2).await.unwrap();
+        let back = store
+            .read_back(&namespace, "batch", last - 1, 2)
+            .await
+            .unwrap();
+        for entry in forward.iter().chain(&back) {
+            assert_eq!(entry.record.as_deref(), Some(record.as_slice()));
+        }
+        assert_eq!((forward.len(), back.len()), (2, 2));
     }
 }
