@@ -52,8 +52,10 @@ never get the same sequence. Nothing dedupes such a batch, so its retry writes i
 ## Log entries
 
 - `r` is the encoded `StreamRecord`, with no offset.
-- `s` is the encoded `StreamSuperseded` with the withdrawal facts, on the first entry of a batch
-  that withdraws. A read builds the Superseded item from it. An entry can have only `s`.
+- `s` is the encoded `StreamSuperseded` with the withdrawal facts. A read builds the Superseded
+  item from it.
+- A batch that withdraws has `s` on its first entry. The orphan rule adds an entry with only `s`
+  before it, so one batch can have two.
 - An offset is the entry id `<ms>-<seq>`, packed as `ms << 20 | seq`.
 
 ## Orphaned Local Activity Records
@@ -67,18 +69,21 @@ and failed tasks. Then the append withdraws the run's tasks in `oa` that never c
   run's Workflow Producer, the batch's task, and the completed and failed tasks.
 - The append then drops the tasks at or before the completed task from `oa`, and adds the batch's
   task when the batch has Records.
-- `ow` keeps the withdrawn tasks, and fences a late write of each one.
+- Each `ow|<run>|<task key>` fences a late write of that task.
 - A batch with no `previous_completed_task` skips the rule.
 
 ## Retry runs
 
-- A Workflow retry run gives its previous run in `withdraw_run`, on its create and on its Local
-  Activities' appends.
+- A Workflow retry run gives its previous run in `withdraw_run`, on its create and on the first
+  batch of each of its Local Activities.
 - The first such call sets `wr|<previous run>`, also when the create makes the Stream.
 - When `run|<previous run>` is set, the call also writes `s`. A create writes it on an entry of its
-  own, and an append on its first entry.
+  own, and an append on the first entry of its batch.
+- When `run|<previous run>` isn't set, a create that finds the Stream sets only `wr|`, and `exp`
+  stays as it is.
 - When `wr|<run>` is set, each later append and close of the run's Producers fails with
-  `stream_fenced`.
+  `stream_fenced`. A resend still gets its first answer, and a close of a closed Stream gets
+  `already`.
 - An append with Records sets `run|<run>`.
 
 ## TTLs
@@ -141,6 +146,10 @@ these lists on a standalone server and on a cluster.
   completed one keeps its Local Activity Records.
 - A Local Activity that runs longer than its Workflow Task keeps its Records when the task where it
   resolves fails. Only a later run of the same call withdraws them.
+- `ow` fences only the tasks that an orphan item withdrew. A failed task's Local Activity that
+  writes for the first time after a later write gave the task as failed keeps that Record.
+- A Local Activity write with no task facts, as from an older Core, isn't in `oa`, so no later
+  orphan item withdraws its Records.
 - A retry run withdraws only its previous run. If that run never wrote, older runs keep their
   Records, since the Store can't tell a retry attempt from a continue-as-new run.
 - A run that closes its Stream and then fails under a retry policy leaves it closed, so each retry
