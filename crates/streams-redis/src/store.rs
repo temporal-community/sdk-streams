@@ -622,7 +622,7 @@ fn check_version(node: &Origin, info: &InfoDict) -> RedisStoreResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use temporalio_streams::store::DEFAULT_SAFETY_TTL;
+    use temporalio_streams::{Reason, StreamError, store::DEFAULT_SAFETY_TTL};
 
     #[test]
     fn a_server_before_redis_7_is_refused() {
@@ -749,7 +749,8 @@ mod tests {
                 .arg(b"")
                 .arg(b"r");
             let error = call.run(&mut shared).await.unwrap_err();
-            assert_eq!(error.code(), Some("STREAM_INVALID"), "{error}");
+            let error = StreamError::from(RedisStoreError::from(error));
+            assert_eq!(error.reason, Reason::Invalid, "{error}");
             let fence: Option<String> = redis::cmd("HGET")
                 .arg(keys.meta())
                 .arg("wr|r0")
