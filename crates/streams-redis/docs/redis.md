@@ -71,6 +71,9 @@ these lists on a standalone server and on a cluster.
 - A Reader reads and describes. It needs the keys `%R~<prefix>:{<namespace>:*` and the commands
   `+evalsha_ro +script|load +time +hmget +xrange`. A read that waits also needs `+xread`, and a
   read of the last Records needs `+xrevrange`.
+- A user that lacks a command of its list can fail a script after its first write, and that write
+  stays. `connect` checks `+wait`, since without it each write would fail its `WAIT` after the
+  write happened.
 - On a cluster, each role also needs `+cluster|slots +asking +ping`, on each node.
 - A process with both roles needs both sets.
 - `+info` and `+config|get` are optional. Without `+info`, the Store skips the version check.
@@ -78,8 +81,8 @@ these lists on a standalone server and on a cluster.
 - A user with write access can write as any Producer.
 - The ACLs don't limit CPU or memory, since `+script|load` lets a user run any Lua. A Reader with no
   `+script|load` needs an admin to load the read script on each primary, after each restart,
-  failover or `SCRIPT FLUSH`. That script is the line `#!lua flags=no-writes` and then
-  `lua/read.lua`.
+  failover or `SCRIPT FLUSH`. The script's SHA is of its exact bytes, so load it with
+  `{ printf '#!lua flags=no-writes\n'; cat lua/read.lua; } | redis-cli -x SCRIPT LOAD`.
 
 ## Eviction and replication
 
@@ -87,7 +90,11 @@ these lists on a standalone server and on a cluster.
   the fence, the dedupe and the close. The Store warns about it on connect.
 - A failover can lose a write that Redis acknowledged. With `wait_replicas`, each write waits for
   that many replicas with `WAIT`. A write that they don't have after `wait_timeout` fails as a
-  Store failure, and its retry writes it once.
+  Store failure, and its retry with the same sequence writes it once.
+- `WAIT` protects only the writer's answer. A Reader can see a write before its `WAIT` ends, and
+  a failover can then lose that write.
+- On a cluster, the client sends a write again after it loses the reply. A batch with sequence 0
+  then gets two copies, and a resend answer has no flag.
 - With `WAIT`, a call that finds its write done, such as a resend, writes `v` again. Then its
   `WAIT` covers the earlier write.
 - A failover can still promote a replica that doesn't have an acknowledged write.

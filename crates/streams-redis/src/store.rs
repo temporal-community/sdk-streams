@@ -358,7 +358,7 @@ fn acknowledged(wait: &Wait, acked: Value) -> RedisStoreResult<()> {
     if acked < wait.replicas.get() {
         return Err(RedisStoreError::storage(format!(
             "{acked} of {} replicas had the write after {:?}. A failover can lose it, and a retry \
-             writes it once",
+             with the same sequence writes it once",
             wait.replicas, wait.timeout
         )));
     }
@@ -426,8 +426,7 @@ fn read_reply(reply: Value) -> RedisStoreResult<(StreamState, Vec<Entry>)> {
     else {
         return Err(bad_reply("read", "parts that are not arrays"));
     };
-    // The script gives an empty string for a field that the Stream doesn't have, since a nil
-    // would end the array.
+    // A field that the Stream doesn't have comes back as nil, and `text` gives it as empty.
     let meta: Vec<Option<String>> = meta
         .iter()
         .map(|value| text(value).filter(|text| !text.is_empty()))
