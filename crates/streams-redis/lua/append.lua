@@ -1,10 +1,10 @@
 -- Appends one batch of one Producer.
 --
--- ARGV: format version, kind, Producer id, encoded run id, epoch key, sequence (0 takes the next
--- one), encoded withdrawn run, Superseded facts, safety TTL ms, Tombstone ms, task key, completed
--- task key (`-` when the write gives no task facts), failed task ids, task Superseded facts, the
--- batch digest, `1` when a `WAIT` runs after it, the encoded Producer, then one Record with no
--- Producer per argument.
+-- ARGV: format version, kind, Producer id, encoded run id, the 40-byte epoch key, sequence (0
+-- takes the next one), encoded withdrawn run, Superseded facts, safety TTL ms, Tombstone ms, the
+-- 24-byte task key, the completed task key (`-` when the write gives no task facts, empty for
+-- none), failed task ids, task Superseded facts, the 16-byte batch digest, `1` when a `WAIT` runs
+-- after it, the encoded Producer, then one Record with no Producer per argument.
 --
 -- Returns {'ok' or 'resend', first id, last id, '1' when flagged}.
 local meta, log, producers = KEYS[1], KEYS[2], KEYS[3]
@@ -16,65 +16,69 @@ local safety, tombstone = tonumber(ARGV[9]), tonumber(ARGV[10])
 local task, completed, failed, task_superseded = ARGV[11], ARGV[12], ARGV[13], ARGV[14]
 local digest, wait, encoded_producer = ARGV[15], ARGV[16], ARGV[17]
 local records = #ARGV - 17
+local field = 'p|' .. kind .. '|' .. producer
 local tracked = kind == '2' and run ~= ''
 -- Only a Local Activity write with its run's task facts tells which tasks of the run completed.
 local facts = tracked and completed ~= '-'
 local open_field, gone_prefix, facts_field = 'oa|' .. run, 'ow|' .. run .. '|', 'tf|' .. run
 
--- The script reads the dedupe entry and writes the batch in one step, so no other batch takes the
--- same number.
-if sequence_text == '0' then
-  local last = redis.call('HGET', meta, 'd|' .. kind .. '|' .. producer) or ''
-  local last_epoch, last_sequence = string.match(last, '^([^|]*)|(%d+)|')
-  sequence_text = '1'
-  if last_epoch == epoch then
-    sequence_text = string.format('%.0f', tonumber(last_sequence) + 1)
-  end
-  sequence = tonumber(sequence_text)
+if #epoch ~= EPOCH_KEY_LEN or #digest ~= DIGEST_LEN then
+  return refuse('INVALID', 'the epoch key and the digest must be 40 and 16 bytes')
 end
--- A Lua number past 2^53 - 1 loses digits, so the dedupe entry keeps the sequence as sent.
-if not string.match(sequence_text, '^[1-9]%d*$') or sequence > 9007199254740991 then
-  return refuse('INVALID', 'the sequence must be from 1 to 2^53 - 1')
-end
-if tracked and not task_key(task) then
+if tracked and #task ~= TASK_KEY_LEN then
   return refuse('INVALID', 'the task must be a task key')
 end
 if facts then
-  if completed ~= '' and not task_key(completed) then
+  if completed ~= '' and #completed ~= TASK_KEY_LEN then
     return refuse('INVALID', 'the completed task must be a task key')
   end
-  -- A Lua number past 2^53 - 1 loses digits, so `started_key` can't format such an id.
+  -- A Lua number past 2^53 - 1 loses digits, so `started_key` can't pack such an id.
   for _, id in ipairs(words(failed)) do
     if not string.match(id, '^%-?%d+$') or math.abs(tonumber(id)) > 9007199254740991 then
       return refuse('INVALID', 'the failed tasks must be started event ids')
     end
   end
 end
+local stored, unknown = read_producer(meta, field)
+if unknown then
+  return unknown
+end
+-- Each append sets the fence to its epoch, so the fence is also the epoch of the last batch.
+local previous = nil
+if stored and stored.fence == epoch then
+  previous = stored
+end
+-- The script reads the last batch and writes this one in one step, so no other batch takes the
+-- same number.
+if sequence_text == '0' then
+  sequence = 1
+  if previous then
+    sequence = previous.sequence + 1
+  end
+  sequence_text = string.format('%.0f', sequence)
+end
+-- A Lua number past 2^53 - 1 loses digits.
+if not string.match(sequence_text, '^[1-9]%d*$') or sequence > 9007199254740991 then
+  return refuse('INVALID', 'the sequence must be from 1 to 2^53 - 1')
+end
 local now = now_ms()
 local refused = check_live(meta, version, now)
 if refused then
   return refused
 end
-local suffix = '|' .. kind .. '|' .. producer
--- Check the dedupe key before the close status, so that a resend gets its entry ids after a close.
-local last = redis.call('HGET', meta, 'd' .. suffix)
-if last then
-  local last_epoch, last_sequence, first_id, last_id, last_digest =
-    string.match(last, '^([^|]*)|(%d+)|([^|]*)|([^|]*)|([^|]*)$')
-  if last_epoch == epoch then
-    last_sequence = tonumber(last_sequence)
-    if sequence == last_sequence then
-      if last_digest ~= digest then
-        return refuse('SEQ_DIVERGENT', 'sequence ' .. sequence ..
-          ' has other content than the batch the Store has')
-      end
-      touch(meta, wait)
-      return {'resend', first_id, last_id, ''}
+-- Check the last batch before the close status, so that a resend gets its entry ids after a close.
+if previous then
+  if sequence == previous.sequence then
+    if previous.digest ~= digest then
+      return refuse('SEQ_DIVERGENT', 'sequence ' .. sequence_text ..
+        ' has other content than the batch the Store has')
     end
-    if sequence < last_sequence then
-      return refuse('SEQUENCE', 'sequence ' .. sequence .. ' is below the last one, ' ..
-        last_sequence)
-    end
+    touch(meta, wait)
+    return {'resend', previous.first, previous.last, ''}
+  end
+  if sequence < previous.sequence then
+    return refuse('SEQUENCE', 'sequence ' .. sequence_text .. ' is below the last one, ' ..
+      string.format('%.0f', previous.sequence))
   end
 end
 if redis.call('HGET', meta, 'closed') then
@@ -83,19 +87,37 @@ end
 if run ~= '' and redis.call('HGET', meta, 'wr|' .. run) then
   return refuse('FENCED', 'a Workflow retry withdrew the run of the Producer')
 end
-local newest = redis.call('HGET', meta, 'e' .. suffix)
-if newest and epoch < newest then
+if stored and bytes_below(epoch, stored.fence) then
   return refuse('FENCED', 'the epoch is lower than the newest one of the Producer')
 end
-if tracked and redis.call('HGET', meta, gone_prefix .. task) then
-  return refuse('FENCED', 'a Superseded item withdrew the Workflow Task of the call')
-end
--- A task can fail before its call writes, so no orphan item withdrew it.
+local newest_facts, open = nil, {}
 if tracked then
-  local stored = redis.call('HGET', meta, facts_field)
-  if stored and fenced_by_facts(stored, task) then
-    return refuse('FENCED',
-      "the run's task facts show that the Workflow Task of the call never completed")
+  if redis.call('HGET', meta, gone_prefix .. task) then
+    return refuse('FENCED', 'a Superseded item withdrew the Workflow Task of the call')
+  end
+  local value = redis.call('HGET', meta, facts_field)
+  if value then
+    newest_facts, unknown = task_keys(value)
+    if unknown then
+      return unknown
+    end
+    -- A task can fail before its call writes, so no orphan item withdrew it.
+    local fenced
+    fenced, unknown = fenced_by_facts(newest_facts, task)
+    if unknown then
+      return unknown
+    end
+    if fenced then
+      return refuse('FENCED',
+        "the run's task facts show that the Workflow Task of the call never completed")
+    end
+  end
+  value = redis.call('HGET', meta, open_field)
+  if value then
+    open, unknown = task_keys(value)
+    if unknown then
+      return unknown
+    end
   end
 end
 
@@ -106,15 +128,16 @@ end
 
 -- The first batch of a newer epoch withdraws the Records of the earlier ones. A client's (4)
 -- newer epoch only fences, since its earlier Records are real messages.
-local holds = redis.call('HGET', meta, 'h' .. suffix)
-local newer = kind ~= '4' and holds ~= false and holds < epoch
+local newer = kind ~= '4' and stored ~= nil and stored.held ~= nil and
+  bytes_below(stored.held, epoch)
 local flagged = newer
-local withdrawn, open = {}, {}
-if tracked then
-  open = words(redis.call('HGET', meta, open_field))
-end
+local withdrawn = {}
 if facts then
-  withdrawn, open = orphan_tasks(open, task, completed, failed)
+  local completed_key = nil
+  if completed ~= '' then
+    completed_key = completed
+  end
+  withdrawn, open = orphan_tasks(open, task, completed_key, failed)
 end
 
 -- `prune` reads `:producers` first, so a key of another type there fails before any write.
@@ -159,15 +182,15 @@ if first_id == '' then
   first_id = orphan_id
 end
 
-redis.call('HSET', meta, 'e' .. suffix, epoch)
-redis.call('HSET', meta, 'd' .. suffix,
-  epoch .. '|' .. sequence_text .. '|' .. first_id .. '|' .. last_id .. '|' .. digest)
+-- The batch's epoch holds Records when it wrote some. Only a newer epoch's item withdraws the
+-- held epoch's Records, so any other empty batch keeps the held epoch as it was.
+local held = nil
 if records > 0 then
-  redis.call('HSET', meta, 'h' .. suffix, epoch)
-elseif newer then
-  -- Only a newer epoch's item withdraws the held epoch's Records.
-  redis.call('HDEL', meta, 'h' .. suffix)
+  held = epoch
+elseif stored and not newer then
+  held = stored.held
 end
+redis.call('HSET', meta, field, producer_value(epoch, held, sequence, first_id, last_id, digest))
 -- Redis sends each write to the replicas and the AOF, so the script sets `run|` only once.
 if run ~= '' and records > 0 and not redis.call('HGET', meta, 'run|' .. run) then
   redis.call('HSET', meta, 'run|' .. run, '1')
@@ -181,7 +204,7 @@ if tracked then
   end
   if facts or added then
     if #open > 0 then
-      redis.call('HSET', meta, open_field, table.concat(open, ' '))
+      redis.call('HSET', meta, open_field, table.concat(open))
     else
       redis.call('HDEL', meta, open_field)
     end
@@ -193,8 +216,7 @@ if tracked then
 end
 if facts then
   -- A long Local Activity of an earlier task writes with older facts.
-  local stored = redis.call('HGET', meta, facts_field)
-  if not stored or string.sub(stored, 1, #task) < task then
+  if not newest_facts or bytes_below(newest_facts[1], task) then
     local value = {task, completed}
     if completed == '' then
       value[2] = ZERO_KEY

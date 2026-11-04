@@ -4,6 +4,7 @@
 use prost::Message;
 use std::{
     num::NonZeroUsize,
+    ops::RangeInclusive,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use temporalio_common::protos::temporal::api::common::v1::Payload;
@@ -11,6 +12,7 @@ use temporalio_streams::{
     Reason,
     digest::batch_digest,
     ids::{StreamKeys, client_producer_id, local_activity_producer_id},
+    offset::offset_of_entry_id,
     proto::{
         AppendRecord, Producer, ProducerEpoch, StreamData, StreamHandle, StreamProducerKind,
         StreamRecord, WorkflowTaskEpoch, stream_record::Item,
@@ -18,8 +20,8 @@ use temporalio_streams::{
     store::{Batch, Owner, Store, TaskFacts, Withdrawal},
 };
 use temporalio_streams_redis::{
-    RedisStore, RedisStoreError, RedisStoreOptions, WaitOptions,
-    testing::{cluster_url, standalone_url},
+    RedisStore, RedisStoreError, RedisStoreOptions, Topology, WaitOptions,
+    testing::{SlotNode, SlotRange, cluster_url, standalone_url},
 };
 
 const PREFIX: &str = "streams-acl";
@@ -97,7 +99,7 @@ fn unique() -> u128 {
 }
 
 /// The encoded Records of a one-Record batch of `client()`, and the batch digest.
-fn one_record() -> (Vec<Vec<u8>>, String) {
+fn one_record() -> (Vec<Vec<u8>>, [u8; 16]) {
     let records = vec![AppendRecord {
         body: Some(Payload {
             data: b"x".to_vec(),
@@ -189,7 +191,7 @@ async fn the_documented_commands_run_every_call_of_each_role() {
         producer: &client(),
         sequence: 1,
         records: &stored,
-        digest: &digest,
+        digest,
         withdrawal: Withdrawal::default(),
     };
     let appended = producer.append(&namespace, &handle, &batch).await.unwrap();
@@ -253,7 +255,7 @@ async fn the_documented_commands_run_every_call_of_each_role() {
         .unwrap();
     let la_append = |task: &WorkflowTaskEpoch, completed, failed: &'static [i64]| {
         let (producer, namespace, retry) = (&producer, &namespace, &retry);
-        let (records, digest) = (&stored, digest.clone());
+        let (records, digest) = (&stored, digest);
         let la = local_activity("r0", task);
         async move {
             let facts = TaskFacts {
@@ -265,7 +267,7 @@ async fn the_documented_commands_run_every_call_of_each_role() {
                 producer: &la,
                 sequence: 1,
                 records,
-                digest: &digest,
+                digest,
                 withdrawal: Withdrawal {
                     tasks: Some(facts),
                     ..Withdrawal::default()
@@ -289,15 +291,14 @@ async fn the_documented_commands_run_every_call_of_each_role() {
         .unwrap();
     assert!(created.flagged);
 
-    // An append after the Retention trims the old Records and prunes the old Producers. The
-    // scripts read the server's `TIME`, so the case must wait for that clock.
+    // An append trims the Records older than the Retention, and prunes the Producers with no
+    // append for one Retention. The scripts read the server's `TIME`, so raw writes age an entry
+    // and a Producer, and the case doesn't wait.
     let short = StreamHandle {
         id: "short".to_string(),
         ..Default::default()
     };
-    // The old Record is at least 1.1 Retentions old at the last append, and the recent one 0.5, so
-    // a stall of up to 1 s leaves the result the same.
-    let retention = Duration::from_secs(2);
+    let retention = Duration::from_secs(60);
     // A Workflow Stream has the safety TTL, so it doesn't expire with the Retention.
     producer
         .create(
@@ -309,39 +310,46 @@ async fn the_documented_commands_run_every_call_of_each_role() {
         )
         .await
         .unwrap();
-    let append_as = |process: &'static str| {
-        let (producer, namespace, short) = (&producer, &namespace, &short);
-        let digest = batch.digest;
-        let stored = &stored;
-        async move {
-            let client = client_named(process);
-            let batch = Batch {
-                producer: &client,
-                sequence: 1,
-                records: stored,
-                digest,
-                withdrawal: Withdrawal::default(),
-            };
-            producer.append(namespace, short, &batch).await.unwrap()
-        }
-    };
-    let old = append_as("old").await.offsets.unwrap().1;
-    tokio::time::sleep(retention * 6 / 10).await;
-    // A write within the Retention keeps the log key.
-    append_as("recent").await;
-    tokio::time::sleep(retention / 2).await;
-    append_as("new").await;
-    let (state, entries) = reader.read(&namespace, "short", 0, 10).await.unwrap();
-    assert_eq!((state.trimmed, entries.len()), (old, 2));
-    let fence = format!(
-        "e|{}|{}",
+    let keys = StreamKeys::new(PREFIX, &namespace, "short");
+    let mut raw = admin(&url).await;
+    let (seconds, _): (u64, u64) = redis::cmd("TIME").query_async(&mut raw).await.unwrap();
+    let old_ms = (seconds - 2 * retention.as_secs()) * 1000;
+    let old = format!("{old_ms}-1");
+    let field = format!(
+        "p|{}|{}",
         StreamProducerKind::Client as i32,
         client_named("old").id
     );
+    let _: () = redis::pipe()
+        .cmd("XADD")
+        .arg(keys.log())
+        .arg(&old)
+        .arg("x")
+        .arg("y")
+        .ignore()
+        .cmd("ZADD")
+        .arg(keys.producers())
+        .arg(old_ms)
+        .arg(&field[2..])
+        .ignore()
+        .cmd("HSET")
+        .arg(keys.meta())
+        .arg(&field)
+        .arg("x")
+        .ignore()
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    producer.append(&namespace, &short, &batch).await.unwrap();
+    let (state, entries) = reader.read(&namespace, "short", 0, 10).await.unwrap();
+    assert_eq!(
+        (state.trimmed, entries.len()),
+        (offset_of_entry_id(&old).unwrap(), 1)
+    );
     let fenced: bool = redis::cmd("HEXISTS")
-        .arg(StreamKeys::new(PREFIX, &namespace, "short").meta())
-        .arg(fence)
-        .query_async(&mut admin(&url).await)
+        .arg(keys.meta())
+        .arg(&field)
+        .query_async(&mut raw)
         .await
         .unwrap();
     assert!(!fenced);
@@ -390,23 +398,27 @@ async fn the_documented_commands_run_every_call_of_each_role() {
     }
 }
 
-/// A cluster primary, from `CLUSTER SLOTS`.
+/// A cluster primary and its slot ranges.
 struct Primary {
-    host: String,
-    port: i64,
-    id: String,
-    slots: Vec<(i64, i64)>,
+    node: SlotNode,
+    slots: Vec<RangeInclusive<u16>>,
 }
 
 impl Primary {
-    fn url(&self) -> String {
-        format!("redis://{}:{}/0", self.host, self.port)
+    /// An empty host is the node that answered, which is local in the test cluster.
+    fn host(&self) -> &str {
+        match self.node.host.as_str() {
+            "" => "127.0.0.1",
+            host => host,
+        }
     }
 
-    fn owns(&self, slot: i64) -> bool {
-        self.slots
-            .iter()
-            .any(|&(start, end)| start <= slot && slot <= end)
+    fn url(&self) -> String {
+        format!("redis://{}:{}/0", self.host(), self.node.port)
+    }
+
+    fn owns(&self, slot: u16) -> bool {
+        self.slots.iter().any(|range| range.contains(&slot))
     }
 
     async fn run(&self, cmd: &redis::Cmd) -> redis::Value {
@@ -417,47 +429,69 @@ impl Primary {
 }
 
 async fn primaries(conn: &mut redis::cluster_async::ClusterConnection) -> Vec<Primary> {
-    let reply: redis::Value = redis::cmd("CLUSTER")
+    let ranges: Vec<SlotRange> = redis::cmd("CLUSTER")
         .arg("SLOTS")
         .query_async(conn)
         .await
         .unwrap();
-    let redis::Value::Array(ranges) = reply else {
-        panic!("CLUSTER SLOTS gave {reply:?}");
-    };
     let mut primaries: Vec<Primary> = vec![];
     for range in ranges {
-        let redis::Value::Array(parts) = range else {
-            continue;
-        };
-        let (redis::Value::Int(start), redis::Value::Int(end), redis::Value::Array(node)) =
-            (&parts[0], &parts[1], &parts[2])
-        else {
-            continue;
-        };
-        let [
-            redis::Value::BulkString(host),
-            redis::Value::Int(port),
-            redis::Value::BulkString(id),
-        ] = &node[..3]
-        else {
-            panic!("CLUSTER SLOTS gave {node:?}");
-        };
-        let id = String::from_utf8_lossy(id).into_owned();
-        match primaries.iter_mut().find(|primary| primary.id == id) {
-            Some(primary) => primary.slots.push((*start, *end)),
+        match primaries
+            .iter_mut()
+            .find(|primary| primary.node.id == range.primary.id)
+        {
+            Some(primary) => primary.slots.push(range.slots),
             None => primaries.push(Primary {
-                host: match String::from_utf8_lossy(host).into_owned() {
-                    host if host.is_empty() => "127.0.0.1".to_string(),
-                    host => host,
-                },
-                port: *port,
-                id,
-                slots: vec![(*start, *end)],
+                node: range.primary,
+                slots: vec![range.slots],
             }),
         }
     }
     primaries
+}
+
+/// A slot that migrates from `source` to `target`. The drop undoes the migration, also when the
+/// case panics, so the next case finds the slot stable.
+struct Migration {
+    slot: u16,
+    source: String,
+    target: String,
+    keys: [String; 3],
+}
+
+impl Drop for Migration {
+    fn drop(&mut self) {
+        // A drop can't wait on a future, so it uses blocking connections.
+        let run = |url: &str, pipe: &redis::Pipeline| -> redis::RedisResult<()> {
+            pipe.query(&mut redis::Client::open(url)?.get_connection()?)
+        };
+        // The Stream's keys are only on the target, so deleting them there undoes the migration.
+        let mut drop_keys = redis::pipe();
+        for key in &self.keys {
+            drop_keys
+                .cmd("ASKING")
+                .ignore()
+                .cmd("DEL")
+                .arg(key)
+                .ignore();
+        }
+        let dropped = run(&self.target, &drop_keys);
+        let mut stable = redis::pipe();
+        stable
+            .cmd("CLUSTER")
+            .arg("SETSLOT")
+            .arg(self.slot)
+            .arg("STABLE")
+            .ignore();
+        let stabled = [&self.target, &self.source].map(|url| run(url, &stable));
+        // A second panic would abort the test binary, so the drop checks only on a clean path.
+        if !std::thread::panicking() {
+            dropped.unwrap();
+            for stabled in stabled {
+                stabled.unwrap();
+            }
+        }
+    }
 }
 
 /// While a slot migrates, the source answers `ASK` for the Stream's keys that it gave away, so the
@@ -480,7 +514,7 @@ async fn the_documented_commands_serve_a_cluster_while_a_slot_moves() {
         for i in 0.. {
             let id = format!("s{i}");
             let keys = StreamKeys::new(PREFIX, &namespace, &id);
-            let slot: i64 = redis::cmd("CLUSTER")
+            let slot: u16 = redis::cmd("CLUSTER")
                 .arg("KEYSLOT")
                 .arg(keys.meta())
                 .query_async(&mut cluster)
@@ -491,7 +525,10 @@ async fn the_documented_commands_serve_a_cluster_while_a_slot_moves() {
                 .run(redis::cmd("CLUSTER").arg("COUNTKEYSINSLOT").arg(slot))
                 .await;
             if count == redis::Value::Int(0) {
-                let target = nodes.iter().find(|node| node.id != source.id).unwrap();
+                let target = nodes
+                    .iter()
+                    .find(|node| node.node.id != source.node.id)
+                    .unwrap();
                 break 'pick (id, slot, source, target);
             }
         }
@@ -513,8 +550,10 @@ async fn the_documented_commands_serve_a_cluster_while_a_slot_moves() {
         let _: () = cmd.query_async(&mut cluster).await.unwrap();
     }
     let connect = |name: &str| {
-        let mut options = RedisStoreOptions::new(login(&url, name));
-        options.cluster = true;
+        let mut options = RedisStoreOptions::from(Topology::Cluster {
+            first: login(&url, name),
+            rest: Vec::new(),
+        });
         options.key_prefix = PREFIX.parse().unwrap();
         RedisStore::connect(options)
     };
@@ -525,7 +564,7 @@ async fn the_documented_commands_serve_a_cluster_while_a_slot_moves() {
         producer: &me,
         sequence,
         records: &stored,
-        digest: &digest,
+        digest,
         withdrawal: Withdrawal::default(),
     };
     let none = Withdrawal::default();
@@ -541,15 +580,21 @@ async fn the_documented_commands_serve_a_cluster_while_a_slot_moves() {
     // The migration that `redis-cli --cluster reshard` runs, stopped after the Stream's keys moved.
     let set_slot = |state: &str, other: &Primary| {
         let mut cmd = redis::cmd("CLUSTER");
-        cmd.arg("SETSLOT").arg(slot).arg(state).arg(&other.id);
+        cmd.arg("SETSLOT").arg(slot).arg(state).arg(&other.node.id);
         cmd
+    };
+    let migration = Migration {
+        slot,
+        source: source.url(),
+        target: target.url(),
+        keys: [keys.meta(), keys.log(), keys.producers()],
     };
     target.run(&set_slot("IMPORTING", source)).await;
     source.run(&set_slot("MIGRATING", target)).await;
     let mut migrate = redis::cmd("MIGRATE");
     migrate
-        .arg(&target.host)
-        .arg(target.port)
+        .arg(target.host())
+        .arg(target.node.port)
         .arg("")
         .arg(0)
         .arg(5000)
@@ -569,23 +614,7 @@ async fn the_documented_commands_serve_a_cluster_while_a_slot_moves() {
         .await
         .map(|_| ());
 
-    // The Stream's keys are only on the target, so deleting them there undoes the migration. A
-    // failed delete must not leave the slot migrating.
-    let mut drop_keys = redis::pipe();
-    for key in [keys.meta(), keys.log(), keys.producers()] {
-        drop_keys
-            .cmd("ASKING")
-            .ignore()
-            .cmd("DEL")
-            .arg(key)
-            .ignore();
-    }
-    let dropped: redis::RedisResult<()> =
-        drop_keys.query_async(&mut admin(&target.url()).await).await;
-    for node in [target, source] {
-        node.run(redis::cmd("CLUSTER").arg("SETSLOT").arg(slot).arg("STABLE"))
-            .await;
-    }
+    drop(migration);
     for name in [&producer_name, &reader_name] {
         let _: () = redis::cmd("ACL")
             .arg("DELUSER")
@@ -594,8 +623,6 @@ async fn the_documented_commands_serve_a_cluster_while_a_slot_moves() {
             .await
             .unwrap();
     }
-    dropped.unwrap();
-
     let appended = appended.unwrap().offsets.unwrap();
     let (state, entries) = read.unwrap();
     assert_eq!((state.newest, entries.len()), (appended.1, 2));

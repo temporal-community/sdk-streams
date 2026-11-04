@@ -14,12 +14,15 @@ mod error;
 mod options;
 mod protos;
 mod runtime;
+// `testing` exports these types for the tests, so only a build with it reaches them.
+#[cfg_attr(not(any(test, feature = "test-support")), allow(unreachable_pub))]
+mod slots;
 mod store;
 #[cfg(any(test, feature = "test-support"))]
 pub mod testing;
 
 pub use error::{RedisStoreError, RedisStoreResult};
-pub use options::{KeyPrefix, RedisStoreOptions, WaitOptions};
+pub use options::{KeyPrefix, RedisStoreOptions, Topology, WaitOptions};
 pub use runtime::{REDIS_RUNTIME_NAME, RedisStreamRuntime, RuntimeOptions};
 pub use store::RedisStore;
 
