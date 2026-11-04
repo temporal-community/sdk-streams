@@ -11,6 +11,7 @@ use temporalio_streams::{
     Reason,
     digest::batch_digest,
     ids::{StreamKeys, client_producer_id},
+    offset::offset_of_entry_id,
     proto::{
         AppendRecord, Producer, ProducerEpoch, StreamData, StreamHandle, StreamProducerKind,
         StreamRecord, stream_record::Item,
@@ -208,15 +209,14 @@ async fn the_documented_commands_run_every_call_of_each_role() {
         .await
         .unwrap();
 
-    // An append after the Retention trims the old Records and prunes the old Producers. The
-    // scripts read the server's `TIME`, so the case must wait for that clock.
+    // An append trims the Records older than the Retention, and prunes the Producers with no
+    // append for one Retention. The scripts read the server's `TIME`, so raw writes age an entry
+    // and a Producer, and the case doesn't wait.
     let short = StreamHandle {
         id: "short".to_string(),
         ..Default::default()
     };
-    // The old Record is at least 1.1 Retentions old at the last append, and the recent one 0.5, so
-    // a stall of up to 1 s leaves the result the same.
-    let retention = Duration::from_secs(2);
+    let retention = Duration::from_secs(60);
     // A Workflow Stream has the safety TTL, so it doesn't expire with the Retention.
     producer
         .create(
@@ -228,39 +228,46 @@ async fn the_documented_commands_run_every_call_of_each_role() {
         )
         .await
         .unwrap();
-    let append_as = |process: &'static str| {
-        let (producer, namespace, short) = (&producer, &namespace, &short);
-        let digest = batch.digest;
-        let stored = &stored;
-        async move {
-            let client = client_named(process);
-            let batch = Batch {
-                producer: &client,
-                sequence: 1,
-                records: stored,
-                digest,
-                withdrawal: Withdrawal::default(),
-            };
-            producer.append(namespace, short, &batch).await.unwrap()
-        }
-    };
-    let old = append_as("old").await.offsets.unwrap().1;
-    tokio::time::sleep(retention * 6 / 10).await;
-    // A write within the Retention keeps the log key.
-    append_as("recent").await;
-    tokio::time::sleep(retention / 2).await;
-    append_as("new").await;
-    let (state, entries) = reader.read(&namespace, "short", 0, 10).await.unwrap();
-    assert_eq!((state.trimmed, entries.len()), (old, 2));
+    let keys = StreamKeys::new(PREFIX, &namespace, "short");
+    let mut raw = admin(&url).await;
+    let (seconds, _): (u64, u64) = redis::cmd("TIME").query_async(&mut raw).await.unwrap();
+    let old_ms = (seconds - 2 * retention.as_secs()) * 1000;
+    let old = format!("{old_ms}-1");
     let fence = format!(
         "e|{}|{}",
         StreamProducerKind::Client as i32,
         client_named("old").id
     );
+    let _: () = redis::pipe()
+        .cmd("XADD")
+        .arg(keys.log())
+        .arg(&old)
+        .arg("x")
+        .arg("y")
+        .ignore()
+        .cmd("ZADD")
+        .arg(keys.producers())
+        .arg(old_ms)
+        .arg(&fence[2..])
+        .ignore()
+        .cmd("HSET")
+        .arg(keys.meta())
+        .arg(&fence)
+        .arg("x")
+        .ignore()
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    producer.append(&namespace, &short, &batch).await.unwrap();
+    let (state, entries) = reader.read(&namespace, "short", 0, 10).await.unwrap();
+    assert_eq!(
+        (state.trimmed, entries.len()),
+        (offset_of_entry_id(&old).unwrap(), 1)
+    );
     let fenced: bool = redis::cmd("HEXISTS")
-        .arg(StreamKeys::new(PREFIX, &namespace, "short").meta())
-        .arg(fence)
-        .query_async(&mut admin(&url).await)
+        .arg(keys.meta())
+        .arg(&fence)
+        .query_async(&mut raw)
         .await
         .unwrap();
     assert!(!fenced);
