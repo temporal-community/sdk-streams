@@ -1,6 +1,7 @@
 //! The connections of the Redis Store. A blocked `XREAD` or `WAIT` stops all later commands on its
 //! connection, so each one gets a dedicated connection, and the short calls share one.
 
+use crate::RedisStoreOptions;
 use parking_lot::Mutex;
 use redis::{
     AsyncConnectionConfig, Client, Cmd, ConnectionAddr, ConnectionInfo, ErrorKind,
@@ -52,21 +53,22 @@ struct Seed {
     node: Node,
 }
 
-impl Seed {
-    fn parse(url: &str) -> RedisResult<Self> {
+impl FromStr for Seed {
+    type Err = RedisError;
+
+    fn from_str(url: &str) -> RedisResult<Self> {
         let info = url.into_connection_info()?;
-        let node = Node::of(&info)?;
+        let node = Node::try_from(&info)?;
         Ok(Self { info, node })
     }
 }
 
-impl Endpoint {
-    pub(crate) fn parse(
-        urls: &[String],
-        cluster: bool,
-        response_timeout: Duration,
-    ) -> RedisResult<Self> {
-        let mut seeds = urls.iter().map(|url| Seed::parse(url));
+/// The endpoint of the options' URLs and timeout.
+impl TryFrom<&RedisStoreOptions> for Endpoint {
+    type Error = RedisError;
+
+    fn try_from(options: &RedisStoreOptions) -> RedisResult<Self> {
+        let mut seeds = options.urls.iter().map(|url| url.parse::<Seed>());
         let Some(first) = seeds.next().transpose()? else {
             return Err(RedisError::from((
                 ErrorKind::InvalidClientConfig,
@@ -74,7 +76,7 @@ impl Endpoint {
             )));
         };
         let rest = seeds.collect::<RedisResult<Vec<_>>>()?;
-        let topology = match (cluster, rest.is_empty()) {
+        let topology = match (options.cluster, rest.is_empty()) {
             (true, _) => Topology::Cluster { first, rest },
             (false, true) => Topology::Standalone(first),
             // A standalone Store connects to one server, so the other URLs would have no effect.
@@ -87,10 +89,12 @@ impl Endpoint {
         };
         Ok(Self {
             topology,
-            response_timeout,
+            response_timeout: options.response_timeout,
         })
     }
+}
 
+impl Endpoint {
     /// How a blocking read of `key` finds its first node.
     fn route(&self, key: &str) -> Route {
         match self.topology {
@@ -460,8 +464,11 @@ enum Node {
     Unix(PathBuf),
 }
 
-impl Node {
-    fn of(info: &ConnectionInfo) -> RedisResult<Self> {
+/// The node at the address of a URL.
+impl TryFrom<&ConnectionInfo> for Node {
+    type Error = RedisError;
+
+    fn try_from(info: &ConnectionInfo) -> RedisResult<Self> {
         match info.addr() {
             ConnectionAddr::Tcp(host, port) | ConnectionAddr::TcpTls { host, port, .. } => {
                 Ok(Self::Tcp {
@@ -477,7 +484,9 @@ impl Node {
             ))),
         }
     }
+}
 
+impl Node {
     /// The seed's connection settings, with its credentials and TLS, for this node.
     fn info(&self, seed: &ConnectionInfo) -> ConnectionInfo {
         let addr = match (self, seed.addr()) {
@@ -859,9 +868,17 @@ mod tests {
         RedisError::from(std::io::Error::new(kind, "test"))
     }
 
+    fn options(urls: &[&str], cluster: bool) -> RedisStoreOptions {
+        RedisStoreOptions {
+            urls: urls.iter().map(|url| url.to_string()).collect(),
+            cluster,
+            response_timeout: Duration::from_secs(1),
+            ..RedisStoreOptions::default()
+        }
+    }
+
     fn endpoint(urls: &[&str], cluster: bool) -> Arc<Endpoint> {
-        let urls: Vec<String> = urls.iter().map(|url| url.to_string()).collect();
-        Arc::new(Endpoint::parse(&urls, cluster, Duration::from_secs(1)).unwrap())
+        Arc::new(Endpoint::try_from(&options(urls, cluster)).unwrap())
     }
 
     #[test]
@@ -936,10 +953,7 @@ mod tests {
 
     #[test]
     fn an_endpoint_needs_a_url_and_a_standalone_one_takes_only_one() {
-        let parse = |urls: &[&str], cluster| {
-            let urls: Vec<String> = urls.iter().map(|url| url.to_string()).collect();
-            Endpoint::parse(&urls, cluster, Duration::from_secs(1))
-        };
+        let parse = |urls: &[&str], cluster| Endpoint::try_from(&options(urls, cluster));
         assert!(parse(&[], false).is_err());
         assert!(parse(&[], true).is_err());
         let two = ["redis://127.0.0.1:1", "redis://127.0.0.1:2"];
@@ -1175,7 +1189,7 @@ mod tests {
             .into_connection_info()
             .unwrap();
         let other = node("10.0.0.2", 7292).info(&seed);
-        assert_eq!(Node::of(&other).unwrap(), node("10.0.0.2", 7292));
+        assert_eq!(Node::try_from(&other).unwrap(), node("10.0.0.2", 7292));
         let settings = |info: &ConnectionInfo| {
             let redis = info.redis_settings();
             (

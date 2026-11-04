@@ -506,7 +506,7 @@ fn read_reply(reply: Value) -> RedisStoreResult<(StreamState, Vec<Entry>)> {
 /// Refuses options that can't work, before any connection, and parses the URLs.
 pub(crate) fn check(options: &RedisStoreOptions) -> RedisStoreResult<Endpoint> {
     check_options(options)?;
-    Endpoint::parse(&options.urls, options.cluster, options.response_timeout)
+    Endpoint::try_from(options)
         .map_err(|error| RedisStoreError::invalid(format!("The Redis URLs are wrong: {error}")))
 }
 
