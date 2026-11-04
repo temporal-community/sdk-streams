@@ -11,7 +11,8 @@ use conn::{BlockingPool, Endpoint, Lease, Leased, SharedConnection, WaitPool};
 use prost::Message;
 use records::{Body, LogEntry, with_producers, without_producer};
 use redis::{
-    Cmd, ErrorKind, FromRedisValue, RedisError, RedisResult, Script, ServerErrorKind, Value,
+    Cmd, ErrorKind, FromRedisValue, Pipeline, RedisError, RedisResult, Script, ServerErrorKind,
+    Value,
 };
 use replies::{AppendReply, CloseReply, CreateReply, ReadReply};
 use std::{collections::HashMap, num::NonZeroUsize, sync::Arc, time::Duration};
@@ -155,21 +156,19 @@ impl RedisStore {
             .cmd("WAIT")
             .arg(wait.replicas)
             .arg(wait.timeout.as_millis());
-        let mut loaded = false;
-        loop {
-            let replies: Vec<Value> = pipe.query_async(conn).await?;
-            let Ok([reply, acked]) = <[Value; 2]>::try_from(replies) else {
-                return Ok(Err(RedisStoreError::storage("Redis gave WAIT no answer")));
-            };
-            match reply.extract_error() {
-                Err(error) if !loaded && no_script(&error) => {
-                    script.load_async(conn).await?;
-                    loaded = true;
-                }
-                Err(error) => return Ok(Err(error.into())),
-                Ok(reply) => return Ok(acknowledged(wait, acked).map(|()| reply)),
-            }
+        let mut replies = write_replies(&pipe, conn).await?;
+        // The script didn't run, so the pipeline runs again after the load.
+        if let [Value::ServerError(error), _] = &replies
+            && error.kind() == Some(ServerErrorKind::NoScript)
+        {
+            script.load_async(conn).await?;
+            replies = write_replies(&pipe, conn).await?;
         }
+        let [reply, acked] = replies;
+        Ok(reply
+            .extract_error()
+            .map_err(RedisStoreError::from)
+            .and_then(|reply| acknowledged(wait, acked).map(|()| reply)))
     }
 }
 
@@ -376,6 +375,18 @@ fn acknowledged(wait: &Wait, acked: Value) -> RedisStoreResult<()> {
 
 fn no_script(error: &redis::RedisError) -> bool {
     error.kind() == ErrorKind::Server(ServerErrorKind::NoScript)
+}
+
+/// The replies of a write pipeline, the script's and the `WAIT`'s.
+async fn write_replies(pipe: &Pipeline, conn: &mut SharedConnection) -> RedisResult<[Value; 2]> {
+    let replies: Vec<Value> = pipe.query_async(conn).await?;
+    <[Value; 2]>::try_from(replies).map_err(|replies| {
+        RedisError::from((
+            ErrorKind::Parse,
+            "Redis gave a write pipeline the wrong number of answers",
+            replies.len().to_string(),
+        ))
+    })
 }
 
 /// Runs a script call, and loads the script when Redis lacks it.
