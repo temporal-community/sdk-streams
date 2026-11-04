@@ -42,13 +42,20 @@ pub(crate) fn standalone() -> Vec<Arc<dyn TestBackend>> {
     vec![Arc::new(waits), Arc::new(plain)]
 }
 
-/// The backend of the cluster.
+/// The backends of the cluster, with `WAIT` on each primary's replica and with none.
 pub(crate) fn cluster() -> Vec<Arc<dyn TestBackend>> {
-    vec![Arc::new(RedisBackend {
-        url: cluster_url(),
+    let url = cluster_url();
+    let waits = RedisBackend {
+        url: url.clone(),
+        cluster: true,
+        wait_replicas: 1,
+    };
+    let plain = RedisBackend {
+        url,
         cluster: true,
         wait_replicas: 0,
-    })]
+    };
+    vec![Arc::new(waits), Arc::new(plain)]
 }
 
 /// Whether a standalone server has a replica that is online.

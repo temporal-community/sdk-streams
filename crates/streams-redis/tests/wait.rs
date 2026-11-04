@@ -58,6 +58,33 @@ async fn replicas(url: &str) -> Vec<String> {
         .collect()
 }
 
+/// The URL of each replica of the cluster.
+async fn cluster_replicas(url: &str) -> Vec<String> {
+    let client = redis::cluster::ClusterClient::new(vec![url]).unwrap();
+    let mut conn = client.get_async_connection().await.unwrap();
+    let ranges: Vec<Vec<redis::Value>> = redis::cmd("CLUSTER")
+        .arg("SLOTS")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    // Each range is its start, its end, its primary, and then its replicas.
+    let mut urls: Vec<String> = ranges
+        .iter()
+        .flat_map(|range| range.iter().skip(3))
+        .filter_map(|node| {
+            let redis::Value::Array(node) = node else {
+                return None;
+            };
+            let host: String = redis::from_redis_value(node.first()?.clone()).ok()?;
+            let port: u16 = redis::from_redis_value(node.get(1)?.clone()).ok()?;
+            Some(format!("redis://{host}:{port}/0"))
+        })
+        .collect();
+    urls.sort();
+    urls.dedup();
+    urls
+}
+
 /// Stops each replica from applying the primary's writes, until [resume] or 5 s.
 async fn pause(replicas: &[String]) {
     for replica in replicas {
@@ -159,6 +186,46 @@ async fn too_few_replicas(url: &str, cluster: bool) {
             CreateOutcome::Exists
         );
     }
+}
+
+/// A `WAIT` on a node with no write of its own returns at once, so only a `WAIT` on the write's
+/// primary fails while the replicas pause.
+#[tokio::test]
+#[ignore = "needs a Redis cluster"]
+async fn a_cluster_write_waits_for_the_replica_of_its_own_primary() {
+    let _lock = SERVER.lock().await;
+    let url = cluster_url();
+    let replicas = cluster_replicas(&url).await;
+    assert!(
+        !replicas.is_empty(),
+        "the cluster at STREAMS_REDIS_CLUSTER_URL needs replicas"
+    );
+    let namespace = unique("ns");
+    let create = |store: RedisStore, id: &'static str| {
+        let namespace = namespace.clone();
+        async move {
+            let handle = StreamHandle {
+                id: id.to_string(),
+                ..Default::default()
+            };
+            store
+                .create(
+                    &namespace,
+                    &handle,
+                    None,
+                    Owner::Client,
+                    &Withdrawal::default(),
+                )
+                .await
+        }
+    };
+    let paused = store(&url, true, 1, SHORT).await;
+    pause(&replicas).await;
+    let refused = create(paused, "paused").await;
+    resume(&replicas).await;
+    assert_eq!(refused.unwrap_err().reason, Reason::Storage);
+    let acked = create(store(&url, true, 1, LONG).await, "acked").await;
+    assert_eq!(acked.unwrap().outcome, CreateOutcome::Created);
 }
 
 /// A create, resend or close that finds its write done waits for the replicas to have that write.
