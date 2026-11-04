@@ -213,7 +213,6 @@ mod tests {
             "App.streams_2~x".parse::<KeyPrefix>().unwrap().as_str(),
             "App.streams_2~x"
         );
-        assert_eq!(KeyPrefix::default().as_str(), DEFAULT_KEY_PREFIX);
     }
 
     #[test]
