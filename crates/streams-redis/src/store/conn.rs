@@ -16,9 +16,10 @@ use std::{
     ops::RangeInclusive,
     path::PathBuf,
     str::FromStr,
-    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    sync::Arc,
     time::Duration,
 };
+use parking_lot::Mutex;
 use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore},
     time::Instant,
@@ -250,7 +251,7 @@ impl<C> Pool<C> {
         let Ok(permit) = permit else {
             return Ok(None);
         };
-        let idle = lock(&self.idle).pop();
+        let idle = self.idle.lock().pop();
         let reused = idle.is_some();
         let conn = match idle {
             Some(conn) => conn,
@@ -293,20 +294,14 @@ impl<C> Lease<C> {
             Err(error) if error.code().is_none() => {
                 // A server restart also closed the other idle connections.
                 if reused && stale(error) {
-                    lock(&idle).clear();
+                    idle.lock().clear();
                 }
             }
             // Push it back before the permit drops, so the next lease finds it.
-            _ => lock(&idle).push(conn),
+            _ => idle.lock().push(conn),
         }
         result
     }
-}
-
-/// Each change under these locks is a single push, pop or insert, so a poisoned lock still guards
-/// valid data.
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Whether the connection itself failed, as when the server closed it. A timeout only shows that
@@ -476,18 +471,18 @@ struct SlotCache(Mutex<HashMap<u16, Node>>);
 
 impl SlotCache {
     fn get(&self, slot: Option<u16>) -> Option<Node> {
-        lock(&self.0).get(&slot?).cloned()
+        self.0.lock().get(&slot?).cloned()
     }
 
     fn learn(&self, slot: u16, node: Node) {
-        lock(&self.0).insert(slot, node);
+        self.0.lock().insert(slot, node);
     }
 
     /// Removes the slot's entry if it still points at `node`. A failover can change a node's
     /// address permanently, and only a redirect would update the entry.
     fn forget(&self, slot: Option<u16>, node: &Node) {
         if let Some(slot) = slot {
-            let mut slots = lock(&self.0);
+            let mut slots = self.0.lock();
             if slots.get(&slot) == Some(node) {
                 slots.remove(&slot);
             }
@@ -723,7 +718,7 @@ impl BlockingPool {
     }
 
     fn node(&self, node: &Node) -> Arc<NodePool> {
-        lock(&self.nodes)
+        self.nodes.lock()
             .entry(node.clone())
             .or_insert_with(|| {
                 Arc::new(NodePool {
@@ -986,7 +981,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_millis(500);
         let blocked = Mutex::new(None);
         let read = pool.query("s", deadline, |wait| {
-            *blocked.lock().unwrap() = Some(wait);
+            *blocked.lock() = Some(wait);
             redis::cmd("XREAD")
         });
         let free = async {
@@ -996,7 +991,7 @@ mod tests {
         // The paused clock can pass the read's deadline before the answer comes, so only the
         // block time counts.
         let _ = tokio::join!(read, free);
-        assert_eq!(*blocked.lock().unwrap(), Some(Duration::from_millis(200)));
+        assert_eq!(*blocked.lock(), Some(Duration::from_millis(200)));
     }
 
     #[tokio::test]
