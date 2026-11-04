@@ -3,23 +3,27 @@
 
 mod conn;
 mod records;
+mod replies;
 mod scripts;
 
 use crate::{KeyPrefix, RedisStoreError, RedisStoreOptions, RedisStoreResult};
 use conn::{BlockingPool, Endpoint, Lease, Leased, SharedConnection, WaitPool};
 use prost::Message;
 use records::{Body, LogEntry, with_producers, without_producer};
-use redis::{Cmd, ErrorKind, RedisError, RedisResult, Script, ServerErrorKind, Value};
-use std::{num::NonZeroUsize, sync::Arc, time::Duration};
+use redis::{
+    Cmd, ErrorKind, FromRedisValue, RedisError, RedisResult, Script, ServerErrorKind, Value,
+};
+use replies::{AppendReply, CloseReply, CreateReply, ReadReply};
+use std::{collections::HashMap, num::NonZeroUsize, sync::Arc, time::Duration};
 use temporalio_streams::{
     StreamResult,
     epoch::epoch_key,
     ids::StreamKeys,
-    offset::{entry_id_of_offset, offset_of_entry_id},
+    offset::entry_id_of_offset,
     proto::{Producer, StreamHandle},
     store::{
-        Appended, Batch, Capabilities, Closed, CreateOutcome, Created, Entry, FORMAT_VERSION,
-        MAX_TTL, Owner, Store, StreamState, TOMBSTONE, Withdrawal, owner_chain,
+        Appended, Batch, Capabilities, Closed, Created, Entry, FORMAT_VERSION, MAX_TTL, Owner,
+        Store, StreamState, TOMBSTONE, Withdrawal, owner_chain,
     },
 };
 use tokio::time::Instant;
@@ -90,24 +94,27 @@ impl RedisStore {
 
     /// Runs a write script, and then `WAIT` when the options set replicas. Both are in one
     /// pipeline on one connection, so the `WAIT` covers the script's writes.
-    async fn write(&self, script: &Script, cmd: &Cmd) -> RedisStoreResult<Value> {
-        let Some(wait) = &self.wait else {
-            return run_script(script, cmd, &mut self.shared.clone())
-                .await
-                .map_err(RedisStoreError::from);
-        };
-        let mut lease = match wait.pool.take().await? {
-            Leased::Busy => {
-                return Err(RedisStoreError::storage(
-                    "Every connection for writes with WAIT stayed busy for the response timeout",
-                ));
+    async fn write<T: FromRedisValue>(&self, script: &Script, cmd: &Cmd) -> RedisStoreResult<T> {
+        let reply = match &self.wait {
+            None => run_script(script, cmd, &mut self.shared.clone()).await?,
+            Some(wait) => {
+                let mut lease = match wait.pool.take().await? {
+                    Leased::Busy => {
+                        return Err(RedisStoreError::storage(
+                            "Every connection for writes with WAIT stayed busy for the response \
+                             timeout",
+                        ));
+                    }
+                    // A write runs once, since the server may have run it before its connection
+                    // closed.
+                    Leased::Idle(lease) => Lease::from(lease),
+                    Leased::New(lease) => lease,
+                };
+                let reply = Self::write_and_wait(wait, script, cmd, lease.conn()).await;
+                lease.settle(reply)??
             }
-            // A write runs once, since the server may have run it before its connection closed.
-            Leased::Idle(lease) => Lease::from(lease),
-            Leased::New(lease) => lease,
         };
-        let reply = Self::write_and_wait(wait, script, cmd, lease.conn()).await;
-        lease.settle(reply)?
+        Ok(redis::from_redis_value(reply).map_err(RedisError::from)?)
     }
 
     /// The Producer of the batch of `entry`, when the batch starts before `entry`.
@@ -199,19 +206,8 @@ impl Store for RedisStore {
             .arg(TOMBSTONE.as_millis())
             .arg(chain)
             .arg(self.waits());
-        let reply = self.write(&scripts::CREATE_SCRIPT, &cmd).await?;
-        let [outcome, stored] = strings::<2>(reply, "create")?;
-        let outcome = match outcome.as_str() {
-            "created" => CreateOutcome::Created,
-            "exists" => CreateOutcome::Exists,
-            other => return Err(bad_reply("create", other).into()),
-        };
-        let stored: u64 = stored.parse().map_err(|_| bad_reply("create", &stored))?;
-        Ok(Created {
-            outcome,
-            retention: Duration::from_millis(stored),
-            flagged: false,
-        })
+        let CreateReply(created) = self.write(&scripts::CREATE_SCRIPT, &cmd).await?;
+        Ok(created)
     }
 
     async fn append(
@@ -239,22 +235,8 @@ impl Store for RedisStore {
         for record in batch.records {
             cmd.arg(without_producer(record, producer)?);
         }
-        let reply = self.write(&scripts::APPEND_SCRIPT, &cmd).await?;
-        let [outcome, first, last, flag] = strings::<4>(reply, "append")?;
-        let resend = match outcome.as_str() {
-            "ok" => false,
-            "resend" => true,
-            other => return Err(bad_reply("append", other).into()),
-        };
-        let offsets = match (first.as_str(), last.as_str()) {
-            ("", _) | (_, "") => None,
-            (first, last) => Some((offset_of_entry_id(first)?, offset_of_entry_id(last)?)),
-        };
-        Ok(Appended {
-            offsets,
-            resend,
-            flagged: flagged(&flag, "append")?,
-        })
+        let AppendReply(appended) = self.write(&scripts::APPEND_SCRIPT, &cmd).await?;
+        Ok(appended)
     }
 
     /// Closes a Stream with an encoded close Record, if the Producer's kind and the handle's run
@@ -277,17 +259,8 @@ impl Store for RedisStore {
             .arg(record)
             .arg(owner_chain(handle))
             .arg(self.waits());
-        let reply = self.write(&scripts::CLOSE_SCRIPT, &cmd).await?;
-        let [outcome, id] = strings::<2>(reply, "close")?;
-        let already = match outcome.as_str() {
-            "closed" => false,
-            "already" => true,
-            other => return Err(bad_reply("close", other).into()),
-        };
-        Ok(Closed {
-            offset: offset_of_entry_id(&id)?,
-            already,
-        })
+        let CloseReply(closed) = self.write(&scripts::CLOSE_SCRIPT, &cmd).await?;
+        Ok(closed)
     }
 
     /// Reads the Stream's state and up to `count` entries from `from`, inclusive. Zero reads
@@ -316,7 +289,13 @@ impl Store for RedisStore {
         let reply = run_script(&scripts::READ_SCRIPT, &cmd, &mut self.shared.clone())
             .await
             .map_err(RedisStoreError::from)?;
-        Ok(read_reply(reply)?)
+        let ReadReply {
+            state,
+            entries,
+            earlier,
+        } = redis::from_redis_value(reply)
+            .map_err(|error| RedisStoreError::from(RedisError::from(error)))?;
+        Ok((state, with_producers(entries, earlier)?))
     }
 
     /// Reads up to `count` entries at or before `before`, newest first, with `XREVRANGE`.
@@ -410,97 +389,8 @@ async fn run_script(script: &Script, cmd: &Cmd, conn: &mut SharedConnection) -> 
     }
 }
 
-/// The flag of a script answer. Lua has no bool, and a nil would end the answer's array, so the
-/// scripts give `1` or an empty string.
-fn flagged(flag: &str, call: &str) -> RedisStoreResult<bool> {
-    match flag {
-        "1" => Ok(true),
-        "" => Ok(false),
-        other => Err(bad_reply(call, other)),
-    }
-}
-
 fn bad_reply(call: &str, reply: impl std::fmt::Debug) -> RedisStoreError {
     RedisStoreError::storage(format!("Redis gave the {call} script the answer {reply:?}"))
-}
-
-fn text(value: &Value) -> Option<String> {
-    match value {
-        Value::BulkString(bytes) => String::from_utf8(bytes.clone()).ok(),
-        Value::SimpleString(text) => Some(text.clone()),
-        Value::Int(number) => Some(number.to_string()),
-        Value::Nil => Some(String::new()),
-        _ => None,
-    }
-}
-
-fn strings<const N: usize>(reply: Value, call: &str) -> RedisStoreResult<[String; N]> {
-    let Value::Array(items) = &reply else {
-        return Err(bad_reply(call, &reply));
-    };
-    let texts: Option<Vec<String>> = items.iter().map(text).collect();
-    texts
-        .and_then(|texts| texts.try_into().ok())
-        .ok_or_else(|| bad_reply(call, &reply))
-}
-
-fn read_reply(reply: Value) -> RedisStoreResult<(StreamState, Vec<Entry>)> {
-    let Value::Array(parts) = reply else {
-        return Err(bad_reply("read", reply));
-    };
-    let [
-        Value::Array(meta),
-        Value::Array(time),
-        Value::Array(entries),
-        producer,
-    ] = <[Value; 4]>::try_from(parts).map_err(|parts| bad_reply("read", parts))?
-    else {
-        return Err(bad_reply("read", "parts that are not arrays"));
-    };
-    let earlier = match producer {
-        Value::BulkString(producer) if !producer.is_empty() => {
-            Some(Producer::decode(producer.as_slice()).map_err(|error| bad_reply("read", error))?)
-        }
-        _ => None,
-    };
-    // A field that the Stream doesn't have comes back as nil, and `text` gives it as empty.
-    let meta: Vec<Option<String>> = meta
-        .iter()
-        .map(|value| text(value).filter(|text| !text.is_empty()))
-        .collect();
-    let field = |i: usize| meta.get(i).cloned().flatten();
-    let offset = |i: usize| -> RedisStoreResult<i64> {
-        field(i).map_or(Ok(0), |id| Ok(offset_of_entry_id(&id)?))
-    };
-    let number = |i: usize| -> RedisStoreResult<i64> {
-        field(i).map_or(Ok(0), |text| {
-            text.parse().map_err(|_| bad_reply("read", text))
-        })
-    };
-    let time: Vec<i64> = time
-        .iter()
-        .map(|value| text(value).and_then(|text| text.parse().ok()))
-        .collect::<Option<_>>()
-        .ok_or_else(|| bad_reply("read", &time))?;
-    let [seconds, micros] = <[i64; 2]>::try_from(time).map_err(|time| bad_reply("read", time))?;
-    let state = StreamState {
-        exists: field(0).is_some(),
-        version: u32::try_from(number(0)?).map_err(|error| bad_reply("read", error))?,
-        closed_at: match field(1) {
-            Some(_) => Some(offset(2)?),
-            None => None,
-        },
-        newest: offset(3)?,
-        trimmed: offset(4)?,
-        retention: Duration::from_millis(
-            u64::try_from(number(5)?).map_err(|error| bad_reply("read", error))?,
-        ),
-        expires_ms: number(6)?,
-        now_ms: seconds * 1000 + micros / 1000,
-    };
-    let entries: Vec<LogEntry> =
-        redis::from_redis_value(Value::Array(entries)).map_err(RedisError::from)?;
-    Ok((state, with_producers(entries, earlier)?))
 }
 
 /// Refuses options that can't work, before any connection, and parses the URLs.
@@ -583,18 +473,24 @@ async fn check_server(shared: &SharedConnection) -> RedisStoreResult<()> {
     }
     let mut policy = redis::cmd("CONFIG");
     policy.arg("GET").arg("maxmemory-policy");
-    match shared.on_each_primary(policy).await {
-        Ok(replies) => {
-            for (node, reply) in replies {
-                if let Some(policy) = eviction_policy(reply).filter(|p| p != "noeviction") {
-                    tracing::warn!(
-                        node = node.as_deref().unwrap_or("the server"),
-                        policy,
-                        "Redis may evict Stream keys under memory pressure, which loses Records \
-                         and their fence. Use maxmemory-policy noeviction for Streams."
-                    );
-                    break;
-                }
+    let policies = shared.on_each_primary(policy).await.and_then(|replies| {
+        replies
+            .into_iter()
+            .map(|(node, reply)| Ok((node, eviction_policy(reply)?)))
+            .collect::<RedisResult<Vec<_>>>()
+    });
+    match policies {
+        Ok(policies) => {
+            let evicting = policies
+                .into_iter()
+                .find_map(|(node, policy)| Some((node, policy.filter(|p| p != "noeviction")?)));
+            if let Some((node, policy)) = evicting {
+                tracing::warn!(
+                    node = node.as_deref().unwrap_or("the server"),
+                    policy,
+                    "Redis may evict Stream keys under memory pressure, which loses Records and \
+                     their fence. Use maxmemory-policy noeviction for Streams."
+                );
             }
         }
         // Managed services often refuse CONFIG, and some default to a `volatile-*` policy.
@@ -627,12 +523,14 @@ fn check_version(node: &str, info: &str) -> RedisStoreResult<()> {
     let version = info
         .lines()
         .find_map(|line| line.trim().strip_prefix("redis_version:"))
-        .unwrap_or("0");
+        .ok_or_else(|| RedisStoreError::invalid(format!("{node} reports no Redis version")))?;
     let major: u32 = version
         .split('.')
         .next()
         .and_then(|major| major.parse().ok())
-        .unwrap_or(0);
+        .ok_or_else(|| {
+            RedisStoreError::invalid(format!("{node} reports the Redis version {version:?}"))
+        })?;
     if major < 7 {
         return Err(RedisStoreError::invalid(format!(
             "The Redis Store needs Redis 7.0 or later, but {node} reports {version}"
@@ -641,18 +539,10 @@ fn check_version(node: &str, info: &str) -> RedisStoreResult<()> {
     Ok(())
 }
 
-fn eviction_policy(reply: Value) -> Option<String> {
-    let flat: Vec<String> = match reply {
-        Value::Map(pairs) => pairs
-            .into_iter()
-            .flat_map(|(name, value)| [text(&name), text(&value)])
-            .collect::<Option<_>>()?,
-        Value::Array(items) => items.iter().map(text).collect::<Option<_>>()?,
-        _ => return None,
-    };
-    flat.chunks(2)
-        .find(|pair| pair.first().map(String::as_str) == Some("maxmemory-policy"))
-        .and_then(|pair| pair.get(1).cloned())
+/// The policy in a `CONFIG GET maxmemory-policy` reply.
+fn eviction_policy(reply: Value) -> RedisResult<Option<String>> {
+    let mut config: HashMap<String, String> = redis::from_redis_value(reply)?;
+    Ok(config.remove("maxmemory-policy"))
 }
 
 #[cfg(test)]
