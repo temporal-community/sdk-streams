@@ -91,8 +91,12 @@ impl Endpoint {
         })
     }
 
-    fn cluster(&self) -> bool {
-        matches!(self.topology, Topology::Cluster { .. })
+    /// How a blocking read of `key` finds its first node.
+    fn route(&self, key: &str) -> Route {
+        match self.topology {
+            Topology::Standalone(_) => Route::Standalone,
+            Topology::Cluster { .. } => Route::Slot(slot(key)),
+        }
     }
 
     /// The server, or the cluster seed whose credentials and TLS every node gets.
@@ -517,8 +521,8 @@ impl FromStr for Node {
 struct SlotCache(Mutex<HashMap<u16, Node>>);
 
 impl SlotCache {
-    fn get(&self, slot: Option<u16>) -> Option<Node> {
-        self.0.lock().get(&slot?).cloned()
+    fn get(&self, slot: u16) -> Option<Node> {
+        self.0.lock().get(&slot).cloned()
     }
 
     fn learn(&self, slot: u16, node: Node) {
@@ -527,22 +531,32 @@ impl SlotCache {
 
     /// Removes the slot's entry if it still points at `node`. A failover can change a node's
     /// address permanently, and only a redirect would update the entry.
-    fn forget(&self, slot: Option<u16>, node: &Node) {
-        if let Some(slot) = slot {
-            let mut slots = self.0.lock();
-            if slots.get(&slot) == Some(node) {
-                slots.remove(&slot);
-            }
+    fn forget(&self, slot: u16, node: &Node) {
+        let mut slots = self.0.lock();
+        if slots.get(&slot) == Some(node) {
+            slots.remove(&slot);
         }
     }
 }
 
-/// What a blocking read knows when a try fails.
-#[derive(Clone, Copy, Debug, Default)]
-struct Attempt {
-    cluster: bool,
-    /// The read already used one redirect.
-    redirected: bool,
+/// How a blocking read found the node of its try.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Route {
+    /// The one server of a standalone Store.
+    Standalone,
+    /// A cluster node for the slot, from the slot cache, the live topology or the seeds.
+    Slot(u16),
+    /// The cluster node that a redirect gave for the slot.
+    Redirected(u16),
+}
+
+impl Route {
+    fn slot(self) -> Option<u16> {
+        match self {
+            Route::Standalone => None,
+            Route::Slot(slot) | Route::Redirected(slot) => Some(slot),
+        }
+    }
 }
 
 /// What a blocking read does after a failed try.
@@ -559,19 +573,53 @@ enum Step {
 }
 
 /// The retry policy of a blocking read. It has no I/O, so a table test covers it.
-fn classify(error: &RedisError, attempt: Attempt) -> Step {
+fn classify(error: &RedisError, route: Route) -> Step {
     if unreachable(error) {
         return Step::NextSeed;
     }
-    if !attempt.cluster {
-        return Step::Fail;
-    }
-    // One redirect is normal when the cache had no entry or a stale one. A second means the cluster
-    // is migrating the slot.
-    match redirect(error) {
-        Some(target) if !attempt.redirected => Step::Redirect(target),
+    match (route, redirect(error)) {
+        // A standalone server never redirects, so a redirect there is an error.
+        (Route::Standalone, _) => Step::Fail,
+        // One redirect is normal when the cache had no entry or a stale one. A second means the
+        // cluster is migrating the slot.
+        (Route::Slot(_), Some(target)) => Step::Redirect(target),
         _ if resharding(error) => Step::NoWake,
         _ => Step::Fail,
+    }
+}
+
+/// A read that blocks until the log at `key` has an entry after `after`, or until `deadline`.
+struct BlockedRead<'a> {
+    key: &'a str,
+    after: &'a str,
+    deadline: Instant,
+}
+
+impl BlockedRead<'_> {
+    /// The `XREAD` for the time left to the deadline. A lease can wait up to [PERMIT_WAIT], so the
+    /// block time comes from the deadline once the read has its connection.
+    fn xread(&self) -> Cmd {
+        let wait = self.deadline.saturating_duration_since(Instant::now());
+        let mut xread = redis::cmd("XREAD");
+        xread
+            .arg("COUNT")
+            .arg(1)
+            .arg("BLOCK")
+            // `BLOCK 0` waits with no end, so a read at its deadline blocks for 1 ms.
+            .arg(wait.as_millis().max(1))
+            .arg("STREAMS")
+            .arg(self.key)
+            .arg(self.after);
+        xread
+    }
+}
+
+/// Whether an `XREAD` reply has an entry. A read that ends with no entry gives nil.
+fn woke(reply: &Value) -> bool {
+    match reply {
+        Value::Array(keys) => !keys.is_empty(),
+        Value::Map(keys) => !keys.is_empty(),
+        _ => false,
     }
 }
 
@@ -621,71 +669,49 @@ impl BlockingPool {
         }
     }
 
-    /// Waits for an entry after the entry id `after` in the log at `key`. With no free connection,
-    /// or during a slot migration, it returns `false` early, and the caller reads the Stream again.
+    /// Waits for an entry after the entry id `after` in the log at `key`. Gives `false` when the
+    /// read ends with no entry, also early with no free connection or during a slot migration. Then
+    /// the caller reads the Stream again.
     pub(crate) async fn wait_after(
         &self,
         key: &str,
         after: &str,
         deadline: Instant,
     ) -> RedisResult<bool> {
-        let xread = |wait: Duration| {
-            let mut xread = redis::cmd("XREAD");
-            xread
-                .arg("COUNT")
-                .arg(1)
-                .arg("BLOCK")
-                // `BLOCK 0` waits with no end, so a read at its deadline blocks for 1 ms.
-                .arg(wait.as_millis().max(1))
-                .arg("STREAMS")
-                .arg(key)
-                .arg(after);
-            xread
+        let read = BlockedRead {
+            key,
+            after,
+            deadline,
         };
-        let reply = self.query(key, deadline, xread).await?;
-        Ok(
-            matches!(reply, Some(Value::Array(ref keys)) if !keys.is_empty())
-                || matches!(reply, Some(Value::Map(ref keys)) if !keys.is_empty()),
-        )
-    }
-
-    /// Runs the command that `cmd` builds for the time left to `deadline`, which can be zero.
-    /// Returns `None` if no connection was free in time, or if the key's slot is migrating.
-    async fn query(
-        &self,
-        key: &str,
-        deadline: Instant,
-        cmd: impl Fn(Duration) -> Cmd,
-    ) -> RedisResult<Option<Value>> {
-        let slot = self.endpoint.cluster().then(|| slot(key));
-        let mut node = match (self.slots.get(slot), slot) {
-            (Some(node), _) => Some(node),
-            (None, Some(slot)) => self.live_primary(slot).await,
-            (None, None) => None,
+        let mut route = self.endpoint.route(key);
+        let mut node = match route.slot() {
+            Some(slot) => match self.slots.get(slot) {
+                Some(node) => Some(node),
+                None => self.live_primary(slot).await,
+            },
+            None => None,
         }
         .unwrap_or_else(|| self.endpoint.first().node.clone());
         // When a node is down, try each other node once. After a failover the live topology has
         // the slot's new primary, and a seed that is down may have a replica that took over.
         let mut fallbacks: Option<std::vec::IntoIter<Node>> = None;
-        let mut attempt = Attempt {
-            cluster: slot.is_some(),
-            ..Attempt::default()
-        };
         loop {
             // Each node that is down costs a connect timeout, so the seed list can take longer than
             // the read.
             if deadline <= Instant::now() {
-                return Ok(None);
+                return Ok(false);
             }
-            let error = match self.try_node(&node, deadline, &cmd).await {
-                Ok(answer) => return Ok(answer),
+            let error = match self.try_node(&node, &read).await {
+                Ok(woke) => return Ok(woke),
                 Err(error) => error,
             };
-            match classify(&error, attempt) {
+            match classify(&error, route) {
                 Step::NextSeed => {
-                    self.slots.forget(slot, &node);
+                    if let Some(slot) = route.slot() {
+                        self.slots.forget(slot, &node);
+                    }
                     if fallbacks.is_none() {
-                        let live = match slot {
+                        let live = match route.slot() {
                             Some(slot) => self.live_primary(slot).await,
                             None => None,
                         };
@@ -701,59 +727,51 @@ impl BlockingPool {
                     node = nodes.find(|other| *other != node).ok_or(error)?;
                 }
                 Step::Redirect(target) => {
-                    if let Some(slot) = slot {
+                    if let Route::Slot(slot) = route {
                         self.slots.learn(slot, target.clone());
+                        route = Route::Redirected(slot);
                     }
                     node = target;
-                    attempt.redirected = true;
                 }
                 Step::NoWake => {
                     tokio::time::sleep_until(deadline.min(Instant::now() + RESHARD_WAIT)).await;
-                    return Ok(None);
+                    return Ok(false);
                 }
                 Step::Fail => return Err(error),
             }
         }
     }
 
-    /// One try of the command on `node`. A connection from the idle list that the server closed
-    /// gets one more try on a new connection.
-    async fn try_node(
-        &self,
-        node: &Node,
-        deadline: Instant,
-        cmd: &impl Fn(Duration) -> Cmd,
-    ) -> RedisResult<Option<Value>> {
+    /// One try of the read on `node`. A connection from the idle list that the server closed gets
+    /// one more try on a new connection.
+    async fn try_node(&self, node: &Node, read: &BlockedRead<'_>) -> RedisResult<bool> {
         let node = self.node(node);
-        let mut lease = match node.lease(deadline).await? {
-            Leased::Busy => return Ok(None),
+        let mut lease = match node.lease(read.deadline).await? {
+            Leased::Busy => return Ok(false),
             Leased::New(lease) => lease,
             Leased::Idle(mut lease) => {
-                let answer = self.run(lease.conn(), deadline, cmd).await?;
+                let answer = self.run(lease.conn(), read).await?;
                 match lease.settle(answer) {
-                    Settled::Done(answer) => return answer.map(Some),
+                    Settled::Done(answer) => return answer,
                     Settled::Stale(permit) => permit.open(node.open()).await?,
                 }
             }
         };
-        let answer = self.run(lease.conn(), deadline, cmd).await?;
-        lease.settle(answer).map(Some)
+        let answer = self.run(lease.conn(), read).await?;
+        lease.settle(answer)
     }
 
-    /// Runs the command that `cmd` builds for the time left to `deadline`. The outer error is a
-    /// read that Redis didn't answer in time. Then the lease drops, which closes the connection.
+    /// Runs the read on `conn`. The outer error is a read that Redis didn't answer in time. Then
+    /// the lease drops, which closes the connection.
     async fn run(
         &self,
         conn: &mut MultiplexedConnection,
-        deadline: Instant,
-        cmd: &impl Fn(Duration) -> Cmd,
-    ) -> RedisResult<RedisResult<Value>> {
-        // The lease can wait up to [PERMIT_WAIT], so the block time comes from the deadline.
-        let wait = deadline.saturating_duration_since(Instant::now());
+        read: &BlockedRead<'_>,
+    ) -> RedisResult<RedisResult<bool>> {
         // A server that stopped without a reset never replies, and the read must still end.
-        tokio::time::timeout_at(
-            deadline + self.endpoint.response_timeout,
-            cmd(wait).query_async::<Value>(conn),
+        let reply = tokio::time::timeout_at(
+            read.deadline + self.endpoint.response_timeout,
+            read.xread().query_async::<Value>(conn),
         )
         .await
         .map_err(|_| {
@@ -761,7 +779,8 @@ impl BlockingPool {
                 ErrorKind::Io,
                 "Redis did not answer a blocked read by its deadline",
             ))
-        })
+        })?;
+        Ok(reply.map(|reply| woke(&reply)))
     }
 
     /// The primary that serves `slot` now, as the shared connection of a cluster sees it.
@@ -870,10 +889,7 @@ mod tests {
 
     #[test]
     fn the_retry_policy_of_a_blocking_read() {
-        let cluster = Attempt {
-            cluster: true,
-            ..Attempt::default()
-        };
+        let cluster = Route::Slot(1);
         let cases = [
             // The pool already tried a new connection, so a connection error means the node is
             // down.
@@ -891,23 +907,20 @@ mod tests {
             // A second redirect, or an `ASK`, means the slot is moving.
             (
                 reply("MOVED 1 10.0.0.2:7292"),
-                Attempt {
-                    redirected: true,
-                    ..cluster
-                },
+                Route::Redirected(1),
                 Step::NoWake,
             ),
             (reply("ASK 1 10.0.0.2:7292"), cluster, Step::NoWake),
             // A standalone server never redirects, so a redirect there is an error.
             (
                 reply("MOVED 1 10.0.0.2:7292"),
-                Attempt::default(),
+                Route::Standalone,
                 Step::Fail,
             ),
             (reply("WRONGTYPE not a stream"), cluster, Step::Fail),
         ];
-        for (error, attempt, step) in cases {
-            assert_eq!(classify(&error, attempt), step, "{error} {attempt:?}");
+        for (error, route, step) in cases {
+            assert_eq!(classify(&error, route), step, "{error} {route:?}");
         }
     }
 
@@ -915,11 +928,10 @@ mod tests {
     fn a_slot_entry_goes_only_while_it_names_the_dead_node() {
         let cache = SlotCache::default();
         cache.learn(1, node("10.0.0.2", 7292));
-        cache.forget(Some(1), &node("10.0.0.3", 7293));
-        assert_eq!(cache.get(Some(1)), Some(node("10.0.0.2", 7292)));
-        cache.forget(Some(1), &node("10.0.0.2", 7292));
-        assert_eq!(cache.get(Some(1)), None);
-        assert_eq!(cache.get(None), None);
+        cache.forget(1, &node("10.0.0.3", 7293));
+        assert_eq!(cache.get(1), Some(node("10.0.0.2", 7292)));
+        cache.forget(1, &node("10.0.0.2", 7292));
+        assert_eq!(cache.get(1), None);
     }
 
     #[test]
@@ -943,14 +955,23 @@ mod tests {
         // node is dropped.
         let pool = BlockingPool::new(endpoint(&[&url], true), NonZeroUsize::MIN, None);
         let key = "test:{dead-node}:log";
+        let mut conn = Client::open(url.as_str())
+            .unwrap()
+            .get_multiplexed_async_connection()
+            .await
+            .unwrap();
+        let _: String = redis::cmd("XADD")
+            .arg(key)
+            .arg("*")
+            .arg("x")
+            .arg("y")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
         pool.slots.learn(slot(key), node("127.0.0.1", dead_port()));
         let deadline = Instant::now() + Duration::from_secs(2);
-        let answer = pool.query(key, deadline, |_| redis::cmd("PING")).await;
-        assert_eq!(
-            answer.unwrap(),
-            Some(Value::SimpleString("PONG".to_string()))
-        );
-        assert_eq!(pool.slots.get(Some(slot(key))), None);
+        assert!(pool.wait_after(key, "0-0", deadline).await.unwrap());
+        assert_eq!(pool.slots.get(slot(key)), None);
     }
 
     #[test]
@@ -1002,30 +1023,36 @@ mod tests {
         dead.local_addr().unwrap().port()
     }
 
-    /// The URL of a server that gives every command a nil array.
-    fn nil_server() -> String {
+    /// The URL of a server that gives every command a nil array, and the commands that it gets.
+    fn nil_server() -> (String, std::sync::mpsc::Receiver<Vec<String>>) {
         use std::io::Write;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
+        let (sent, commands) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             for mut stream in listener.incoming().flatten() {
+                let sent = sent.clone();
                 std::thread::spawn(move || {
                     let mut reader = stream.try_clone().unwrap();
                     let mut parser = redis::Parser::new();
-                    while parser.parse_value(&mut reader).is_ok()
-                        && stream.write_all(b"*-1\r\n").is_ok()
-                    {}
+                    while let Ok(command) = parser.parse_value(&mut reader) {
+                        let _ = sent.send(redis::from_redis_value(command).unwrap());
+                        if stream.write_all(b"*-1\r\n").is_err() {
+                            break;
+                        }
+                    }
                 });
             }
         });
-        format!("redis://{address}")
+        (format!("redis://{address}"), commands)
     }
 
     // The paused clock advances only on `advance`, or to the next timer when all tasks wait. The
     // connections open before the pause, since the clock would jump past a connect.
     #[tokio::test]
     async fn the_block_time_starts_when_the_read_has_a_connection() {
-        let pool = BlockingPool::new(endpoint(&[&nil_server()], false), NonZeroUsize::MIN, None);
+        let (url, commands) = nil_server();
+        let pool = BlockingPool::new(endpoint(&[&url], false), NonZeroUsize::MIN, None);
         let seed = pool.endpoint.first().node.clone();
         let held = new(pool
             .node(&seed)
@@ -1034,31 +1061,31 @@ mod tests {
             .unwrap());
         tokio::time::pause();
         let deadline = Instant::now() + Duration::from_millis(500);
-        let blocked = Mutex::new(None);
-        let read = pool.query("s", deadline, |wait| {
-            *blocked.lock() = Some(wait);
-            redis::cmd("XREAD")
-        });
+        let read = pool.wait_after("s", "0-0", deadline);
         let free = async {
             tokio::time::advance(Duration::from_millis(300)).await;
             held.settle(Ok(())).unwrap();
         };
         // The paused clock can pass the read's deadline before the answer comes, so only the
-        // block time counts.
+        // block time that the server gets counts.
         let _ = tokio::join!(read, free);
-        assert_eq!(*blocked.lock(), Some(Duration::from_millis(200)));
+        let xread = commands
+            .iter()
+            .find(|command| command.first().is_some_and(|name| name == "XREAD"))
+            .unwrap();
+        assert_eq!(xread[1..5], ["COUNT", "1", "BLOCK", "200"]);
     }
 
     #[tokio::test]
     async fn a_read_with_no_free_connection_ends_after_the_permit_wait() {
-        let pool = BlockingPool::new(endpoint(&[&nil_server()], false), NonZeroUsize::MIN, None);
+        let (url, _) = nil_server();
+        let pool = BlockingPool::new(endpoint(&[&url], false), NonZeroUsize::MIN, None);
         let seed = pool.endpoint.first().node.clone();
         let deadline = || Instant::now() + Duration::from_secs(10);
         let _held = new(pool.node(&seed).lease(deadline()).await.unwrap());
         tokio::time::pause();
         let start = Instant::now();
-        let answer = pool.query("s", deadline(), |_| redis::cmd("XREAD")).await;
-        assert_eq!(answer.unwrap(), None);
+        assert!(!pool.wait_after("s", "0-0", deadline()).await.unwrap());
         let waited = start.elapsed();
         assert!(
             waited >= PERMIT_WAIT && waited < Duration::from_secs(10),
