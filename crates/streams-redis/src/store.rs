@@ -11,20 +11,20 @@ use conn::{BlockingPool, Endpoint, Lease, Leased, Origin, SharedConnection, Wait
 use prost::Message;
 use records::{Body, LogEntry, with_producers, without_producer};
 use redis::{
-    Cmd, ErrorKind, FromRedisValue, InfoDict, Pipeline, RedisError, RedisResult, Script,
-    ServerErrorKind, Value,
+    Cmd, ErrorKind, FromRedisValue, InfoDict, Pipeline, RedisError, RedisResult, RedisWrite,
+    Script, ServerErrorKind, ToRedisArgs, Value,
 };
 use replies::{AppendReply, CloseReply, CreateReply, ReadReply};
 use std::{collections::HashMap, num::NonZeroUsize, sync::Arc, time::Duration};
 use temporalio_streams::{
     StreamResult,
-    epoch::{epoch_key, task_key, task_of},
+    epoch::{TASK_KEY_LEN, epoch_key, task_key, task_of},
     ids::{StreamKeys, encode_part},
     offset::entry_id_of_offset,
-    proto::{Producer, StreamHandle, StreamProducerKind},
+    proto::{Producer, StreamHandle, StreamProducerKind, WorkflowTaskEpoch},
     store::{
         Appended, Batch, Capabilities, Closed, Created, Entry, FORMAT_VERSION, MAX_TTL, Owner,
-        Store, StreamState, TOMBSTONE, Withdrawal, owner_chain,
+        Store, StreamState, TOMBSTONE, TaskFacts, Withdrawal, owner_chain,
     },
 };
 use tokio::time::Instant;
@@ -229,10 +229,7 @@ impl Store for RedisStore {
             .arg(withdrawal.superseded)
             .arg(self.safety_ttl.as_millis())
             .arg(TOMBSTONE.as_millis())
-            .arg(task_arg(producer))
-            .arg(completed_arg(withdrawal))
-            .arg(failed_list(withdrawal))
-            .arg(withdrawal.tasks.map_or(&[][..], |tasks| tasks.superseded))
+            .arg(TaskArgs::of(batch))
             .arg(&batch.digest[..])
             .arg(self.wait.is_some())
             .arg(producer.encode_to_vec());
@@ -419,33 +416,61 @@ async fn write_replies(pipe: &Pipeline, conn: &mut SharedConnection) -> RedisRes
     })
 }
 
-/// The task argument of the append script. It is the task key of a Local Activity's dispatching
-/// Workflow Task, and empty for any other kind.
-fn task_arg(producer: &Producer) -> Vec<u8> {
-    if producer.kind != StreamProducerKind::LocalActivity as i32 {
-        return Vec::new();
-    }
-    task_key(&task_of(&producer.epoch.unwrap_or_default())).to_vec()
+/// What an append batch gives the script about its Workflow Task.
+enum TaskArgs<'a> {
+    /// The batch isn't of a Local Activity of a run, so the script tracks no task.
+    Untracked,
+    /// A Local Activity's task, with no task facts, as from an older Core.
+    Task([u8; TASK_KEY_LEN]),
+    /// A Local Activity's task, with the run's task facts.
+    Facts {
+        task: [u8; TASK_KEY_LEN],
+        facts: TaskFacts<'a>,
+    },
 }
 
-/// The completed task argument of the append script. It is `-` when the batch gives no task
-/// facts, empty before the run's first completed task, and that task's key otherwise.
-fn completed_arg(withdrawal: &Withdrawal<'_>) -> Vec<u8> {
-    match withdrawal.tasks {
-        None => b"-".to_vec(),
-        Some(tasks) => tasks
-            .completed
-            .map_or_else(Vec::new, |completed| task_key(completed).to_vec()),
+impl<'a> TaskArgs<'a> {
+    fn of(batch: &Batch<'a>) -> Self {
+        let producer = batch.producer;
+        let kind = StreamProducerKind::LocalActivity as i32;
+        if producer.kind != kind || producer.run_id.is_empty() {
+            return Self::Untracked;
+        }
+        let task = task_key(&task_of(&producer.epoch.unwrap_or_default()));
+        match batch.withdrawal.tasks {
+            None => Self::Task(task),
+            Some(facts) => Self::Facts { task, facts },
+        }
     }
 }
 
-fn failed_list(withdrawal: &Withdrawal<'_>) -> String {
-    let failed = withdrawal.tasks.map_or(&[][..], |tasks| tasks.failed_tasks);
-    failed
-        .iter()
-        .map(i64::to_string)
-        .collect::<Vec<_>>()
-        .join(" ")
+/// The four task arguments of `append.lua`. These are the task key, the completed task key, the
+/// failed tasks' started event ids, 8 bytes each, and the task Superseded facts. With no task facts,
+/// the completed task is empty, and before the run's first completed task it is the zero key.
+impl ToRedisArgs for TaskArgs<'_> {
+    fn write_redis_args<W: ?Sized + RedisWrite>(&self, out: &mut W) {
+        let (task, facts) = match self {
+            Self::Untracked => (&[][..], None),
+            Self::Task(task) => (&task[..], None),
+            Self::Facts { task, facts } => (&task[..], Some(facts)),
+        };
+        out.write_arg(task);
+        let Some(facts) = facts else {
+            for _ in 0..3 {
+                out.write_arg(b"");
+            }
+            return;
+        };
+        let zero = WorkflowTaskEpoch::default();
+        out.write_arg(&task_key(facts.completed.unwrap_or(&zero)));
+        let failed: Vec<u8> = facts
+            .failed_tasks
+            .iter()
+            .flat_map(|id| id.to_be_bytes())
+            .collect();
+        out.write_arg(&failed);
+        out.write_arg(facts.superseded);
+    }
 }
 
 fn bad_reply(call: &str, reply: impl std::fmt::Debug) -> RedisStoreError {
@@ -674,14 +699,14 @@ mod tests {
         options.key_prefix = "streams-unit".parse().unwrap();
         let store = RedisStore::connect(options).await.unwrap();
         let namespace = format!("ns-{}", std::process::id());
-        let task = task_key(&Default::default());
-        // A task key of another length, a failed list that isn't event ids, a failed id past
-        // 2^53 - 1, and a completed task key of another length.
-        let cases: [(&[u8], &[u8], &str); 4] = [
-            (b"zz", b"", "1"),
-            (&task, b"", "x"),
-            (&task, b"", "9007199254740992"),
-            (&task, b"zz", "1"),
+        // The script is the format that every SDK calls, so these are arguments that no Rust type
+        // can build. They are a task key of another length, a completed task key of another
+        // length, and failed ids that aren't 8 bytes each.
+        let zero = task_key(&Default::default());
+        let cases: [(&[u8], &[u8], &[u8]); 3] = [
+            (b"zz", &zero, b""),
+            (&zero, b"zz", b""),
+            (&zero, &zero, b"abc"),
         ];
         for (i, (task, completed, failed)) in cases.into_iter().enumerate() {
             let handle = StreamHandle {
