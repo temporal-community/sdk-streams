@@ -2,7 +2,7 @@
 //! each data Record before the append and puts it back on each one after a read.
 
 use super::bad_reply;
-use crate::RedisStoreResult;
+use crate::{RedisStoreError, RedisStoreResult};
 use prost::Message;
 use redis::{FromRedisValue, ParsingError, Value};
 use std::{collections::HashMap, fmt, str::FromStr};
@@ -13,16 +13,16 @@ use temporalio_streams::{
 };
 
 /// The Record with no Producer, when it is a data Record of `producer`.
-pub(super) fn without_producer(record: &[u8], producer: &Producer) -> Vec<u8> {
-    let Ok(mut stored) = StreamRecord::decode(record) else {
-        return record.to_vec();
-    };
+pub(super) fn without_producer(record: &[u8], producer: &Producer) -> RedisStoreResult<Vec<u8>> {
+    let mut stored = StreamRecord::decode(record).map_err(|error| {
+        RedisStoreError::invalid(format!("A Record isn't an encoded StreamRecord: {error}"))
+    })?;
     match &mut stored.item {
         Some(Item::Data(data)) if data.producer.as_ref() == Some(producer) => {
             data.producer = None;
-            stored.encode_to_vec()
+            Ok(stored.encode_to_vec())
         }
-        _ => record.to_vec(),
+        _ => Ok(record.to_vec()),
     }
 }
 
@@ -196,13 +196,14 @@ mod tests {
     #[test]
     fn each_data_record_gets_the_producer_of_its_batch_back() {
         let (a, b) = (producer("a"), producer("b"));
-        let bare = without_producer(&data(Some(a.clone())), &a);
+        let bare = without_producer(&data(Some(a.clone())), &a).unwrap();
         assert_eq!(bare, data(None));
         // Another Producer's Record keeps its own.
         assert_eq!(
-            without_producer(&data(Some(b.clone())), &a),
+            without_producer(&data(Some(b.clone())), &a).unwrap(),
             data(Some(b.clone()))
         );
+        assert!(without_producer(b"not a Record", &a).is_err());
         let later = |record| Body::Later {
             record,
             first: EntryId { ms: 1, seq: 0 },

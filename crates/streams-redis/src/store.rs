@@ -237,7 +237,7 @@ impl Store for RedisStore {
             .arg(self.waits())
             .arg(producer.encode_to_vec());
         for record in batch.records {
-            cmd.arg(without_producer(record, producer));
+            cmd.arg(without_producer(record, producer)?);
         }
         let reply = self.write(&scripts::APPEND_SCRIPT, &cmd).await?;
         let [outcome, first, last, flag] = strings::<4>(reply, "append")?;

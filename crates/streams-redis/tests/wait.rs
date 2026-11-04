@@ -1,10 +1,11 @@
 //! A Store with `wait_replicas` refuses a write that too few replicas have, even one that it finds
 //! done, and its writes wait for their replicas in parallel.
 
+use prost::Message;
 use std::{num::NonZeroUsize, time::Duration};
 use temporalio_streams::{
     Reason,
-    proto::{Producer, ProducerEpoch, StreamHandle, StreamProducerKind},
+    proto::{Producer, ProducerEpoch, StreamHandle, StreamProducerKind, StreamRecord},
     store::{Batch, CreateOutcome, Owner, Store, Withdrawal},
 };
 use temporalio_streams_redis::{
@@ -254,7 +255,7 @@ async fn a_call_that_finds_its_write_waits_for_the_replicas() {
     }
     let none = Withdrawal::default;
     let producer = client();
-    let records = [b"x".to_vec()];
+    let records = [StreamRecord::default().encode_to_vec()];
     let batch = Batch {
         producer: &producer,
         sequence: 1,
