@@ -586,13 +586,18 @@ fn classify(error: &RedisError, route: Route) -> Step {
     if unreachable(error) {
         return Step::NextSeed;
     }
-    match (route, redirect(error)) {
+    match (route, error.kind()) {
         // A standalone server never redirects, so a redirect there is an error.
         (Route::Standalone, _) => Step::Fail,
         // One redirect is normal when the cache had no entry or a stale one. A second means the
         // cluster is migrating the slot.
-        (Route::Slot(_), Some(target)) => Step::Redirect(target),
-        _ if resharding(error) => Step::NoWake,
+        (Route::Slot(_), ErrorKind::Server(ServerErrorKind::Moved)) => match moved_to(error) {
+            Ok(target) => Step::Redirect(target),
+            Err(_) => Step::Fail,
+        },
+        // An `ASK` target serves the key only after `ASKING`, and the slot can migrate again
+        // before the next read.
+        (_, ErrorKind::Server(ServerErrorKind::Ask | ServerErrorKind::Moved)) => Step::NoWake,
         _ => Step::Fail,
     }
 }
@@ -820,20 +825,12 @@ fn unreachable(error: &RedisError) -> bool {
     error.is_io_error() || error.is_connection_refusal() || error.is_connection_dropped()
 }
 
-fn redirect(error: &RedisError) -> Option<Node> {
-    if error.kind() != ErrorKind::Server(ServerErrorKind::Moved) {
-        return None;
-    }
-    error.redirect_node()?.0.parse().ok()
-}
-
-/// Whether the cluster is migrating the slot of the command's key. An `ASK` target serves the key
-/// only after `ASKING`, and the slot can migrate again before the next read.
-fn resharding(error: &RedisError) -> bool {
-    matches!(
-        error.kind(),
-        ErrorKind::Server(ServerErrorKind::Ask | ServerErrorKind::Moved)
-    )
+/// The node of a `MOVED` redirect.
+fn moved_to(error: &RedisError) -> RedisResult<Node> {
+    let (address, _) = error
+        .redirect_node()
+        .ok_or_else(|| RedisError::from((ErrorKind::Parse, "a redirect with no node")))?;
+    address.parse()
 }
 
 /// The cluster slot of a key, which is the CRC16 of its hash tag, or of the whole key with no tag.
@@ -893,13 +890,11 @@ mod tests {
     }
 
     #[test]
-    fn only_a_moved_slot_is_remembered() {
+    fn a_moved_redirect_gives_its_node() {
         assert_eq!(
-            redirect(&reply("MOVED 3999 127.0.0.1:7292")),
-            Some(node("127.0.0.1", 7292))
+            moved_to(&reply("MOVED 3999 127.0.0.1:7292")).unwrap(),
+            node("127.0.0.1", 7292)
         );
-        // An `ASK` target serves the slot only for one command after `ASKING`.
-        assert_eq!(redirect(&reply("ASK 3999 127.0.0.1:7292")), None);
         assert!("127.0.0.1".parse::<Node>().is_err());
         assert!("127.0.0.1:port".parse::<Node>().is_err());
     }
@@ -928,6 +923,8 @@ mod tests {
                 Step::NoWake,
             ),
             (reply("ASK 1 10.0.0.2:7292"), cluster, Step::NoWake),
+            // A redirect to a node that doesn't parse is an error, not a migration.
+            (reply("MOVED 1 10.0.0.2"), cluster, Step::Fail),
             // A standalone server never redirects, so a redirect there is an error.
             (
                 reply("MOVED 1 10.0.0.2:7292"),
