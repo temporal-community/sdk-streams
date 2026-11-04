@@ -113,6 +113,10 @@ impl FromRedisValue for ReadReply {
         let (version, closed, close_id, newest, trimmed, retention, expires) = meta;
         // A create sets `v`, `ret` and `exp` together, so a Stream with no `v` doesn't exist.
         let Some(version) = version else {
+            let texts = [&closed, &close_id, &newest, &trimmed];
+            if texts.iter().any(|text| text.is_some()) || retention.is_some() || expires.is_some() {
+                return Err("a Stream has meta fields but no format version".into());
+            }
             return Ok(Self {
                 state: StreamState {
                     now_ms,

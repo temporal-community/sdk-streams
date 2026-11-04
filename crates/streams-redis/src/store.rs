@@ -95,9 +95,9 @@ impl RedisStore {
 
     /// Runs a write script, and then `WAIT` when the options set replicas. Both are in one
     /// pipeline on one connection, so the `WAIT` covers the script's writes.
-    async fn write<T: FromRedisValue>(&self, script: &Script, cmd: &Cmd) -> RedisStoreResult<T> {
+    async fn write<T: FromRedisValue>(&self, call: &ScriptCall) -> RedisStoreResult<T> {
         let reply = match &self.wait {
-            None => run_script(script, cmd, &mut self.shared.clone()).await?,
+            None => call.run(&mut self.shared.clone()).await?,
             Some(wait) => {
                 let mut lease = match wait.pool.take().await? {
                     Leased::Busy => {
@@ -111,7 +111,7 @@ impl RedisStore {
                     Leased::Idle(lease) => Lease::from(lease),
                     Leased::New(lease) => lease,
                 };
-                let reply = Self::write_and_wait(wait, script, cmd, lease.conn()).await;
+                let reply = Self::write_and_wait(wait, call, lease.conn()).await;
                 lease.settle(reply)??
             }
         };
@@ -141,13 +141,12 @@ impl RedisStore {
     /// inner one is the server's answer to the write.
     async fn write_and_wait(
         wait: &Wait,
-        script: &Script,
-        cmd: &Cmd,
+        call: &ScriptCall,
         conn: &mut SharedConnection,
     ) -> RedisResult<RedisStoreResult<Value>> {
         let mut pipe = redis::pipe();
         pipe.ignore_errors()
-            .add_command(cmd.clone())
+            .add_command(call.cmd.clone())
             .cmd("WAIT")
             .arg(wait.replicas)
             .arg(wait.timeout.as_millis());
@@ -156,7 +155,7 @@ impl RedisStore {
         if let [Value::ServerError(error), _] = &replies
             && error.kind() == Some(ServerErrorKind::NoScript)
         {
-            script.load_async(conn).await?;
+            call.script.load_async(conn).await?;
             replies = write_replies(&pipe, conn).await?;
         }
         let [reply, acked] = replies;
@@ -192,15 +191,16 @@ impl Store for RedisStore {
             Owner::Workflow => ("wf", owner_chain(handle)),
             Owner::Client => ("client", String::new()),
         };
-        let mut cmd = script_cmd("EVALSHA", &scripts::CREATE_SCRIPT, &keys);
-        cmd.arg(FORMAT_VERSION)
+        let mut call = ScriptCall::write(&scripts::CREATE_SCRIPT, &keys);
+        call.cmd
+            .arg(FORMAT_VERSION)
             .arg(retention.as_millis())
             .arg(owner)
             .arg(self.safety_ttl.as_millis())
             .arg(TOMBSTONE.as_millis())
             .arg(chain)
             .arg(self.wait.is_some());
-        let CreateReply(created) = self.write(&scripts::CREATE_SCRIPT, &cmd).await?;
+        let CreateReply(created) = self.write(&call).await?;
         Ok(created)
     }
 
@@ -214,8 +214,9 @@ impl Store for RedisStore {
         let producer = batch.producer;
         let epoch = producer.epoch.unwrap_or_default();
         let withdrawal = &batch.withdrawal;
-        let mut cmd = script_cmd("EVALSHA", &scripts::APPEND_SCRIPT, &keys);
-        cmd.arg(FORMAT_VERSION)
+        let mut call = ScriptCall::write(&scripts::APPEND_SCRIPT, &keys);
+        call.cmd
+            .arg(FORMAT_VERSION)
             .arg(producer.kind)
             .arg(&producer.id)
             .arg(epoch_key(&epoch))
@@ -227,9 +228,9 @@ impl Store for RedisStore {
             .arg(self.wait.is_some())
             .arg(producer.encode_to_vec());
         for record in batch.records {
-            cmd.arg(without_producer(record, producer)?);
+            call.cmd.arg(without_producer(record, producer)?);
         }
-        let AppendReply(appended) = self.write(&scripts::APPEND_SCRIPT, &cmd).await?;
+        let AppendReply(appended) = self.write(&call).await?;
         Ok(appended)
     }
 
@@ -244,8 +245,9 @@ impl Store for RedisStore {
     ) -> StreamResult<Closed> {
         let keys = self.keys(namespace, &handle.id);
         let epoch = producer.epoch.unwrap_or_default();
-        let mut cmd = script_cmd("EVALSHA", &scripts::CLOSE_SCRIPT, &keys);
-        cmd.arg(FORMAT_VERSION)
+        let mut call = ScriptCall::write(&scripts::CLOSE_SCRIPT, &keys);
+        call.cmd
+            .arg(FORMAT_VERSION)
             .arg(producer.kind)
             .arg(&producer.id)
             .arg(epoch_key(&epoch))
@@ -253,7 +255,7 @@ impl Store for RedisStore {
             .arg(record)
             .arg(owner_chain(handle))
             .arg(self.wait.is_some());
-        let CloseReply(closed) = self.write(&scripts::CLOSE_SCRIPT, &cmd).await?;
+        let CloseReply(closed) = self.write(&call).await?;
         Ok(closed)
     }
 
@@ -272,15 +274,10 @@ impl Store for RedisStore {
         } else {
             "-".to_string()
         };
-        // With `EVALSHA_RO`, a Reader's user needs only read access to the keys.
-        let mut cmd = redis::cmd("EVALSHA_RO");
-        cmd.arg(scripts::READ_SCRIPT.get_hash())
-            .arg(2)
-            .arg(keys.meta())
-            .arg(keys.log())
-            .arg(start)
-            .arg(count);
-        let reply = run_script(&scripts::READ_SCRIPT, &cmd, &mut self.shared.clone())
+        let mut call = ScriptCall::read(&keys);
+        call.cmd.arg(start).arg(count);
+        let reply = call
+            .run(&mut self.shared.clone())
             .await
             .map_err(RedisStoreError::from)?;
         let ReadReply {
@@ -343,15 +340,47 @@ impl Store for RedisStore {
     }
 }
 
-/// A call of `script` with the Stream's keys, as `EVALSHA` or `EVALSHA_RO`.
-fn script_cmd(name: &str, script: &Script, keys: &StreamKeys) -> Cmd {
-    let mut cmd = redis::cmd(name);
-    cmd.arg(script.get_hash())
-        .arg(3)
-        .arg(keys.meta())
-        .arg(keys.log())
-        .arg(keys.producers());
-    cmd
+/// A call of a script with the Stream's keys. It keeps its script, so a reply of `NOSCRIPT` loads
+/// the same one.
+struct ScriptCall {
+    script: &'static Script,
+    cmd: Cmd,
+}
+
+impl ScriptCall {
+    /// A write script call, with the meta, the log and `:producers`.
+    fn write(script: &'static Script, keys: &StreamKeys) -> Self {
+        let mut cmd = redis::cmd("EVALSHA");
+        cmd.arg(script.get_hash())
+            .arg(3)
+            .arg(keys.meta())
+            .arg(keys.log())
+            .arg(keys.producers());
+        Self { script, cmd }
+    }
+
+    /// The read script call. With `EVALSHA_RO`, a Reader's user needs only read access to the
+    /// keys.
+    fn read(keys: &StreamKeys) -> Self {
+        let script = &*scripts::READ_SCRIPT;
+        let mut cmd = redis::cmd("EVALSHA_RO");
+        cmd.arg(script.get_hash())
+            .arg(2)
+            .arg(keys.meta())
+            .arg(keys.log());
+        Self { script, cmd }
+    }
+
+    /// Runs the call, and loads the script when Redis lacks it.
+    async fn run(&self, conn: &mut SharedConnection) -> RedisResult<Value> {
+        match self.cmd.query_async(conn).await {
+            Err(error) if error.kind() == ErrorKind::Server(ServerErrorKind::NoScript) => {
+                self.script.load_async(conn).await?;
+                self.cmd.query_async(conn).await
+            }
+            result => result,
+        }
+    }
 }
 
 /// Refuses a write that fewer than `wait.replicas` replicas have.
@@ -378,17 +407,6 @@ async fn write_replies(pipe: &Pipeline, conn: &mut SharedConnection) -> RedisRes
             replies.len().to_string(),
         ))
     })
-}
-
-/// Runs a script call, and loads the script when Redis lacks it.
-async fn run_script(script: &Script, cmd: &Cmd, conn: &mut SharedConnection) -> RedisResult<Value> {
-    match cmd.query_async(conn).await {
-        Err(error) if error.kind() == ErrorKind::Server(ServerErrorKind::NoScript) => {
-            script.load_async(conn).await?;
-            cmd.query_async(conn).await
-        }
-        result => result,
-    }
 }
 
 fn bad_reply(call: &str, reply: impl std::fmt::Debug) -> RedisStoreError {
