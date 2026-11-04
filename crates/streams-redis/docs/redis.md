@@ -183,8 +183,8 @@ these lists on a standalone server and on a cluster.
   run's create fails with `stream_closed`. The close's Readers have ended, so it can't be withdrawn.
 - A reset run doesn't withdraw the base run's Records after the reset point, and it doesn't fence
   the base run's Producers.
-- The meta keeps the `run|`, `oa|`, `ow|`, `tf|` and `wr|` fields of each run until the Stream expires, so
-  a long run chain adds fields for as long as it writes.
+- The meta keeps the `run|`, `oa|`, `ow|`, `tf|` and `wr|` fields of each run until the Stream
+  expires, so a long run chain adds fields for as long as it writes.
 - Redis can't tie a run to its run chain. A run of another chain that holds the owner's handle,
   such as a child Workflow with its parent's Stream, can still close it. The native server checks
   the run.
