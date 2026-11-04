@@ -445,8 +445,9 @@ impl<'a> TaskArgs<'a> {
 }
 
 /// The four task arguments of `append.lua`. These are the task key, the completed task key, the
-/// failed tasks' started event ids, 8 bytes each, and the task Superseded facts. With no task facts,
-/// the completed task is empty, and before the run's first completed task it is the zero key.
+/// failed tasks' started event ids, 8 bytes each, and the task Superseded facts. With no task
+/// facts, the completed task is empty, and before the run's first completed task it is the zero
+/// key.
 impl ToRedisArgs for TaskArgs<'_> {
     fn write_redis_args<W: ?Sized + RedisWrite>(&self, out: &mut W) {
         let (task, facts) = match self {
