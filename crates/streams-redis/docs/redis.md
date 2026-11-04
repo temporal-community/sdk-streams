@@ -27,21 +27,36 @@ form, and the `testdata/` of `temporalio-streams` has its test vectors.
 | `closed`, `close_id` | Set by the close, with the entry id of the close Record |
 | `newest` | The entry id of the newest entry |
 | `trimmed` | The entry id of the newest entry that Retention or the log's expiry dropped |
-| `e\|<kind>\|<producer id>` | The newest epoch key of the Producer, the fence |
-| `d\|<kind>\|<producer id>` | `<epoch key>\|<sequence>\|<first id>\|<last id>\|<digest>` |
-| `h\|<kind>\|<producer id>` | The newest epoch key that still has Records here |
+| `p\|<kind>\|<producer id>` | The Producer's fence, held epoch and last batch, 129 bytes |
 
-`<kind>` is the `ProducerKind` number, and `d` is the Producer's last batch. An epoch key is the
-epoch's fields as fixed-width hex, so two keys compare as strings.
+`<kind>` is the `ProducerKind` number. The `p|` value has big-endian numbers in this order.
+
+| Bytes | Field |
+|---|---|
+| 1 | Flags. Bit 0 is set when the held epoch is present, and the other bits are zero. |
+| 40 | The fence, the Producer's newest epoch key. It is also the epoch of the last batch. |
+| 40 | The held epoch key, the newest one that still has Records here, or zeros |
+| 8 | The last batch's sequence |
+| 12 | The last batch's first entry id, the ms in 8 bytes and the seq in 4 |
+| 12 | The last batch's last entry id, in the same form |
+| 16 | The last batch's digest, which a resend must match |
+
+- The ids are zero when the last batch wrote no entry. A real entry id is never `0-0`.
+- A call that finds a value of another length, another flag bit, or only one zero id fails with
+  `stream_storage`, since a later format may write it.
+- An epoch key is the task key (started event id 8, attempt 4, started seconds 8 and nanos 4),
+  then the attempt's scheduled seconds 8 and nanos 4 and the attempt 4. A negative field is zero.
+- The scripts compare two epoch keys byte by byte. Lua's `<` collates with the server's locale.
+- The digest is the first 16 bytes of the batch's SHA-256.
 
 `:producers` scores each `<kind>|<producer id>` with the ms of its last append. An append drops the
-`e|`, `d|` and `h|` fields of up to 64 Producers with no append for one Retention. A resend of such
-a Producer's last batch then writes the batch again, and a lower epoch of the Producer is accepted.
-So the fence lasts one Retention after the last append.
+`p|` field of up to 64 Producers with no append for one Retention. A resend of such a Producer's
+last batch then writes the batch again, and a lower epoch of the Producer is accepted. So the fence
+lasts one Retention after the last append.
 
-An append with sequence 0 takes the sequence after the one in `d` when `d` has the batch's epoch
-key, and 1 otherwise. The script reads `d` and writes the batch in one step, so two such batches
-never get the same sequence. Nothing dedupes such a batch, so its retry writes it again.
+An append with sequence 0 takes the sequence after the last batch's when the fence is the batch's
+epoch key, and 1 otherwise. The script reads `p|` and writes the batch in one step, so two such
+batches never get the same sequence. Nothing dedupes such a batch, so its retry writes it again.
 
 ## Log entries
 

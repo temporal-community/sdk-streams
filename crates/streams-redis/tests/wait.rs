@@ -284,7 +284,7 @@ async fn a_call_that_finds_its_write_waits_for_the_replicas() {
         producer: &producer,
         sequence: 1,
         records: &records,
-        digest: "d",
+        digest: [0; 16],
         withdrawal: none(),
     };
     let other = StreamHandle {

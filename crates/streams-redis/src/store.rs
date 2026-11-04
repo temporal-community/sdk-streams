@@ -219,12 +219,12 @@ impl Store for RedisStore {
             .arg(FORMAT_VERSION)
             .arg(producer.kind)
             .arg(&producer.id)
-            .arg(epoch_key(&epoch))
+            .arg(&epoch_key(&epoch)[..])
             .arg(batch.sequence)
             .arg(withdrawal.superseded)
             .arg(self.safety_ttl.as_millis())
             .arg(TOMBSTONE.as_millis())
-            .arg(batch.digest)
+            .arg(&batch.digest[..])
             .arg(self.wait.is_some())
             .arg(producer.encode_to_vec());
         for record in batch.records {
@@ -250,7 +250,7 @@ impl Store for RedisStore {
             .arg(FORMAT_VERSION)
             .arg(producer.kind)
             .arg(&producer.id)
-            .arg(epoch_key(&epoch))
+            .arg(&epoch_key(&epoch)[..])
             .arg(TOMBSTONE.as_millis())
             .arg(record)
             .arg(owner_chain(handle))
@@ -671,7 +671,7 @@ mod tests {
             producer: &producer,
             sequence: 1,
             records: &records,
-            digest: "d",
+            digest: [0; 16],
             withdrawal: Withdrawal::default(),
         };
         let (first, last) = store

@@ -127,13 +127,13 @@ end
 -- The most Producers that one append prunes, so that an append after a long gap stays short.
 local PRUNE_LIMIT = 64
 
--- Removes the fence and dedupe fields of the Producers whose last append is older than the
--- Retention. Their Records are older too, so the log has none of them.
+-- Removes the field of each Producer whose last append is older than the Retention. Its Records
+-- are older too, so the log has none of them.
 local function prune(meta, producers, now)
   local min = now - tonumber(redis.call('HGET', meta, 'ret'))
   local old = redis.call('ZRANGEBYSCORE', producers, '-inf', '(' .. min, 'LIMIT', 0, PRUNE_LIMIT)
   for _, producer in ipairs(old) do
-    redis.call('HDEL', meta, 'e|' .. producer, 'd|' .. producer, 'h|' .. producer)
+    redis.call('HDEL', meta, 'p|' .. producer)
   end
   if #old > 0 then
     redis.call('ZREM', producers, unpack(old))
@@ -170,4 +170,90 @@ local function add(log, fields)
   local id = string.format('%d-%d', next_ms, next_seq)
   next_seq = next_seq + 1
   return redis.call('XADD', log, id, unpack(fields))
+end
+
+-- Whether the binary key a sorts below b. Lua's `<` collates with the server's locale, so it
+-- doesn't order bytes.
+local function bytes_below(a, b)
+  if a == b then
+    return false
+  end
+  for i = 1, math.min(#a, #b) do
+    local x, y = string.byte(a, i), string.byte(b, i)
+    if x ~= y then
+      return x < y
+    end
+  end
+  return #a < #b
+end
+
+local EPOCH_KEY_LEN, DIGEST_LEN = 40, 16
+
+-- The `p|<kind>|<producer id>` field of a Producer is 129 bytes, with big-endian numbers. These
+-- are the flags, the fence, the held epoch key or zeros, and the last batch's sequence (8), first
+-- and last entry ids (the ms in 8 and the seq in 4, zeros for none) and digest. Flag bit 0 is set
+-- when the held epoch is present. `docs/redis.md` has the layout.
+local PRODUCER_FIELD_LEN = 1 + 2 * EPOCH_KEY_LEN + 8 + 2 * 12 + DIGEST_LEN
+local HELD = 1
+
+-- The Producer field as a table, or nil when the Producer has none. A value of another format,
+-- which a later version may write, gives false and the refusal.
+local function read_producer(meta, field)
+  local value = redis.call('HGET', meta, field)
+  if not value then
+    return nil
+  end
+  local unknown = refuse('STORAGE', 'the Producer field has an unknown format')
+  if #value ~= PRODUCER_FIELD_LEN then
+    return false, unknown
+  end
+  local flags = string.byte(value, 1)
+  if flags ~= 0 and flags ~= HELD then
+    return false, unknown
+  end
+  local at = 2 + 2 * EPOCH_KEY_LEN
+  local sequence, first_ms, first_seq, last_ms, last_seq =
+    struct.unpack('>I8I8I4I8I4', value, at)
+  -- A batch has both entry ids or neither.
+  local first_none, last_none = first_ms + first_seq == 0, last_ms + last_seq == 0
+  if first_none ~= last_none then
+    return false, unknown
+  end
+  local stored = {
+    fence = string.sub(value, 2, 1 + EPOCH_KEY_LEN),
+    sequence = sequence,
+    first = '',
+    last = '',
+    digest = string.sub(value, -DIGEST_LEN),
+  }
+  if flags == HELD then
+    stored.held = string.sub(value, 2 + EPOCH_KEY_LEN, 1 + 2 * EPOCH_KEY_LEN)
+  end
+  if not first_none then
+    stored.first = string.format('%.0f-%.0f', first_ms, first_seq)
+    stored.last = string.format('%.0f-%.0f', last_ms, last_seq)
+  end
+  return stored
+end
+
+-- The ms and seq of an entry id, or zeros for ''.
+local function id_parts(id)
+  if id == '' then
+    return 0, 0
+  end
+  local ms, seq = string.match(id, '^(%d+)-(%d+)$')
+  return tonumber(ms), tonumber(seq)
+end
+
+-- The Producer field of a batch. `held` is nil when no epoch of the Producer has Records, and the
+-- ids are '' when the batch wrote no entry.
+local function producer_value(fence, held, sequence, first, last, digest)
+  local flags, held_key = 0, string.rep('\0', EPOCH_KEY_LEN)
+  if held then
+    flags, held_key = HELD, held
+  end
+  local first_ms, first_seq = id_parts(first)
+  local last_ms, last_seq = id_parts(last)
+  return string.char(flags) .. fence .. held_key ..
+    struct.pack('>I8I8I4I8I4', sequence, first_ms, first_seq, last_ms, last_seq) .. digest
 end

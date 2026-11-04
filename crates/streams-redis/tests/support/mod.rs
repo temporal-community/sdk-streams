@@ -150,13 +150,13 @@ impl Raw {
 
 #[async_trait::async_trait]
 impl RawKeys for Raw {
-    async fn set_meta(&self, namespace: &str, stream: &str, field: &str, value: &str) {
+    async fn set_meta(&self, namespace: &str, stream: &str, field: &[u8], value: &[u8]) {
         let keys = StreamKeys::new(PREFIX, namespace, stream);
         self.query::<()>(redis::cmd("HSET").arg(keys.meta()).arg(field).arg(value))
             .await;
     }
 
-    async fn meta(&self, namespace: &str, stream: &str, field: &str) -> Option<String> {
+    async fn meta(&self, namespace: &str, stream: &str, field: &[u8]) -> Option<Vec<u8>> {
         let keys = StreamKeys::new(PREFIX, namespace, stream);
         self.query(redis::cmd("HGET").arg(keys.meta()).arg(field))
             .await

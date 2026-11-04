@@ -99,7 +99,7 @@ fn unique() -> u128 {
 }
 
 /// The encoded Records of a one-Record batch of `client()`, and the batch digest.
-fn one_record() -> (Vec<Vec<u8>>, String) {
+fn one_record() -> (Vec<Vec<u8>>, [u8; 16]) {
     let records = vec![AppendRecord {
         body: Some(Payload {
             data: b"x".to_vec(),
@@ -163,7 +163,7 @@ async fn the_documented_commands_run_every_call_of_each_role() {
         producer: &client(),
         sequence: 1,
         records: &stored,
-        digest: &digest,
+        digest,
         withdrawal: Withdrawal::default(),
     };
     let appended = producer.append(&namespace, &handle, &batch).await.unwrap();
@@ -234,8 +234,8 @@ async fn the_documented_commands_run_every_call_of_each_role() {
     let (seconds, _): (u64, u64) = redis::cmd("TIME").query_async(&mut raw).await.unwrap();
     let old_ms = (seconds - 2 * retention.as_secs()) * 1000;
     let old = format!("{old_ms}-1");
-    let fence = format!(
-        "e|{}|{}",
+    let field = format!(
+        "p|{}|{}",
         StreamProducerKind::Client as i32,
         client_named("old").id
     );
@@ -249,11 +249,11 @@ async fn the_documented_commands_run_every_call_of_each_role() {
         .cmd("ZADD")
         .arg(keys.producers())
         .arg(old_ms)
-        .arg(&fence[2..])
+        .arg(&field[2..])
         .ignore()
         .cmd("HSET")
         .arg(keys.meta())
-        .arg(&fence)
+        .arg(&field)
         .arg("x")
         .ignore()
         .query_async(&mut raw)
@@ -267,7 +267,7 @@ async fn the_documented_commands_run_every_call_of_each_role() {
     );
     let fenced: bool = redis::cmd("HEXISTS")
         .arg(keys.meta())
-        .arg(&fence)
+        .arg(&field)
         .query_async(&mut raw)
         .await
         .unwrap();
@@ -483,7 +483,7 @@ async fn the_documented_commands_serve_a_cluster_while_a_slot_moves() {
         producer: &me,
         sequence,
         records: &stored,
-        digest: &digest,
+        digest,
         withdrawal: Withdrawal::default(),
     };
     let none = Withdrawal::default();

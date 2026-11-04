@@ -1,8 +1,8 @@
 -- Closes the Stream with one close Record.
 --
--- ARGV: format version, kind, Producer id, epoch key, Tombstone ms, close Record, the run chain
--- that the close's handle gives as `<workflow id>:<first run id>` with each part encoded (empty for
--- none), `1` when a `WAIT` runs after it.
+-- ARGV: format version, kind, Producer id, the 40-byte epoch key, Tombstone ms, close Record, the
+-- run chain that the close's handle gives as `<workflow id>:<first run id>` with each part encoded
+-- (empty for none), `1` when a `WAIT` runs after it.
 --
 -- Returns {'closed' or 'already', close id}.
 local meta, log, producers = KEYS[1], KEYS[2], KEYS[3]
@@ -24,8 +24,11 @@ if redis.call('HGET', meta, 'closed') then
   return {'already', redis.call('HGET', meta, 'close_id')}
 end
 -- A Producer is fenced as its appends are, so a stale attempt can't close the Stream.
-local newest = redis.call('HGET', meta, 'e|' .. kind .. '|' .. producer)
-if newest and epoch < newest then
+local stored, unknown = read_producer(meta, 'p|' .. kind .. '|' .. producer)
+if unknown then
+  return unknown
+end
+if stored and bytes_below(epoch, stored.fence) then
   return refuse('FENCED', 'the epoch is lower than the newest one of the Producer')
 end
 
