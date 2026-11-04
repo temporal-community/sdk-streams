@@ -94,7 +94,8 @@ end
 -- The first batch of a newer epoch withdraws the Records of the earlier ones. A client's (4)
 -- newer epoch only fences, since its earlier Records are real messages.
 local holds = redis.call('HGET', meta, 'h' .. suffix)
-local flagged = kind ~= '4' and holds ~= false and holds < epoch
+local newer = kind ~= '4' and holds ~= false and holds < epoch
+local flagged = newer
 local withdrawn, open = {}, {}
 if orphans then
   withdrawn, open = orphan_tasks(words(redis.call('HGET', meta, open_field)), task, completed,
@@ -148,7 +149,8 @@ redis.call('HSET', meta, 'd' .. suffix,
   epoch .. '|' .. sequence_text .. '|' .. first_id .. '|' .. last_id .. '|' .. digest)
 if records > 0 then
   redis.call('HSET', meta, 'h' .. suffix, epoch)
-elseif flagged then
+elseif newer then
+  -- Only a newer epoch's item withdraws the held epoch's Records.
   redis.call('HDEL', meta, 'h' .. suffix)
 end
 -- Redis sends each write to the replicas and the AOF, so the script sets `run|` only once.
