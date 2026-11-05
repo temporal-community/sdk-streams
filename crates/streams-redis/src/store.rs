@@ -7,7 +7,7 @@ mod replies;
 mod scripts;
 
 use crate::{KeyPrefix, RedisStoreError, RedisStoreOptions, RedisStoreResult};
-use conn::{BlockingPool, Endpoint, Lease, Leased, Origin, SharedConnection, WaitPool};
+use conn::{BlockingPool, Endpoint, Leased, Origin, Settled, SharedConnection, WaitPool};
 use prost::Message;
 use records::{with_producers, without_producer};
 use redis::{
@@ -98,22 +98,28 @@ impl RedisStore {
     async fn write<T: FromRedisValue>(&self, call: &ScriptCall) -> RedisStoreResult<T> {
         let reply = match &self.wait {
             None => call.run(&mut self.shared.clone()).await?,
-            Some(wait) => {
-                let mut lease = match wait.pool.take().await? {
-                    Leased::Busy => {
-                        return Err(RedisStoreError::unavailable(
-                            "Every connection for writes with WAIT stayed busy for the response \
-                             timeout",
-                        ));
+            Some(wait) => match wait.pool.take().await? {
+                Leased::Busy => {
+                    return Err(RedisStoreError::unavailable(
+                        "Every connection for writes with WAIT stayed busy for the response \
+                         timeout",
+                    ));
+                }
+                Leased::New(mut lease) => {
+                    let reply = Self::write_and_wait(wait, call, lease.conn()).await;
+                    lease.settle(reply)??
+                }
+                Leased::Idle(mut lease) => {
+                    let reply = Self::write_and_wait(wait, call, lease.conn()).await;
+                    match lease.settle(reply) {
+                        Settled::Done(reply) => reply??,
+                        // No second try. The server may have run the write before the connection
+                        // closed, and a batch with sequence 0 or a create with no request id has
+                        // no dedupe. The caller gets `StorageUnavailable` and decides on a retry.
+                        Settled::Stale { error, .. } => return Err(error.into()),
                     }
-                    // A write runs once, since the server may have run it before its connection
-                    // closed.
-                    Leased::Idle(lease) => Lease::from(lease),
-                    Leased::New(lease) => lease,
-                };
-                let reply = Self::write_and_wait(wait, call, lease.conn()).await;
-                lease.settle(reply)??
-            }
+                }
+            },
         };
         redis::from_redis_value(reply).map_err(|error| corrupt("A script answer", error))
     }

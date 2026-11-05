@@ -319,9 +319,13 @@ pub(crate) struct IdleLease<C>(Held<C>);
 pub(crate) enum Settled<T, C> {
     /// The call's result, as [Lease::settle] gives it.
     Done(RedisResult<T>),
-    /// The server closed the connection, and the other idle ones with it. The pool dropped them,
-    /// so the permit opens a new connection. That try tells a dead connection from a dead server.
-    Stale(Permit<C>),
+    /// The server closed the connection, and the other idle ones with it. The pool dropped them.
+    /// A call that can run again opens a new connection with the permit, and that try tells a
+    /// dead connection from a dead server. A call that must run at most once returns the error.
+    Stale {
+        error: RedisError,
+        permit: Permit<C>,
+    },
 }
 
 impl<C> IdleLease<C> {
@@ -335,17 +339,10 @@ impl<C> IdleLease<C> {
                 let Held { conn, permit } = self.0;
                 drop(conn);
                 permit.idle.lock().clear();
-                Settled::Stale(permit)
+                Settled::Stale { error, permit }
             }
             result => Settled::Done(Lease(self.0).settle(result)),
         }
-    }
-}
-
-/// A caller that doesn't retry uses an idle connection as any other.
-impl<C> From<IdleLease<C>> for Lease<C> {
-    fn from(lease: IdleLease<C>) -> Self {
-        Lease(lease.0)
     }
 }
 
@@ -726,7 +723,7 @@ impl BlockingPool {
                 let answer = self.run(lease.conn(), read).await?;
                 match lease.settle(answer) {
                     Settled::Done(answer) => return answer,
-                    Settled::Stale(permit) => permit.open(node.open()).await?,
+                    Settled::Stale { permit, .. } => permit.open(node.open()).await?,
                 }
             }
         };
@@ -1121,10 +1118,12 @@ mod tests {
         ));
         let mut dead = idle(lease(&pool, 0).await);
         assert_eq!(*dead.conn(), 2);
-        let Settled::Stale(permit) = dead.settle::<()>(Err(io(std::io::ErrorKind::BrokenPipe)))
+        let Settled::Stale { error, permit } =
+            dead.settle::<()>(Err(io(std::io::ErrorKind::BrokenPipe)))
         else {
             panic!("a dead idle connection gives its permit back");
         };
+        assert!(error.is_io_error());
         let mut retry = permit.open(async { Ok(4) }).await.unwrap();
         assert_eq!(*retry.conn(), 4);
         // The pool dropped connection 1 with the dead one.
