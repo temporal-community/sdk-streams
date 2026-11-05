@@ -131,10 +131,17 @@ pub(crate) enum SharedConnection {
     Cluster(ClusterConnection),
 }
 
+// A `MOVED` means another thing on each topology. The cluster client follows redirects, and one
+// that it gives up on is a passing state. A standalone server that redirects is a cluster node,
+// so the options are wrong.
 impl ConnectionLike for SharedConnection {
     fn req_packed_command<'a>(&'a mut self, cmd: &'a Cmd) -> RedisFuture<'a, Value> {
         match self {
-            SharedConnection::Single(conn) => conn.req_packed_command(cmd),
+            SharedConnection::Single(conn) => Box::pin(async move {
+                let value = conn.req_packed_command(cmd).await.map_err(misrouted)?;
+                not_moved(&value)?;
+                Ok(value)
+            }),
             SharedConnection::Cluster(conn) => conn.req_packed_command(cmd),
         }
     }
@@ -146,7 +153,14 @@ impl ConnectionLike for SharedConnection {
         count: usize,
     ) -> RedisFuture<'a, Vec<Value>> {
         match self {
-            SharedConnection::Single(conn) => conn.req_packed_commands(pipeline, offset, count),
+            SharedConnection::Single(conn) => Box::pin(async move {
+                let values = conn
+                    .req_packed_commands(pipeline, offset, count)
+                    .await
+                    .map_err(misrouted)?;
+                values.iter().try_for_each(not_moved)?;
+                Ok(values)
+            }),
             SharedConnection::Cluster(conn) => conn.req_packed_commands(pipeline, offset, count),
         }
     }
@@ -157,6 +171,28 @@ impl ConnectionLike for SharedConnection {
             SharedConnection::Cluster(conn) => conn.get_db(),
         }
     }
+}
+
+/// A standalone server's reply that is a `MOVED` becomes a config error.
+fn not_moved(value: &Value) -> RedisResult<()> {
+    match value {
+        Value::ServerError(error) if error.kind() == Some(ServerErrorKind::Moved) => {
+            Err(misrouted(error.clone().into()))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// A `MOVED` error of a standalone server as a config error. Other errors stay as they are.
+fn misrouted(error: RedisError) -> RedisError {
+    if error.kind() != ErrorKind::Server(ServerErrorKind::Moved) {
+        return error;
+    }
+    RedisError::from((
+        ErrorKind::InvalidClientConfig,
+        "A Redis Cluster node answered, so set `cluster`",
+        error.to_string(),
+    ))
 }
 
 /// The server that sent a reply. Each primary of a cluster has its own keys and settings.
@@ -707,6 +743,7 @@ impl BlockingPool {
                     tokio::time::sleep_until(deadline.min(Instant::now() + RESHARD_WAIT)).await;
                     return Ok(false);
                 }
+                Step::Fail if matches!(route, Route::Standalone) => return Err(misrouted(error)),
                 Step::Fail => return Err(error),
             }
         }
@@ -894,6 +931,18 @@ mod tests {
         for (error, route, step) in cases {
             assert_eq!(classify(&error, route), step, "{error} {route:?}");
         }
+    }
+
+    #[test]
+    fn a_redirect_from_a_standalone_server_is_a_config_error() {
+        use temporalio_streams::{Reason, StreamError};
+        let moved = redis::parse_redis_value(b"-MOVED 3999 127.0.0.1:7292\r\n").unwrap();
+        let error = StreamError::from(crate::RedisStoreError::from(not_moved(&moved).unwrap_err()));
+        assert_eq!(error.reason, Reason::Invalid);
+        assert!(error.message.contains("set `cluster`"), "{error}");
+        assert!(not_moved(&Value::Okay).is_ok());
+        let other = misrouted(reply("WRONGTYPE not a stream"));
+        assert_eq!(other.code(), Some("WRONGTYPE"));
     }
 
     #[tokio::test]
