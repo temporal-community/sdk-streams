@@ -480,11 +480,13 @@ impl TryFrom<&ConnectionInfo> for Node {
 }
 
 impl Node {
-    /// The node of a slot range. An empty host is the node that answered, and `?` is unknown, so
-    /// neither one is reachable.
+    /// The node of a slot range. A NULL host is the endpoint that the caller asked, and an empty
+    /// one is the node that answered. The cluster client doesn't say which node it asked, so
+    /// neither is reachable, and nor is the unknown `?`. The caller still has the seeds.
     fn reachable(node: &SlotNode) -> Option<Self> {
-        (!node.host.is_empty() && node.host != "?").then(|| Self::Tcp {
-            host: node.host.clone(),
+        let host = node.host.as_deref()?;
+        (!host.is_empty() && host != "?").then(|| Self::Tcp {
+            host: host.to_string(),
             port: node.port,
         })
     }
@@ -976,9 +978,10 @@ mod tests {
     #[test]
     fn the_cluster_slots_reply_gives_each_range_its_primary() {
         let reply = redis::parse_redis_value(
-            b"*2\r\n*4\r\n:0\r\n:5460\r\n*3\r\n$9\r\n127.0.0.1\r\n:7001\r\n$1\r\na\r\n\
+            b"*3\r\n*4\r\n:0\r\n:5460\r\n*3\r\n$9\r\n127.0.0.1\r\n:7001\r\n$1\r\na\r\n\
               *3\r\n$9\r\n127.0.0.1\r\n:7004\r\n$1\r\nb\r\n\
-              *3\r\n:5461\r\n:16383\r\n*3\r\n$0\r\n\r\n:7002\r\n$1\r\nc\r\n",
+              *3\r\n:5461\r\n:10922\r\n*3\r\n$0\r\n\r\n:7002\r\n$1\r\nc\r\n\
+              *3\r\n:10923\r\n:16383\r\n*3\r\n$-1\r\n:7003\r\n$1\r\nd\r\n",
         )
         .unwrap();
         let ranges: Vec<SlotRange> = redis::from_redis_value(reply).unwrap();
@@ -988,8 +991,9 @@ mod tests {
             .iter()
             .map(|range| Node::reachable(&range.primary))
             .collect();
-        // The second range has no usable host.
-        assert_eq!(reachable, [Some(node("127.0.0.1", 7001)), None]);
+        // The second range has an empty host, and the third a NULL one.
+        assert_eq!(ranges[2].primary.host, None);
+        assert_eq!(reachable, [Some(node("127.0.0.1", 7001)), None, None]);
         let short = redis::parse_redis_value(b"*1\r\n*2\r\n:0\r\n:1\r\n").unwrap();
         assert!(redis::from_redis_value::<Vec<SlotRange>>(short).is_err());
     }
