@@ -18,6 +18,12 @@ local field = 'p|' .. kind .. '|' .. producer
 if #epoch ~= EPOCH_KEY_LEN or #digest ~= DIGEST_LEN then
   return refuse('INVALID', 'the epoch key and the digest must be 40 and 16 bytes')
 end
+-- The format version comes first, since a newer format can change how the Producer field reads.
+local now = now_ms()
+local refused = check_live(meta, version, now)
+if refused then
+  return refused
+end
 local stored, unknown = read_producer(meta, field)
 if unknown then
   return unknown
@@ -39,11 +45,6 @@ end
 -- A Lua number past 2^53 - 1 loses digits.
 if not string.match(sequence_text, '^[1-9]%d*$') or sequence > 9007199254740991 then
   return refuse('INVALID', 'the sequence must be from 1 to 2^53 - 1')
-end
-local now = now_ms()
-local refused = check_live(meta, version, now)
-if refused then
-  return refused
 end
 -- Check the last batch before the close status, so that a resend gets its entry ids after a close.
 if previous then
