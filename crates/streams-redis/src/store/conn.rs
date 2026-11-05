@@ -585,8 +585,8 @@ enum Step {
     Fail,
 }
 
-/// The retry policy of a blocking read. It has no I/O, so a table test covers it.
-fn classify(error: &RedisError, route: Route) -> Step {
+/// The retry policy of a blocking read on `from`. It has no I/O, so a table test covers it.
+fn classify(error: &RedisError, route: Route, from: &Node) -> Step {
     if unreachable(error) {
         return Step::NextSeed;
     }
@@ -595,10 +595,12 @@ fn classify(error: &RedisError, route: Route) -> Step {
         (Route::Standalone, _) => Step::Fail,
         // One redirect is normal when the cache had no entry or a stale one. A second means the
         // cluster is migrating the slot.
-        (Route::Slot(_), ErrorKind::Server(ServerErrorKind::Moved)) => match moved_to(error) {
-            Ok(target) => Step::Redirect(target),
-            Err(_) => Step::Fail,
-        },
+        (Route::Slot(_), ErrorKind::Server(ServerErrorKind::Moved)) => {
+            match moved_to(error, from) {
+                Ok(target) => Step::Redirect(target),
+                Err(_) => Step::Fail,
+            }
+        }
         // An `ASK` target serves the key only after `ASKING`, and the slot can migrate again
         // before the next read.
         (_, ErrorKind::Server(ServerErrorKind::Ask | ServerErrorKind::Moved)) => Step::NoWake,
@@ -713,7 +715,7 @@ impl BlockingPool {
                 Ok(woke) => return Ok(woke),
                 Err(error) => error,
             };
-            match classify(&error, route) {
+            match classify(&error, route, &node) {
                 Step::NextSeed => {
                     if let Some(slot) = route.slot() {
                         self.slots.forget(slot, &node);
@@ -826,12 +828,25 @@ fn unreachable(error: &RedisError) -> bool {
     error.is_io_error() || error.is_connection_refusal() || error.is_connection_dropped()
 }
 
-/// The node of a `MOVED` redirect.
-fn moved_to(error: &RedisError) -> RedisResult<Node> {
+/// The node of a `MOVED` redirect that `from` sent. A cluster with unknown endpoints gives an
+/// empty host, which means the host of `from`. A `?` host is a hostname that the cluster doesn't
+/// know, so no connect can reach it.
+fn moved_to(error: &RedisError, from: &Node) -> RedisResult<Node> {
+    let bad = |what| RedisError::from((ErrorKind::Parse, what));
     let (address, _) = error
         .redirect_node()
-        .ok_or_else(|| RedisError::from((ErrorKind::Parse, "a redirect with no node")))?;
-    address.parse()
+        .ok_or_else(|| bad("a redirect with no node"))?;
+    match address.parse()? {
+        Node::Tcp { host, port } if host.is_empty() => match from {
+            Node::Tcp { host, .. } => Ok(Node::Tcp {
+                host: host.clone(),
+                port,
+            }),
+            Node::Unix(_) => Err(bad("a redirect with no host from a local socket")),
+        },
+        Node::Tcp { host, .. } if host == "?" => Err(bad("a redirect to an unknown hostname")),
+        node => Ok(node),
+    }
 }
 
 /// The cluster slot of a key, which is the CRC16 of its hash tag, or of the whole key with no tag.
@@ -920,8 +935,17 @@ mod tests {
                 Step::NoWake,
             ),
             (reply("ASK 1 10.0.0.2:7292"), cluster, Step::NoWake),
-            // A redirect to a node that doesn't parse is an error, not a migration.
+            // A cluster with unknown endpoints redirects with no host, so the host is the one of
+            // the node that answered.
+            (
+                reply("MOVED 1 :7292"),
+                cluster,
+                Step::Redirect(node("10.0.0.1", 7292)),
+            ),
+            // A redirect to a node that doesn't parse or has no known host is an error, not a
+            // migration.
             (reply("MOVED 1 10.0.0.2"), cluster, Step::Fail),
+            (reply("MOVED 1 ?:7292"), cluster, Step::Fail),
             // A standalone server never redirects, so a redirect there is an error.
             (
                 reply("MOVED 1 10.0.0.2:7292"),
@@ -930,8 +954,9 @@ mod tests {
             ),
             (reply("WRONGTYPE not a stream"), cluster, Step::Fail),
         ];
+        let from = node("10.0.0.1", 7291);
         for (error, route, step) in cases {
-            assert_eq!(classify(&error, route), step, "{error} {route:?}");
+            assert_eq!(classify(&error, route, &from), step, "{error} {route:?}");
         }
     }
 

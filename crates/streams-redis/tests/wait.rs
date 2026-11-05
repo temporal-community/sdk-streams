@@ -86,7 +86,9 @@ async fn cluster_replicas(url: &str) -> Vec<String> {
         .iter()
         .flat_map(|range| &range.replicas)
         .map(|node| {
-            let host = node.host.as_deref().unwrap_or("127.0.0.1");
+            // An empty or NULL host is local in the test cluster.
+            let host = node.host.as_deref().filter(|host| !host.is_empty());
+            let host = host.unwrap_or("127.0.0.1");
             format!("redis://{host}:{}/0", node.port)
         })
         .collect();

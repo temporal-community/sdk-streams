@@ -1,6 +1,6 @@
--- The prelude of every script. KEYS[1] is the Stream's meta hash, KEYS[2] its log, and KEYS[3] the
--- sorted set of its Producers' last appends. Each script checks everything that can refuse the call
--- before its first write, since Redis doesn't roll a script back.
+-- The prelude of the write scripts. KEYS[1] is the Stream's meta hash, KEYS[2] its log, and KEYS[3]
+-- the sorted set of its Producers' last appends. Each script checks everything that can refuse the
+-- call before its first write, since Redis doesn't roll a script back.
 
 local function now_ms()
   local time = redis.call('TIME')
