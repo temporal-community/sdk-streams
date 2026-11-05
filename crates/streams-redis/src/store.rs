@@ -249,6 +249,7 @@ impl Store for RedisStore {
         let keys = self.keys(namespace, &stream_ref.id);
         let epoch = producer.epoch.unwrap_or_default();
         let mut call = ScriptCall::write(&scripts::CLOSE_SCRIPT, &keys);
+        // An argument and not a key. `close.lua` says why.
         call.cmd
             .arg(keys.closed())
             .arg(FORMAT_VERSION)
