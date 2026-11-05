@@ -5,6 +5,7 @@ use prost::Message;
 use std::{
     num::NonZeroUsize,
     ops::RangeInclusive,
+    sync::LazyLock,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use temporalio_common::protos::temporal::api::common::v1::Payload;
@@ -22,23 +23,30 @@ use temporalio_streams::{
 };
 use temporalio_streams_redis::{
     RedisStore, RedisStoreError, RedisStoreOptions, Topology, WaitOptions,
-    testing::{SlotNode, SlotRange, cluster_url, standalone_url},
+    testing::{SlotNode, SlotRange, cluster_url, documented_commands, standalone_url},
 };
 
 const PREFIX: &str = "streams-acl";
 
-/// The key access and the commands that `docs/redis.md` lists for a Producer and for a Reader.
-const PRODUCER: (&str, &str) = (
-    "~",
-    "+evalsha +script|load +time +hget +hset +hdel +exists +pexpireat +xadd +xtrim +xrevrange \
-     +zadd +zrangebyscore +zrem +wait",
-);
-const READER: (&str, &str) = (
-    "%R~",
-    "+evalsha_ro +script|load +time +hmget +xrange +xread +xrevrange",
-);
+/// The key access of each role, with the commands that `docs/redis.md` lists for it. The docs are
+/// the only list, so a script that calls a new command fails here until the docs list it.
+static PRODUCER: LazyLock<(&str, String)> = LazyLock::new(|| ("~", documented("A Producer")));
+static READER: LazyLock<(&str, String)> = LazyLock::new(|| ("%R~", documented("A Reader")));
 /// The commands that `docs/redis.md` adds for each role on a cluster.
-const CLUSTER: &str = "+cluster|slots +asking +ping";
+static CLUSTER: LazyLock<String> = LazyLock::new(|| documented("On a cluster, each role"));
+
+fn documented(bullet: &str) -> String {
+    let commands: Vec<_> = documented_commands(bullet)
+        .iter()
+        .map(|command| format!("+{command}"))
+        .collect();
+    commands.join(" ")
+}
+
+/// A role as `set_user` takes it.
+fn role<'a>(role: &'a (&'static str, String)) -> (&'static str, &'a str) {
+    (role.0, &role.1)
+}
 
 async fn admin(url: &str) -> redis::aio::MultiplexedConnection {
     redis::Client::open(url)
@@ -146,7 +154,7 @@ async fn the_documented_commands_run_every_call_of_each_role() {
         .await
         .unwrap();
 
-    let producer = store(user(&url, &producer_name, &namespace, PRODUCER).await).await;
+    let producer = store(user(&url, &producer_name, &namespace, role(&PRODUCER)).await).await;
     producer
         .create(&namespace, &handle, &Create::default())
         .await
@@ -162,7 +170,7 @@ async fn the_documented_commands_run_every_call_of_each_role() {
     let appended = producer.append(&namespace, &handle, &batch).await.unwrap();
     let (first, _) = appended.offsets.unwrap();
 
-    let reader = store(user(&url, &reader_name, &namespace, READER).await).await;
+    let reader = store(user(&url, &reader_name, &namespace, role(&READER)).await).await;
     let (state, entries) = reader.read(&namespace, "s", 0, 10).await.unwrap();
     assert_eq!((state.newest, entries.len()), (first, 1));
     assert_eq!(
@@ -182,7 +190,7 @@ async fn the_documented_commands_run_every_call_of_each_role() {
             .unwrap()
     );
     // A user with read access to the keys can't write them, even with the Producer's commands.
-    let read_only = (READER.0, PRODUCER.1);
+    let read_only = (READER.0, PRODUCER.1.as_str());
     let read_only = store(user(&url, &read_only_name, &namespace, read_only).await).await;
     let refused = read_only
         .append(
@@ -270,7 +278,7 @@ async fn the_documented_commands_run_every_call_of_each_role() {
 
     // With `+wait`, too few replicas is a Store failure, not a refusal.
     let mut options =
-        RedisStoreOptions::new(user(&url, &producer_name, &namespace, PRODUCER).await);
+        RedisStoreOptions::new(user(&url, &producer_name, &namespace, role(&PRODUCER)).await);
     options.wait = Some(WaitOptions {
         replicas: NonZeroUsize::new(16).unwrap(),
         timeout: Duration::from_millis(50),
@@ -289,7 +297,8 @@ async fn the_documented_commands_run_every_call_of_each_role() {
         .unwrap_err();
     assert_eq!(failed.reason, Reason::StorageUnavailable, "{failed}");
     // Without `+wait`, each write would run its script and then fail, so connect refuses it.
-    let no_wait = (PRODUCER.0, PRODUCER.1.trim_end_matches(" +wait"));
+    let no_wait = PRODUCER.1.replace(" +wait", "");
+    let no_wait = (PRODUCER.0, no_wait.as_str());
     let mut options = RedisStoreOptions::new(user(&url, &producer_name, &namespace, no_wait).await);
     options.key_prefix = PREFIX.parse().unwrap();
     options.wait = Some(WaitOptions {
@@ -453,8 +462,8 @@ async fn the_documented_commands_serve_a_cluster_while_a_slot_moves() {
         ..Default::default()
     };
     let (producer_name, reader_name) = (format!("prod-{unique}"), format!("read-{unique}"));
-    let producer_commands = format!("{} {CLUSTER}", PRODUCER.1);
-    let reader_commands = format!("{} {CLUSTER}", READER.1);
+    let producer_commands = format!("{} {}", PRODUCER.1, *CLUSTER);
+    let reader_commands = format!("{} {}", READER.1, *CLUSTER);
     // The client sends `ACL SETUSER` to each node, since each node keeps its own users.
     for cmd in [
         set_user(&producer_name, &namespace, (PRODUCER.0, &producer_commands)),
