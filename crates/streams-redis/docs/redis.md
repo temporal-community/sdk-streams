@@ -213,3 +213,7 @@ these lists on a standalone server and on a cluster.
 - Redis can't tie a run to its run chain. A run of another chain that holds the owner's handle,
   such as a child Workflow with its parent's Stream, can still close it. The native server checks
   the run.
+- A cluster with `cluster-preferred-endpoint-type unknown-endpoint` gives no hosts in
+  `CLUSTER SLOTS` and in its redirects. A blocking read then finds a slot's node only through the
+  seeds and `MOVED`. redis-rs doesn't follow an `ASK` with no host, so a call fails with
+  `stream_storage_unavailable` while its slot migrates.
