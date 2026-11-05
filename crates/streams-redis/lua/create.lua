@@ -27,7 +27,7 @@ if not stored then
     redis.call('HSET', meta, 'rid', request_id)
   end
   withdraw_run(meta, withdrawn_run)
-  refresh(meta, log, producers, now, safety, tombstone)
+  refresh(meta, log, producers, nil, now, safety, tombstone)
   return {'created', retention, ''}
 end
 local refused = check_live(meta, version, now) or check_identity(meta, owner, chain)
@@ -58,7 +58,7 @@ if withdraw_run(meta, withdrawn_run) then
   trim(meta, log, now)
   local id = add(log, {'s', superseded})
   redis.call('HSET', meta, 'newest', id)
-  refresh(meta, log, producers, now, safety, tombstone)
+  refresh(meta, log, producers, nil, now, safety, tombstone)
   flag = '1'
 end
 touch(meta, wait)

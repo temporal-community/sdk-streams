@@ -21,7 +21,7 @@ use temporalio_streams::{
     epoch::{ProducerKind, TASK_KEY_LEN, epoch_key, task_key, task_of},
     ids::{StreamKeys, encode_part},
     offset::entry_id_of_offset,
-    proto::{Producer, StreamHandle, WorkflowTaskEpoch},
+    proto::{Producer, StreamRef, WorkflowTaskEpoch},
     store::{
         Appended, Batch, Capabilities, Closed, ConflictPolicy, Create, Created, Entry,
         FORMAT_VERSION, MAX_TTL, Owner, Store, StreamState, TOMBSTONE, TaskFacts, owner_chain,
@@ -101,7 +101,7 @@ impl RedisStore {
             Some(wait) => {
                 let mut lease = match wait.pool.take().await? {
                     Leased::Busy => {
-                        return Err(RedisStoreError::storage(
+                        return Err(RedisStoreError::unavailable(
                             "Every connection for writes with WAIT stayed busy for the response \
                              timeout",
                         ));
@@ -115,7 +115,7 @@ impl RedisStore {
                 lease.settle(reply)??
             }
         };
-        Ok(redis::from_redis_value(reply).map_err(RedisError::from)?)
+        redis::from_redis_value(reply).map_err(|error| corrupt("A script answer", error))
     }
 
     /// The Producer of the batch of `entry`, when the batch starts before `entry`.
@@ -128,13 +128,16 @@ impl RedisStore {
             return Ok(None);
         };
         let first = first.to_string();
-        let entries: Vec<LogEntry> = redis::cmd("XRANGE")
+        let reply: Value = redis::cmd("XRANGE")
             .arg(keys.log())
             .arg(&first)
             .arg(&first)
             .query_async(&mut self.shared.clone())
             .await?;
-        Ok(entries.into_iter().next().and_then(LogEntry::producer))
+        Ok(log_entries(reply)?
+            .into_iter()
+            .next()
+            .and_then(LogEntry::producer))
     }
 
     /// The outer error comes from the connection, or from a script load that Redis refused. The
@@ -176,19 +179,19 @@ impl Store for RedisStore {
     }
 
     /// Creates a Stream, or finds it. A retry run's create withdraws its previous run. A
-    /// Workflow-owned Stream stores its handle's run chain, which later creates and closes
-    /// must match.
+    /// Workflow-owned Stream stores its ref's run chain, which later creates and closes must
+    /// match.
     async fn create(
         &self,
         namespace: &str,
-        handle: &StreamHandle,
+        stream_ref: &StreamRef,
         create: &Create<'_>,
     ) -> StreamResult<Created> {
-        let keys = self.keys(namespace, &handle.id);
+        let keys = self.keys(namespace, &stream_ref.id);
         let retention = create.retention.filter(|r| !r.is_zero());
         let retention = retention.unwrap_or(self.retention);
         let (owner, chain) = match create.owner {
-            Owner::Workflow => ("wf", owner_chain(handle)),
+            Owner::Workflow => ("wf", owner_chain(stream_ref)),
             Owner::Client => ("client", String::new()),
         };
         let mut call = ScriptCall::write(&scripts::CREATE_SCRIPT, &keys);
@@ -211,10 +214,10 @@ impl Store for RedisStore {
     async fn append(
         &self,
         namespace: &str,
-        handle: &StreamHandle,
+        stream_ref: &StreamRef,
         batch: &Batch<'_>,
     ) -> StreamResult<Appended> {
-        let keys = self.keys(namespace, &handle.id);
+        let keys = self.keys(namespace, &stream_ref.id);
         let producer = batch.producer;
         let kind = ProducerKind::try_from(producer)?;
         let epoch = producer.epoch.unwrap_or_default();
@@ -242,27 +245,26 @@ impl Store for RedisStore {
         Ok(appended)
     }
 
-    /// Closes a Stream with an encoded close Record, if the Producer's kind and the handle's run
-    /// chain are the owner's.
+    /// Closes a Stream, if the Producer's kind and the ref's run chain are the owner's. The close
+    /// writes no entry, so it adds one to the `:closed` key, which wakes the blocked reads.
     async fn close(
         &self,
         namespace: &str,
-        handle: &StreamHandle,
+        stream_ref: &StreamRef,
         producer: &Producer,
-        record: &[u8],
     ) -> StreamResult<Closed> {
-        let keys = self.keys(namespace, &handle.id);
+        let keys = self.keys(namespace, &stream_ref.id);
         let epoch = producer.epoch.unwrap_or_default();
         let mut call = ScriptCall::write(&scripts::CLOSE_SCRIPT, &keys);
         call.cmd
+            .arg(keys.closed())
             .arg(FORMAT_VERSION)
             .arg(ProducerKind::try_from(producer)? as i32)
             .arg(&producer.id)
             .arg(encode_part(&producer.run_id))
             .arg(&epoch_key(&epoch)[..])
             .arg(TOMBSTONE.as_millis())
-            .arg(record)
-            .arg(owner_chain(handle))
+            .arg(owner_chain(stream_ref))
             .arg(self.wait.is_some());
         let CloseReply(closed) = self.write(&call).await?;
         Ok(closed)
@@ -293,8 +295,7 @@ impl Store for RedisStore {
             state,
             entries,
             earlier,
-        } = redis::from_redis_value(reply)
-            .map_err(|error| RedisStoreError::from(RedisError::from(error)))?;
+        } = redis::from_redis_value(reply).map_err(|error| corrupt("The Stream", error))?;
         Ok((state, with_producers(entries, earlier)?))
     }
 
@@ -307,7 +308,7 @@ impl Store for RedisStore {
         count: usize,
     ) -> StreamResult<Vec<Entry>> {
         let keys = self.keys(namespace, stream_id);
-        let mut entries: Vec<LogEntry> = redis::cmd("XREVRANGE")
+        let reply: Value = redis::cmd("XREVRANGE")
             .arg(keys.log())
             .arg(entry_id_of_offset(before))
             .arg("-")
@@ -316,6 +317,7 @@ impl Store for RedisStore {
             .query_async(&mut self.shared.clone())
             .await
             .map_err(RedisStoreError::from)?;
+        let mut entries = log_entries(reply)?;
         entries.reverse();
         // The oldest entry's batch can start below the page, so its Producer comes from there.
         let earlier = match entries.first() {
@@ -343,7 +345,7 @@ impl Store for RedisStore {
         };
         Ok(self
             .blocking
-            .wait_after(&keys.log(), &after, deadline)
+            .wait_after(&keys.log(), &keys.closed(), &after, deadline)
             .await
             .map_err(RedisStoreError::from)?)
     }
@@ -394,10 +396,11 @@ impl ScriptCall {
 
 /// Refuses a write that fewer than `wait.replicas` replicas have.
 fn acknowledged(wait: &Wait, acked: Value) -> RedisStoreResult<()> {
-    let acked: usize = redis::from_redis_value(acked.extract_error()?)
-        .map_err(|error| bad_reply("WAIT", error))?;
+    let acked: usize = redis::from_redis_value(acked.extract_error()?).map_err(|error| {
+        RedisStoreError::unavailable(format!("Redis gave WAIT the answer {error}"))
+    })?;
     if acked < wait.replicas.get() {
-        return Err(RedisStoreError::storage(format!(
+        return Err(RedisStoreError::unavailable(format!(
             "{acked} of {} replicas had the write after {:?}. A failover can lose it, and a retry \
              with the same sequence writes it once",
             wait.replicas, wait.timeout
@@ -475,8 +478,14 @@ impl ToRedisArgs for TaskArgs<'_> {
     }
 }
 
-fn bad_reply(call: &str, reply: impl std::fmt::Debug) -> RedisStoreError {
-    RedisStoreError::storage(format!("Redis gave the {call} script the answer {reply:?}"))
+/// The entries of an `XRANGE` or `XREVRANGE` reply.
+fn log_entries(reply: Value) -> RedisStoreResult<Vec<LogEntry>> {
+    redis::from_redis_value(reply).map_err(|error| corrupt("A log entry", error))
+}
+
+/// A value that Redis keeps or answers and that the Store can't decode.
+fn corrupt(what: &str, error: impl std::fmt::Display) -> RedisStoreError {
+    RedisStoreError::corrupt(format!("{what} doesn't decode: {error}"))
 }
 
 /// Refuses options that can't work, before any connection, and parses the URLs.
@@ -688,7 +697,7 @@ mod tests {
             (&zero, &zero, b"abc"),
         ];
         for (i, (task, completed, failed)) in cases.into_iter().enumerate() {
-            let handle = StreamHandle {
+            let handle = StreamRef {
                 id: format!("s{i}"),
                 ..Default::default()
             };
@@ -754,7 +763,7 @@ mod tests {
         let store = RedisStore::connect(options).await.unwrap();
         let (namespace, handle) = (
             format!("ns-{}", std::process::id()),
-            StreamHandle {
+            StreamRef {
                 id: "batch".to_string(),
                 ..Default::default()
             },

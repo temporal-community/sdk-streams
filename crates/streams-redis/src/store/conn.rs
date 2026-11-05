@@ -571,9 +571,12 @@ fn classify(error: &RedisError, route: Route) -> Step {
     }
 }
 
-/// A read that blocks until the log at `key` has an entry after `after`, or until `deadline`.
+/// A read that blocks until the log at `key` has an entry after `after`, the Stream closes, or
+/// `deadline` passes.
 struct BlockedRead<'a> {
     key: &'a str,
+    /// The Stream's `:closed` key, which gets an entry when the Stream closes.
+    closed: &'a str,
     after: &'a str,
     deadline: Instant,
 }
@@ -586,7 +589,8 @@ impl BlockedRead<'_> {
         // `BLOCK 0` waits with no end, so a read at its deadline blocks for 1 ms.
         let block = usize::try_from(wait.as_millis().max(1)).unwrap_or(usize::MAX);
         let options = StreamReadOptions::default().count(1).block(block);
-        Cmd::xread_options(&[self.key], &[self.after], &options)
+        // Any entry of the `:closed` key wakes the read, so a read of a closed Stream ends at once.
+        Cmd::xread_options(&[self.key, self.closed], &[self.after, "0-0"], &options)
     }
 }
 
@@ -636,17 +640,19 @@ impl BlockingPool {
         }
     }
 
-    /// Waits for an entry after the entry id `after` in the log at `key`. Gives `false` when the
-    /// read ends with no entry, also early with no free connection or during a slot migration. Then
-    /// the caller reads the Stream again.
+    /// Waits for an entry after the entry id `after` in the log at `key`, or for the Stream's close
+    /// on its `closed` key. Gives `false` when the read ends with neither, also early with no free
+    /// connection or during a slot migration. Then the caller reads the Stream again.
     pub(crate) async fn wait_after(
         &self,
         key: &str,
+        closed: &str,
         after: &str,
         deadline: Instant,
     ) -> RedisResult<bool> {
         let read = BlockedRead {
             key,
+            closed,
             after,
             deadline,
         };
@@ -916,7 +922,8 @@ mod tests {
             .unwrap();
         pool.slots.learn(slot(key), node("127.0.0.1", dead_port()));
         let deadline = Instant::now() + Duration::from_secs(2);
-        assert!(pool.wait_after(key, "0-0", deadline).await.unwrap());
+        let closed = "test:{dead-node}:closed";
+        assert!(pool.wait_after(key, closed, "0-0", deadline).await.unwrap());
         assert_eq!(pool.slots.get(slot(key)), None);
     }
 
@@ -960,7 +967,13 @@ mod tests {
             .unwrap();
         let reads = BlockingPool::new(dead.clone(), NonZeroUsize::MIN, Some(cluster.clone()));
         let deadline = Instant::now() + Duration::from_secs(5);
-        assert!(reads.wait_after(key, "0-0", deadline).await.unwrap());
+        let closed = "test:{dead-seeds}:closed";
+        assert!(
+            reads
+                .wait_after(key, closed, "0-0", deadline)
+                .await
+                .unwrap()
+        );
         // The second lease finds no idle connection, so it opens one.
         let first = SharedConnection::Cluster(cluster.clone());
         let waits = WaitPool::new(first, dead, Some(cluster));
@@ -1014,7 +1027,7 @@ mod tests {
             .unwrap());
         tokio::time::pause();
         let deadline = Instant::now() + Duration::from_millis(500);
-        let read = pool.wait_after("s", "0-0", deadline);
+        let read = pool.wait_after("s", "s:closed", "0-0", deadline);
         let free = async {
             tokio::time::advance(Duration::from_millis(300)).await;
             held.settle(Ok(())).unwrap();
@@ -1039,7 +1052,12 @@ mod tests {
         let _held = new(pool.node(&seed).lease(deadline()).await.unwrap());
         tokio::time::pause();
         let start = Instant::now();
-        assert!(!pool.wait_after("s", "0-0", deadline()).await.unwrap());
+        assert!(
+            !pool
+                .wait_after("s", "s:closed", "0-0", deadline())
+                .await
+                .unwrap()
+        );
         // The paused clock moves only to the read's give-up, which the timer rounds up to the
         // next ms.
         let waited = start.elapsed();

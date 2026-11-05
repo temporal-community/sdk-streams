@@ -57,21 +57,18 @@ impl FromRedisValue for AppendReply {
     }
 }
 
-/// The answer of `close.lua`, `[outcome, close id]`.
+/// The answer of `close.lua`, `[outcome]`.
 pub(super) struct CloseReply(pub(super) Closed);
 
 impl FromRedisValue for CloseReply {
     fn from_redis_value(value: Value) -> Result<Self, ParsingError> {
-        let (outcome, id): (String, String) = FromRedisValue::from_redis_value(value)?;
+        let (outcome,): (String,) = FromRedisValue::from_redis_value(value)?;
         let already = match outcome.as_str() {
             "closed" => false,
             "already" => true,
             other => return Err(unknown("close", other)),
         };
-        Ok(Self(Closed {
-            offset: offset(&id)?,
-            already,
-        }))
+        Ok(Self(Closed { already }))
     }
 }
 
@@ -87,7 +84,6 @@ pub(super) struct ReadReply {
 /// nil.
 type MetaFields = (
     Option<u32>,
-    Option<String>,
     Option<String>,
     Option<String>,
     Option<String>,
@@ -107,10 +103,10 @@ impl FromRedisValue for ReadReply {
             ),
         };
         let now_ms = seconds * 1000 + micros / 1000;
-        let (version, closed, close_id, newest, trimmed, retention, expires) = meta;
+        let (version, closed, newest, trimmed, retention, expires) = meta;
         // A create sets `v`, `ret` and `exp` together, so a Stream with no `v` doesn't exist.
         let Some(version) = version else {
-            let texts = [&closed, &close_id, &newest, &trimmed];
+            let texts = [&closed, &newest, &trimmed];
             if texts.iter().any(|text| text.is_some()) || retention.is_some() || expires.is_some() {
                 return Err("a Stream has meta fields but no format version".into());
             }
@@ -125,15 +121,10 @@ impl FromRedisValue for ReadReply {
         };
         // An offset of zero is no entry, as in `StreamState`.
         let offset_or_zero = |id: Option<String>| id.as_deref().map_or(Ok(0), offset);
-        let closed_at = match (closed, close_id) {
-            (None, _) => None,
-            (Some(_), Some(id)) => Some(offset(&id)?),
-            (Some(_), None) => return Err("a closed Stream has no close id".into()),
-        };
         let state = StreamState {
             exists: true,
             version,
-            closed_at,
+            closed: closed.is_some(),
             newest: offset_or_zero(newest)?,
             trimmed: offset_or_zero(trimmed)?,
             retention: Duration::from_millis(retention.ok_or("a Stream has no Retention")?),
