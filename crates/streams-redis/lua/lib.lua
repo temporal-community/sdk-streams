@@ -59,8 +59,9 @@ local function check_identity(meta, owner, chain)
 end
 
 -- Sets the expiry after this write. It's the safety TTL for an open Workflow-owned Stream, or the
--- Retention otherwise. The meta key expires 30 days later, as the Tombstone.
-local function refresh(meta, log, producers, now, safety, tombstone)
+-- Retention otherwise. The meta key expires 30 days later, as the Tombstone. Only a close gives the
+-- `closed` key, since a closed Stream takes no other write.
+local function refresh(meta, log, producers, closed, now, safety, tombstone)
   local retention = tonumber(redis.call('HGET', meta, 'ret'))
   local exp = now + retention
   if redis.call('HGET', meta, 'own') == 'wf' and not redis.call('HGET', meta, 'closed') then
@@ -68,8 +69,10 @@ local function refresh(meta, log, producers, now, safety, tombstone)
   end
   redis.call('HSET', meta, 'exp', exp)
   redis.call('PEXPIREAT', meta, exp + tombstone)
-  if redis.call('EXISTS', producers) == 1 then
-    redis.call('PEXPIREAT', producers, exp)
+  for _, key in ipairs({producers, closed}) do
+    if redis.call('EXISTS', key) == 1 then
+      redis.call('PEXPIREAT', key, exp)
+    end
   end
   -- A read hides every Record one Retention after the last write. `newest` keeps later ids above
   -- the expired ones.
@@ -161,7 +164,8 @@ local function check_ids_fit(meta, log, now, count)
     end
   end
   if next_seq + count > 1048576 then
-    return refuse('STORAGE', 'the entry ids of this millisecond would not fit an offset')
+    return refuse('STORAGE_UNAVAILABLE',
+      'the entry ids of this millisecond would not fit an offset')
   end
   return nil
 end
@@ -204,7 +208,7 @@ local function read_producer(meta, field)
   if not value then
     return nil
   end
-  local unknown = refuse('STORAGE', 'the Producer field has an unknown format')
+  local unknown = refuse('STORAGE_CORRUPT', 'the Producer field has an unknown format')
   if #value ~= PRODUCER_FIELD_LEN then
     return false, unknown
   end

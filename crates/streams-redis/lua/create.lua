@@ -25,7 +25,7 @@ if not stored then
   if request_id ~= '' then
     redis.call('HSET', meta, 'rid', request_id)
   end
-  refresh(meta, log, producers, now, safety, tombstone)
+  refresh(meta, log, producers, nil, now, safety, tombstone)
   return {'created', retention}
 end
 local refused = check_live(meta, version, now) or check_identity(meta, owner, chain)

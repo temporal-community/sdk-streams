@@ -9,11 +9,14 @@ form, and the `testdata/` of `temporalio-streams` has its test vectors.
 <prefix>:{<namespace>:<stream id>}:meta
 <prefix>:{<namespace>:<stream id>}:log
 <prefix>:{<namespace>:<stream id>}:producers
+<prefix>:{<namespace>:<stream id>}:closed
 ```
 
-- Each part is percent-encoded. The hash tag puts the three keys in one cluster slot.
+- Each part is percent-encoded. The hash tag puts the four keys in one cluster slot.
 - The prefix has only letters, digits, `-`, `.`, `_` and `~`, so a key pattern shows it as written.
-- A create writes `:meta`. An append writes `:producers`, and an append or a close writes `:log`.
+- A create writes `:meta`. An append writes `:producers` and `:log`.
+- A close writes no log entry. It adds one entry to `:closed`, so a read that waits on the log and
+  on `:closed` wakes. `:closed` expires with the log.
 
 ## The meta hash
 
@@ -25,7 +28,7 @@ form, and the `testdata/` of `temporalio-streams` has its test vectors.
 | `oc` | The owner's run chain, `<workflow id>:<first run id>` with each part encoded |
 | `exp` | When the Stream stops taking writes, in ms since 1970 |
 | `rid` | The request id of the create that made the Stream, absent when it gave none |
-| `closed`, `close_id` | Set by the close, with the entry id of the close Record |
+| `closed` | Set by the close |
 | `newest` | The entry id of the newest entry |
 | `trimmed` | The entry id of the newest entry that Retention or the log's expiry dropped |
 | `p\|<kind>\|<producer id>` | The Producer's fence, held epoch and last batch, 129 bytes |
@@ -44,7 +47,7 @@ form, and the `testdata/` of `temporalio-streams` has its test vectors.
 
 - The ids are zero when the last batch wrote no entry. A real entry id is never `0-0`.
 - A call that finds a value of another length, another flag bit, or only one zero id fails with
-  `stream_storage`, since a later format may write it.
+  `stream_storage_corrupt`, since a later format may write it.
 - An epoch key is the task key (started event id 8, attempt 4, started seconds 8 and nanos 4),
   then the attempt's scheduled seconds 8 and nanos 4 and the attempt 4. A negative field is zero.
 - The scripts compare two epoch keys byte by byte. Lua's `<` collates with the server's locale.
@@ -122,8 +125,8 @@ these lists on a standalone server and on a cluster.
 - Use `maxmemory-policy noeviction`. Another policy can evict the meta and keep the log, which loses
   the fence, the dedupe and the close. The Store warns about it on connect.
 - A failover can lose a write that Redis acknowledged. With `wait_replicas`, each write waits for
-  that many replicas with `WAIT`. A write that they don't have after `wait_timeout` fails as a
-  Store failure, and its retry with the same sequence writes it once.
+  that many replicas with `WAIT`. A write that they don't have after `wait_timeout` fails with
+  `stream_storage_unavailable`, and its retry with the same sequence writes it once.
 - `WAIT` protects only the writer's answer. A Reader can see a write before its `WAIT` ends, and
   a failover can then lose that write.
 - On a cluster, the client sends a write again after it loses the reply. A batch with sequence 0

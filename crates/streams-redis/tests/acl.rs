@@ -15,7 +15,7 @@ use temporalio_streams::{
     ids::{StreamKeys, client_producer_id},
     offset::offset_of_entry_id,
     proto::{
-        AppendRecord, ClientEpoch, Producer, ProducerEpoch, StreamData, StreamHandle, StreamRecord,
+        AppendRecord, ClientEpoch, Producer, ProducerEpoch, StreamData, StreamRecord, StreamRef,
         producer_epoch::Kind, stream_record::Item,
     },
     store::{Batch, Create, Owner, Store, Withdrawal},
@@ -135,7 +135,7 @@ async fn the_documented_commands_run_every_call_of_each_role() {
     let namespace = format!("ns-{unique}");
     let (producer_name, reader_name) = (format!("prod-{unique}"), format!("read-{unique}"));
     let read_only_name = format!("ro-{unique}");
-    let handle = StreamHandle {
+    let handle = StreamRef {
         id: "s".to_string(),
         ..Default::default()
     };
@@ -199,14 +199,14 @@ async fn the_documented_commands_run_every_call_of_each_role() {
     assert!(!refused.message.contains("evalsha"), "{refused}");
 
     producer
-        .close(&namespace, &handle, &client(), b"")
+        .close(&namespace, &handle, &client())
         .await
         .unwrap();
 
     // An append trims the Records older than the Retention, and prunes the Producers with no
     // append for one Retention. The scripts read the server's `TIME`, so raw writes age an entry
     // and a Producer, and the case doesn't wait.
-    let short = StreamHandle {
+    let short = StreamRef {
         id: "short".to_string(),
         ..Default::default()
     };
@@ -279,7 +279,7 @@ async fn the_documented_commands_run_every_call_of_each_role() {
     let failed = waits
         .create(
             &namespace,
-            &StreamHandle {
+            &StreamRef {
                 id: "waits".to_string(),
                 ..Default::default()
             },
@@ -287,7 +287,7 @@ async fn the_documented_commands_run_every_call_of_each_role() {
         )
         .await
         .unwrap_err();
-    assert_eq!(failed.reason, Reason::Storage, "{failed}");
+    assert_eq!(failed.reason, Reason::StorageUnavailable, "{failed}");
     // Without `+wait`, each write would run its script and then fail, so connect refuses it.
     let no_wait = (PRODUCER.0, PRODUCER.1.trim_end_matches(" +wait"));
     let mut options = RedisStoreOptions::new(user(&url, &producer_name, &namespace, no_wait).await);
@@ -368,7 +368,7 @@ struct Migration {
     slot: u16,
     source: String,
     target: String,
-    keys: [String; 3],
+    keys: [String; 4],
 }
 
 impl Drop for Migration {
@@ -447,7 +447,7 @@ async fn the_documented_commands_serve_a_cluster_while_a_slot_moves() {
         unreachable!()
     };
     let keys = StreamKeys::new(PREFIX, &namespace, &stream);
-    let handle = StreamHandle {
+    let handle = StreamRef {
         id: stream,
         ..Default::default()
     };
@@ -498,7 +498,7 @@ async fn the_documented_commands_serve_a_cluster_while_a_slot_moves() {
         slot,
         source: source.url(),
         target: target.url(),
-        keys: [keys.meta(), keys.log(), keys.producers()],
+        keys: [keys.meta(), keys.log(), keys.producers(), keys.closed()],
     };
     target.run(&set_slot("IMPORTING", source)).await;
     source.run(&set_slot("MIGRATING", target)).await;
@@ -520,10 +520,7 @@ async fn the_documented_commands_serve_a_cluster_while_a_slot_moves() {
     let read_back = reader.read_back(&namespace, &handle.id, i64::MAX, 10).await;
     let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
     let waited = reader.wait_after(&namespace, &handle.id, 0, deadline).await;
-    let closed = producer
-        .close(&namespace, &handle, &me, b"")
-        .await
-        .map(|_| ());
+    let closed = producer.close(&namespace, &handle, &me).await.map(|_| ());
 
     drop(migration);
     for name in [&producer_name, &reader_name] {

@@ -5,8 +5,7 @@
 -- close_id, newest, trimmed, ret and exp, with false for a missing one. The producer is the
 -- encoded Producer of the batch that the first entry is part of, when that batch starts earlier.
 local meta, log = KEYS[1], KEYS[2]
-local state = redis.call('HMGET', meta, 'v', 'closed', 'close_id', 'newest', 'trimmed', 'ret',
-  'exp')
+local state = redis.call('HMGET', meta, 'v', 'closed', 'newest', 'trimmed', 'ret', 'exp')
 local entries = {}
 if tonumber(ARGV[2]) > 0 then
   entries = redis.call('XRANGE', log, ARGV[1], '+', 'COUNT', ARGV[2])

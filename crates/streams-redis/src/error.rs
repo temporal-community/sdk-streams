@@ -14,10 +14,13 @@ pub enum RedisStoreError {
     /// The options are wrong or Redis is too old, so a retry can't fix it.
     #[error("{0}")]
     Invalid(String),
-    /// Redis gave an answer that the Store doesn't expect, or too few replicas acknowledged a
-    /// write. A retry may fix it.
+    /// Redis or its replicas didn't take the call in time, so a retry may fix it.
     #[error("{0}")]
-    Storage(String),
+    Unavailable(String),
+    /// Redis keeps a value that isn't valid, or gave an answer that the Store can't decode. A
+    /// retry can't fix it.
+    #[error("{0}")]
+    Corrupt(String),
     /// A rule of the Stream runtime refused a value that Redis keeps.
     #[error(transparent)]
     Stream(#[from] StreamError),
@@ -31,8 +34,12 @@ impl RedisStoreError {
         Self::Invalid(message.into())
     }
 
-    pub(crate) fn storage(message: impl Into<String>) -> Self {
-        Self::Storage(message.into())
+    pub(crate) fn unavailable(message: impl Into<String>) -> Self {
+        Self::Unavailable(message.into())
+    }
+
+    pub(crate) fn corrupt(message: impl Into<String>) -> Self {
+        Self::Corrupt(message.into())
     }
 }
 
@@ -41,14 +48,16 @@ impl From<RedisStoreError> for StreamError {
         match error {
             RedisStoreError::Redis(error) => from_redis(&error),
             RedisStoreError::Invalid(message) => StreamError::invalid(message),
-            RedisStoreError::Storage(message) => StreamError::storage(message),
+            RedisStoreError::Unavailable(message) => StreamError::storage_unavailable(message),
+            RedisStoreError::Corrupt(message) => StreamError::storage_corrupt(message),
             RedisStoreError::Stream(error) => error,
         }
     }
 }
 
 /// The Stream error of a Redis error. Scripts mark their refusals with a `STREAM_` code. A refusal
-/// that a retry can't fix is invalid, and any other failure is a Store failure that may be retried.
+/// that a retry can't fix is invalid, a key of another type is corrupt, and any other failure is
+/// unavailable, so a retry may fix it.
 fn from_redis(error: &RedisError) -> StreamError {
     let detail = error.detail().unwrap_or_default().to_string();
     // A bad URL or bad credentials stay wrong on a retry. redis-rs gives some server codes as
@@ -95,17 +104,25 @@ fn from_redis(error: &RedisError) -> StreamError {
         Some("STREAM_NOT_OWNER") => Reason::NotOwner,
         Some("STREAM_FORMAT_TOO_NEW") => Reason::FormatTooNew,
         Some("STREAM_INVALID") => Reason::Invalid,
-        Some("STREAM_STORAGE") => Reason::Storage,
-        Some(code @ ("WRONGTYPE" | "NOAUTH" | "WRONGPASS")) => {
+        Some("STREAM_STORAGE_UNAVAILABLE") => Reason::StorageUnavailable,
+        Some("STREAM_STORAGE_CORRUPT") => Reason::StorageCorrupt,
+        Some("WRONGTYPE") => {
+            return StreamError::storage_corrupt(format!(
+                "A key of the Stream has another type: {detail}"
+            ));
+        }
+        Some(code @ ("NOAUTH" | "WRONGPASS")) => {
             return StreamError::invalid(format!(
                 "Redis refused the call for good: {code} {detail}"
             ));
         }
         // The code as the server wrote it, so the message has the code the Redis docs use.
         Some(code) => {
-            return StreamError::storage(format!("Redis refused the call: {code} {detail}"));
+            return StreamError::storage_unavailable(format!(
+                "Redis refused the call: {code} {detail}"
+            ));
         }
-        None => return StreamError::storage(format!("Redis failed: {error}")),
+        None => return StreamError::storage_unavailable(format!("Redis failed: {error}")),
     };
     StreamError::new(reason, detail)
 }
@@ -124,7 +141,7 @@ mod tests {
     }
 
     #[test]
-    fn a_script_refusal_keeps_its_reason_a_lasting_refusal_is_invalid_and_the_rest_is_storage() {
+    fn a_script_refusal_keeps_its_reason_and_a_server_refusal_gets_its_class() {
         for (code, reason) in [
             ("STREAM_NOT_FOUND", Reason::NotFound),
             ("STREAM_EXPIRED", Reason::Expired),
@@ -136,6 +153,8 @@ mod tests {
             ("STREAM_NOT_OWNER", Reason::NotOwner),
             ("STREAM_FORMAT_TOO_NEW", Reason::FormatTooNew),
             ("STREAM_INVALID", Reason::Invalid),
+            ("STREAM_STORAGE_UNAVAILABLE", Reason::StorageUnavailable),
+            ("STREAM_STORAGE_CORRUPT", Reason::StorageCorrupt),
         ] {
             let error = server(code, "why it refused");
             assert_eq!(
@@ -146,17 +165,13 @@ mod tests {
         // A script that a flush or a failover dropped again after its reload is a passing state.
         for code in ["READONLY", "OOM", "LOADING", "BUSY", "TRYAGAIN", "NOSCRIPT"] {
             let error = server(code, "x");
-            assert_eq!(error.reason, Reason::Storage, "{code}");
+            assert_eq!(error.reason, Reason::StorageUnavailable, "{code}");
             assert!(error.message.contains(code), "{error}");
         }
         for (code, detail) in [
             (
                 "NOPERM",
                 "this user has no permissions to run the 'evalsha' command",
-            ),
-            (
-                "WRONGTYPE",
-                "Operation against a key holding the wrong kind of value",
             ),
             (
                 "ERR",
@@ -174,7 +189,12 @@ mod tests {
             assert!(error.message.contains(detail), "{error}");
         }
         let other = server("ERR", "max number of clients reached");
-        assert_eq!(other.reason, Reason::Storage);
+        assert_eq!(other.reason, Reason::StorageUnavailable);
+        let wrong_type = server(
+            "WRONGTYPE",
+            "Operation against a key holding the wrong kind",
+        );
+        assert_eq!(wrong_type.reason, Reason::StorageCorrupt);
         let url = RedisError::from((ErrorKind::InvalidClientConfig, "Redis URL did not parse"));
         assert_eq!(
             StreamError::from(RedisStoreError::from(url)).reason,

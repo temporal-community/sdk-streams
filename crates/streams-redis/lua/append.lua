@@ -118,7 +118,7 @@ if last_id ~= '' then
   redis.call('HSET', meta, 'newest', last_id)
 end
 redis.call('ZADD', producers, next_ms, kind .. '|' .. producer)
-refresh(meta, log, producers, now, safety, tombstone)
+refresh(meta, log, producers, nil, now, safety, tombstone)
 local flag = ''
 if flagged then
   flag = '1'
