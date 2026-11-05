@@ -317,7 +317,8 @@ struct Primary {
 }
 
 impl Primary {
-    /// An empty or NULL host is the node that answered, which is local in the test cluster.
+    /// An empty host is the node that answered, and a NULL one is the endpoint that the test asked.
+    /// Both are local in the test cluster.
     fn host(&self) -> &str {
         match self.node.host.as_deref() {
             None | Some("") => "127.0.0.1",
