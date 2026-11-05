@@ -105,13 +105,14 @@ create with another owner (`stream_not_owner`) and a closed Stream (`stream_clos
 
 ## Orphaned Local Activity Records
 
-A Local Activity batch can give its run's last completed Workflow Task (`previous_completed_task`)
-and failed tasks. Then the append withdraws the run's tasks in `oa` that never completed.
+A Local Activity batch's `writer` can give its run's last completed Workflow Task
+(`previous_completed_task`) and failed tasks (`failed_tasks`). Then the append withdraws the run's
+tasks in `oa` that never completed.
 
 - These are the tasks after the completed task and before the batch's task, the failed tasks, and
   the lower attempts of the batch's task and of the completed task.
-- One entry with only `s` withdraws them. Its `StreamSuperseded` is of the Workflow kind, with the
-  run's Workflow Producer, the batch's task, and the completed and failed tasks.
+- One entry with only `s` withdraws them. The `writer` of its `StreamSuperseded` has the run's
+  Workflow Producer at the batch's task, and the completed and failed tasks.
 - The append then drops the tasks at or before the completed task from `oa`.
 - Each Local Activity batch with Records adds its task to `oa`, also a batch with no task facts.
 - Each `ow|<run>|<task key>` fences a late write of that task.
@@ -123,8 +124,8 @@ and failed tasks. Then the append withdraws the run's tasks in `oa` that never c
 
 ## Retry runs
 
-- A Workflow retry run gives its previous run in `withdraw_run`, on its create and on the first
-  batch of each of its Local Activities.
+- A Workflow retry run gives its previous run in `withdraw_run` on its create, and in
+  `writer.withdraw_run` on the first batch of each of its Local Activities.
 - The first such call sets `wr|<previous run>`, also when the create makes the Stream.
 - When `run|<previous run>` is set, the call also writes `s`. A create writes it on an entry of its
   own, and an append on the first entry of its batch.

@@ -27,7 +27,7 @@ use temporalio_streams::{
     memory::MemoryStore,
     proto::{
         ActivityEpoch, AppendRecord, ClientEpoch, LocalActivityEpoch, Producer, ProducerEpoch,
-        StreamData, StreamRecord, StreamRef, StreamSuperseded, WorkflowTaskEpoch,
+        StreamData, StreamRecord, StreamRef, StreamSuperseded, StreamWriter, WorkflowTaskEpoch,
         producer_epoch::Kind, stream_record,
     },
     store::{
@@ -695,17 +695,17 @@ fn batch(producer: &Producer, texts: &[&str]) -> (Vec<Vec<u8>>, [u8; 16]) {
 /// The `Superseded` facts of a batch, or of a create of a retry run.
 fn superseded(producer: &Producer, withdraw_run: &str) -> Vec<u8> {
     StreamSuperseded {
-        producer_id: producer.id.clone(),
-        epoch: producer.epoch,
-        withdraw_run: withdraw_run.to_string(),
-        run_id: producer.run_id.clone(),
-        ..Default::default()
+        writer: Some(StreamWriter {
+            producer: Some(producer.clone()),
+            withdraw_run: withdraw_run.to_string(),
+            ..Default::default()
+        }),
     }
     .encode_to_vec()
 }
 
-/// The `Superseded` facts that withdraw a run's orphaned Local Activity Records. They are of the
-/// Workflow kind, with the batch's task.
+/// The `Superseded` facts that withdraw a run's orphaned Local Activity Records. Their writer is
+/// the run's Workflow Producer at the batch's task, with the run's task facts.
 fn task_superseded(
     producer: &Producer,
     completed: Option<WorkflowTaskEpoch>,
@@ -716,14 +716,18 @@ fn task_superseded(
         _ => None,
     };
     StreamSuperseded {
-        producer_id: workflow_producer_id(&producer.run_id),
-        epoch: Some(ProducerEpoch {
-            kind: task.map(Kind::Workflow),
+        writer: Some(StreamWriter {
+            producer: Some(Producer {
+                id: workflow_producer_id(&producer.run_id),
+                epoch: Some(ProducerEpoch {
+                    kind: task.map(Kind::Workflow),
+                }),
+                run_id: producer.run_id.clone(),
+            }),
+            previous_completed_task: completed,
+            failed_tasks: failed.to_vec(),
+            ..Default::default()
         }),
-        previous_completed_task: completed,
-        failed_tasks: failed.to_vec(),
-        run_id: producer.run_id.clone(),
-        ..Default::default()
     }
     .encode_to_vec()
 }
