@@ -11,13 +11,14 @@ use temporalio_common::protos::temporal::api::common::v1::Payload;
 use temporalio_streams::{
     Reason,
     digest::batch_digest,
+    epoch::ProducerKind,
     ids::{StreamKeys, client_producer_id, local_activity_producer_id},
     offset::offset_of_entry_id,
     proto::{
-        AppendRecord, Producer, ProducerEpoch, StreamData, StreamHandle, StreamProducerKind,
-        StreamRecord, WorkflowTaskEpoch, stream_record::Item,
+        AppendRecord, ClientEpoch, LocalActivityEpoch, Producer, ProducerEpoch, StreamData,
+        StreamHandle, StreamRecord, WorkflowTaskEpoch, producer_epoch::Kind, stream_record::Item,
     },
-    store::{Batch, Owner, Store, TaskFacts, Withdrawal},
+    store::{Batch, ConflictPolicy, Create, Owner, Store, TaskFacts, Withdrawal},
 };
 use temporalio_streams_redis::{
     RedisStore, RedisStoreError, RedisStoreOptions, Topology, WaitOptions,
@@ -118,11 +119,9 @@ fn one_record() -> (Vec<Vec<u8>>, [u8; 16]) {
 
 fn client_named(process: &str) -> Producer {
     Producer {
-        kind: StreamProducerKind::Client as i32,
         id: client_producer_id("me", process),
         epoch: Some(ProducerEpoch {
-            attempt: 1,
-            ..Default::default()
+            kind: Some(Kind::Client(ClientEpoch { attempt: 1 })),
         }),
         run_id: String::new(),
     }
@@ -143,14 +142,12 @@ fn task(started: i64) -> WorkflowTaskEpoch {
 /// A Local Activity of the run `run`, dispatched by `task`.
 fn local_activity(run: &str, task: &WorkflowTaskEpoch) -> Producer {
     Producer {
-        kind: StreamProducerKind::LocalActivity as i32,
         id: local_activity_producer_id(run, &format!("call-{}", task.started_event_id)),
         epoch: Some(ProducerEpoch {
-            task_started_event_id: task.started_event_id,
-            task_attempt: task.attempt,
-            task_started_time: task.started_time,
-            attempt: 1,
-            ..Default::default()
+            kind: Some(Kind::LocalActivity(LocalActivityEpoch {
+                task: Some(*task),
+                attempt: 1,
+            })),
         }),
         run_id: run.to_string(),
     }
@@ -177,13 +174,7 @@ async fn the_documented_commands_run_every_call_of_each_role() {
 
     let producer = store(user(&url, &producer_name, &namespace, PRODUCER).await).await;
     producer
-        .create(
-            &namespace,
-            &handle,
-            None,
-            Owner::Client,
-            &Withdrawal::default(),
-        )
+        .create(&namespace, &handle, &Create::default())
         .await
         .unwrap();
     let (stored, digest) = one_record();
@@ -244,13 +235,7 @@ async fn the_documented_commands_run_every_call_of_each_role() {
         ..Default::default()
     };
     producer
-        .create(
-            &namespace,
-            &retry,
-            None,
-            Owner::Client,
-            &Withdrawal::default(),
-        )
+        .create(&namespace, &retry, &Create::default())
         .await
         .unwrap();
     let la_append = |task: &WorkflowTaskEpoch, completed, failed: &'static [i64]| {
@@ -280,13 +265,18 @@ async fn the_documented_commands_run_every_call_of_each_role() {
     la_append(&failed, None, &[]).await;
     let orphan = la_append(&next, Some(&completed), &[3]).await;
     assert!(orphan.flagged);
-    let withdrawn = Withdrawal {
-        withdraw_run: "r0",
-        superseded: b"run",
-        tasks: None,
+    // The retry run's create uses the Stream that the first run made.
+    let withdraw = Create {
+        conflict: ConflictPolicy::UseExisting,
+        withdrawal: Withdrawal {
+            withdraw_run: "r0",
+            superseded: b"run",
+            tasks: None,
+        },
+        ..Create::default()
     };
     let created = producer
-        .create(&namespace, &retry, None, Owner::Client, &withdrawn)
+        .create(&namespace, &retry, &withdraw)
         .await
         .unwrap();
     assert!(created.flagged);
@@ -304,9 +294,11 @@ async fn the_documented_commands_run_every_call_of_each_role() {
         .create(
             &namespace,
             &short,
-            Some(retention),
-            Owner::Workflow,
-            &Withdrawal::default(),
+            &Create {
+                retention: Some(retention),
+                owner: Owner::Workflow,
+                ..Create::default()
+            },
         )
         .await
         .unwrap();
@@ -317,7 +309,7 @@ async fn the_documented_commands_run_every_call_of_each_role() {
     let old = format!("{old_ms}-1");
     let field = format!(
         "p|{}|{}",
-        StreamProducerKind::Client as i32,
+        ProducerKind::Client as i32,
         client_named("old").id
     );
     let _: () = redis::pipe()
@@ -369,9 +361,7 @@ async fn the_documented_commands_run_every_call_of_each_role() {
                 id: "waits".to_string(),
                 ..Default::default()
             },
-            None,
-            Owner::Client,
-            &Withdrawal::default(),
+            &Create::default(),
         )
         .await
         .unwrap_err();
@@ -567,9 +557,8 @@ async fn the_documented_commands_serve_a_cluster_while_a_slot_moves() {
         digest,
         withdrawal: Withdrawal::default(),
     };
-    let none = Withdrawal::default();
     producer
-        .create(&namespace, &handle, None, Owner::Client, &none)
+        .create(&namespace, &handle, &Create::default())
         .await
         .unwrap();
     producer

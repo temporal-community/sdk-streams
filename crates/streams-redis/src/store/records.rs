@@ -161,14 +161,13 @@ fn restored(record: &[u8], producer: &Producer) -> RedisStoreResult<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use temporalio_streams::proto::{ProducerEpoch, StreamData};
+    use temporalio_streams::proto::{ClientEpoch, ProducerEpoch, StreamData, producer_epoch::Kind};
 
     fn producer(id: &str) -> Producer {
         Producer {
             id: id.to_string(),
             epoch: Some(ProducerEpoch {
-                attempt: 1,
-                ..Default::default()
+                kind: Some(Kind::Client(ClientEpoch { attempt: 1 })),
             }),
             ..Default::default()
         }

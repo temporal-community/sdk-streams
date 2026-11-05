@@ -18,13 +18,13 @@ use replies::{AppendReply, CloseReply, CreateReply, ReadReply};
 use std::{collections::HashMap, num::NonZeroUsize, sync::Arc, time::Duration};
 use temporalio_streams::{
     StreamResult,
-    epoch::{TASK_KEY_LEN, epoch_key, task_key, task_of},
+    epoch::{ProducerKind, TASK_KEY_LEN, epoch_key, task_key, task_of},
     ids::{StreamKeys, encode_part},
     offset::entry_id_of_offset,
-    proto::{Producer, StreamHandle, StreamProducerKind, WorkflowTaskEpoch},
+    proto::{Producer, StreamHandle, WorkflowTaskEpoch},
     store::{
-        Appended, Batch, Capabilities, Closed, Created, Entry, FORMAT_VERSION, MAX_TTL, Owner,
-        Store, StreamState, TOMBSTONE, TaskFacts, Withdrawal, owner_chain,
+        Appended, Batch, Capabilities, Closed, ConflictPolicy, Create, Created, Entry,
+        FORMAT_VERSION, MAX_TTL, Owner, Store, StreamState, TOMBSTONE, TaskFacts, owner_chain,
     },
 };
 use tokio::time::Instant;
@@ -182,13 +182,12 @@ impl Store for RedisStore {
         &self,
         namespace: &str,
         handle: &StreamHandle,
-        retention: Option<Duration>,
-        owner: Owner,
-        withdrawal: &Withdrawal<'_>,
+        create: &Create<'_>,
     ) -> StreamResult<Created> {
         let keys = self.keys(namespace, &handle.id);
-        let retention = retention.filter(|r| !r.is_zero()).unwrap_or(self.retention);
-        let (owner, chain) = match owner {
+        let retention = create.retention.filter(|r| !r.is_zero());
+        let retention = retention.unwrap_or(self.retention);
+        let (owner, chain) = match create.owner {
             Owner::Workflow => ("wf", owner_chain(handle)),
             Owner::Client => ("client", String::new()),
         };
@@ -199,9 +198,11 @@ impl Store for RedisStore {
             .arg(owner)
             .arg(self.safety_ttl.as_millis())
             .arg(TOMBSTONE.as_millis())
-            .arg(encode_part(withdrawal.withdraw_run))
-            .arg(withdrawal.superseded)
+            .arg(encode_part(create.withdrawal.withdraw_run))
+            .arg(create.withdrawal.superseded)
             .arg(chain)
+            .arg(create.request_id)
+            .arg(create.conflict == ConflictPolicy::UseExisting)
             .arg(self.wait.is_some());
         let CreateReply(created) = self.write(&call).await?;
         Ok(created)
@@ -215,12 +216,13 @@ impl Store for RedisStore {
     ) -> StreamResult<Appended> {
         let keys = self.keys(namespace, &handle.id);
         let producer = batch.producer;
+        let kind = ProducerKind::try_from(producer)?;
         let epoch = producer.epoch.unwrap_or_default();
         let withdrawal = &batch.withdrawal;
         let mut call = ScriptCall::write(&scripts::APPEND_SCRIPT, &keys);
         call.cmd
             .arg(FORMAT_VERSION)
-            .arg(producer.kind)
+            .arg(kind as i32)
             .arg(&producer.id)
             .arg(encode_part(&producer.run_id))
             .arg(&epoch_key(&epoch)[..])
@@ -229,7 +231,7 @@ impl Store for RedisStore {
             .arg(withdrawal.superseded)
             .arg(self.safety_ttl.as_millis())
             .arg(TOMBSTONE.as_millis())
-            .arg(TaskArgs::of(batch))
+            .arg(TaskArgs::of(kind, batch))
             .arg(&batch.digest[..])
             .arg(self.wait.is_some())
             .arg(producer.encode_to_vec());
@@ -254,7 +256,7 @@ impl Store for RedisStore {
         let mut call = ScriptCall::write(&scripts::CLOSE_SCRIPT, &keys);
         call.cmd
             .arg(FORMAT_VERSION)
-            .arg(producer.kind)
+            .arg(ProducerKind::try_from(producer)? as i32)
             .arg(&producer.id)
             .arg(encode_part(&producer.run_id))
             .arg(&epoch_key(&epoch)[..])
@@ -430,10 +432,9 @@ enum TaskArgs<'a> {
 }
 
 impl<'a> TaskArgs<'a> {
-    fn of(batch: &Batch<'a>) -> Self {
+    fn of(kind: ProducerKind, batch: &Batch<'a>) -> Self {
         let producer = batch.producer;
-        let kind = StreamProducerKind::LocalActivity as i32;
-        if producer.kind != kind || producer.run_id.is_empty() {
+        if kind != ProducerKind::LocalActivity || producer.run_id.is_empty() {
             return Self::Untracked;
         }
         let task = task_key(&task_of(&producer.epoch.unwrap_or_default()));
@@ -691,9 +692,8 @@ mod tests {
                 id: format!("s{i}"),
                 ..Default::default()
             };
-            let none = Withdrawal::default();
             store
-                .create(&namespace, &handle, None, Owner::Client, &none)
+                .create(&namespace, &handle, &Create::default())
                 .await
                 .unwrap();
             let keys = store.keys(&namespace, &handle.id);
@@ -709,7 +709,7 @@ mod tests {
             let mut call = ScriptCall::write(&scripts::APPEND_SCRIPT, &keys);
             call.cmd
                 .arg(FORMAT_VERSION)
-                .arg(StreamProducerKind::LocalActivity as i32)
+                .arg(ProducerKind::LocalActivity as i32)
                 .arg("la")
                 .arg("r1")
                 .arg(&epoch_key(&Default::default())[..])
@@ -742,8 +742,12 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs Redis"]
     async fn a_read_inside_a_batch_gets_the_producer_of_the_batch() {
-        use temporalio_streams::proto::{
-            StreamData, StreamProducerKind, StreamRecord, stream_record::Item,
+        use temporalio_streams::{
+            proto::{
+                ClientEpoch, ProducerEpoch, StreamData, StreamRecord, producer_epoch::Kind,
+                stream_record::Item,
+            },
+            store::Withdrawal,
         };
         let mut options = RedisStoreOptions::new(crate::testing::standalone_url());
         options.key_prefix = "streams-unit".parse().unwrap();
@@ -756,18 +760,14 @@ mod tests {
             },
         );
         store
-            .create(
-                &namespace,
-                &handle,
-                None,
-                Owner::Client,
-                &Withdrawal::default(),
-            )
+            .create(&namespace, &handle, &Create::default())
             .await
             .unwrap();
         let producer = Producer {
-            kind: StreamProducerKind::Client as i32,
             id: "client:unit".to_string(),
+            epoch: Some(ProducerEpoch {
+                kind: Some(Kind::Client(ClientEpoch { attempt: 1 })),
+            }),
             ..Default::default()
         };
         let record = StreamRecord {
