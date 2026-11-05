@@ -5,12 +5,12 @@
 -- key, Tombstone ms, the run chain that the close's ref gives as `<workflow id>:<first run id>`
 -- with each part encoded (empty for none), `1` when a `WAIT` runs after it.
 --
--- The `:closed` key is an argument and not one of KEYS. It doesn't exist before the close, and
--- while its slot migrates, a script with a key that doesn't exist yet gets `TRYAGAIN`. Redis lets
--- a script use a key of its own slot that KEYS doesn't name.
---
 -- Returns {'closed' or 'already'}.
 local meta, log, producers = KEYS[1], KEYS[2], KEYS[3]
+-- Keep `:closed` out of KEYS. It doesn't exist before the close, and while its slot migrates, a
+-- script with a declared key that doesn't exist yet gets `TRYAGAIN`, so each close would fail.
+-- Redis doesn't promise a script a key that KEYS doesn't name, and no script flag changes that.
+-- It allows one of the script's own slot, and the slot migration case of `tests/acl.rs` checks it.
 local closed_key, version, kind = ARGV[1], tonumber(ARGV[2]), ARGV[3]
 local producer, run, epoch, tombstone = ARGV[4], ARGV[5], ARGV[6], tonumber(ARGV[7])
 local chain, wait = ARGV[8], ARGV[9]
