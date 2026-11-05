@@ -106,13 +106,13 @@ impl FromRedisValue for LogEntry {
     }
 }
 
-/// The entries, oldest first, with the batch's Producer on each data Record. `earlier` is the
-/// Producer of the first entry's batch, when that batch starts before the first entry.
+/// The entries, oldest first, with the batch's Producer on each data Record. `producer` starts as
+/// the Producer of the first entry's batch, when that batch starts before the first entry, and
+/// each batch's first entry replaces it.
 pub(super) fn with_producers(
     entries: Vec<LogEntry>,
-    earlier: Option<Producer>,
+    mut producer: Option<Producer>,
 ) -> RedisStoreResult<Vec<Entry>> {
-    let mut producer = earlier;
     entries
         .into_iter()
         .map(|entry| {
