@@ -27,7 +27,7 @@ use temporalio_streams::{
     memory::MemoryStore,
     proto::{
         ActivityEpoch, AppendRecord, ClientEpoch, LocalActivityEpoch, Producer, ProducerEpoch,
-        StreamData, StreamRecord, StreamRef, StreamSuperseded, WorkflowTaskEpoch,
+        StreamData, StreamRecord, StreamRef, StreamSuperseded, StreamWriter, WorkflowTaskEpoch,
         producer_epoch::Kind, stream_record,
     },
     store::{Batch, ConflictPolicy, Create, CreateOutcome, Entry, Owner, Store, Withdrawal},
@@ -629,10 +629,10 @@ fn batch(producer: &Producer, texts: &[&str]) -> (Vec<Vec<u8>>, [u8; 16]) {
 
 fn superseded(producer: &Producer) -> Vec<u8> {
     StreamSuperseded {
-        producer_id: producer.id.clone(),
-        epoch: producer.epoch,
-        run_id: producer.run_id.clone(),
-        ..Default::default()
+        writer: Some(StreamWriter {
+            producer: Some(producer.clone()),
+            ..Default::default()
+        }),
     }
     .encode_to_vec()
 }
