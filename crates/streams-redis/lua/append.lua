@@ -74,7 +74,7 @@ if previous then
     return {'resend', previous.first, previous.last, ''}
   end
   if sequence < previous.sequence then
-    return refuse('SEQUENCE', 'sequence ' .. sequence_text .. ' is below the last one, ' ..
+    return refuse('SEQUENCE_TOO_LOW', 'sequence ' .. sequence_text .. ' is below the last one, ' ..
       string.format('%.0f', previous.sequence))
   end
 end

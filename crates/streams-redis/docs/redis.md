@@ -25,6 +25,7 @@ form, and the `testdata/` of `temporalio-streams` has its test vectors.
 | `own` | `wf` for a Workflow-owned Stream, `client` otherwise |
 | `oc` | The owner's run chain, `<workflow id>:<first run id>` with each part encoded |
 | `exp` | When the Stream stops taking writes, in ms since 1970 |
+| `rid` | The request id of the create that made the Stream, absent when it gave none |
 | `closed`, `close_id` | Set by the close, with the entry id of the close Record |
 | `newest` | The entry id of the newest entry |
 | `trimmed` | The entry id of the newest entry that Retention or the log's expiry dropped |
@@ -68,6 +69,16 @@ lasts one Retention after the last append.
 An append with sequence 0 takes the sequence after the last batch's when the fence is the batch's
 epoch key, and 1 otherwise. The script reads `p|` and writes the batch in one step, so two such
 batches never get the same sequence. Nothing dedupes such a batch, so its retry writes it again.
+
+## Create
+
+A create of a Stream that exists refuses, in this order, an expired Stream (`stream_expired`), a
+create with another owner (`stream_not_owner`) and a closed Stream (`stream_closed`). Then:
+
+- A create with the `rid` of the create that made the Stream is its retry, so it gets `created`
+  again. With `WAIT`, it waits for the replicas to have the first create's write.
+- Any other create fails with `stream_already_exists`, unless it uses the existing Stream. Then it
+  gets `exists`, and the Stream keeps its Retention.
 
 ## Log entries
 
@@ -170,7 +181,8 @@ these lists on a standalone server and on a cluster.
 
 - Nothing closes a Workflow-owned Stream whose owner was terminated or timed out, so it stays open
   until its safety TTL passes. The native server closes it when the owner's run ends.
-- A client's Stream has no owner but the kind, so any client closes it.
+- A Stream with no owner takes a close from any Workflow or client, since the Store can't tell
+  which one made it.
 - A failed task's Local Activity Records go only when the retry task runs the same call again, or
   a later Local Activity write gives the failed task. Otherwise they stay, as in the memory Store.
 - Core sends only the last 100 failed Workflow Tasks of a run. An older failed task before the last

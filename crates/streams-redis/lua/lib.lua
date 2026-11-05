@@ -30,7 +30,8 @@ end
 
 -- Returns nil when the Producer kind may close the Stream, or else the refusal. Only the Workflow
 -- Producer (1) closes a Workflow-owned Stream, with a handle of the run chain in `oc`. A Local
--- Activity (2) can't, since it writes before its task commits. A client (4) closes the others.
+-- Activity (2) can't, since it writes before its task commits. A Workflow or a client (4) closes a
+-- Stream with no owner.
 local function check_owner(meta, kind, chain)
   if redis.call('HGET', meta, 'own') == 'wf' then
     if kind ~= '1' then
@@ -41,8 +42,8 @@ local function check_owner(meta, kind, chain)
     if owner_chain and chain ~= owner_chain then
       return refuse('NOT_OWNER', 'the handle names another run chain than the owner')
     end
-  elseif kind ~= '4' then
-    return refuse('NOT_OWNER', 'only a client closes a Stream that a client created')
+  elseif kind ~= '1' and kind ~= '4' then
+    return refuse('NOT_OWNER', 'only a Workflow or a client closes a Stream with no owner')
   end
   return nil
 end
