@@ -911,6 +911,40 @@ mod tests {
         assert_eq!(slot("p:{ns:wf:run}:t:a"), slot("p:{ns:wf:run}:chain"));
     }
 
+    // A script names only its Stream's keys, so a cluster refuses it with `CROSSSLOT` when one
+    // key falls outside the hash tag. The ids take the characters that a tag or a key uses.
+    #[test]
+    fn the_keys_of_a_stream_share_one_slot_for_any_id() {
+        use temporalio_streams::ids::StreamKeys;
+        let chars: Vec<char> = "ab{}:|%~ -_./\\*?\u{e9}\u{1f600}".chars().collect();
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut text = |len: u64| -> String {
+            (0..len)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    chars[usize::try_from(state % chars.len() as u64).unwrap()]
+                })
+                .collect()
+        };
+        for round in 0..2_000 {
+            let (namespace, stream) = (text(round % 7), text(round % 13 + 1));
+            let keys = StreamKeys::new("streams", &namespace, &stream);
+            let slots = [keys.meta(), keys.log(), keys.producers(), keys.closed()].map(|key| {
+                let tag = key
+                    .split_once('{')
+                    .and_then(|(_, rest)| rest.split_once('}'));
+                assert!(tag.is_some_and(|(tag, _)| !tag.is_empty()), "{key}");
+                slot(&key)
+            });
+            assert!(
+                slots.iter().all(|s| *s == slots[0]),
+                "{namespace:?} {stream:?}"
+            );
+        }
+    }
+
     #[test]
     fn the_retry_policy_of_a_blocking_read() {
         let cluster = Route::Slot(1);
