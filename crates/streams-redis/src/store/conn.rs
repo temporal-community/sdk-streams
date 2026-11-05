@@ -131,10 +131,17 @@ pub(crate) enum SharedConnection {
     Cluster(ClusterConnection),
 }
 
+// A `MOVED` means another thing on each topology. The cluster client follows redirects, and one
+// that it gives up on is a passing state. A standalone server that redirects is a cluster node,
+// so the options are wrong.
 impl ConnectionLike for SharedConnection {
     fn req_packed_command<'a>(&'a mut self, cmd: &'a Cmd) -> RedisFuture<'a, Value> {
         match self {
-            SharedConnection::Single(conn) => conn.req_packed_command(cmd),
+            SharedConnection::Single(conn) => Box::pin(async move {
+                let value = conn.req_packed_command(cmd).await.map_err(misrouted)?;
+                not_moved(&value)?;
+                Ok(value)
+            }),
             SharedConnection::Cluster(conn) => conn.req_packed_command(cmd),
         }
     }
@@ -146,7 +153,14 @@ impl ConnectionLike for SharedConnection {
         count: usize,
     ) -> RedisFuture<'a, Vec<Value>> {
         match self {
-            SharedConnection::Single(conn) => conn.req_packed_commands(pipeline, offset, count),
+            SharedConnection::Single(conn) => Box::pin(async move {
+                let values = conn
+                    .req_packed_commands(pipeline, offset, count)
+                    .await
+                    .map_err(misrouted)?;
+                values.iter().try_for_each(not_moved)?;
+                Ok(values)
+            }),
             SharedConnection::Cluster(conn) => conn.req_packed_commands(pipeline, offset, count),
         }
     }
@@ -157,6 +171,28 @@ impl ConnectionLike for SharedConnection {
             SharedConnection::Cluster(conn) => conn.get_db(),
         }
     }
+}
+
+/// A standalone server's reply that is a `MOVED` becomes a config error.
+fn not_moved(value: &Value) -> RedisResult<()> {
+    match value {
+        Value::ServerError(error) if error.kind() == Some(ServerErrorKind::Moved) => {
+            Err(misrouted(error.clone().into()))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// A `MOVED` error of a standalone server as a config error. Other errors stay as they are.
+fn misrouted(error: RedisError) -> RedisError {
+    if error.kind() != ErrorKind::Server(ServerErrorKind::Moved) {
+        return error;
+    }
+    RedisError::from((
+        ErrorKind::InvalidClientConfig,
+        "A Redis Cluster node answered, so set `cluster`",
+        error.to_string(),
+    ))
 }
 
 /// The server that sent a reply. Each primary of a cluster has its own keys and settings.
@@ -319,9 +355,13 @@ pub(crate) struct IdleLease<C>(Held<C>);
 pub(crate) enum Settled<T, C> {
     /// The call's result, as [Lease::settle] gives it.
     Done(RedisResult<T>),
-    /// The server closed the connection, and the other idle ones with it. The pool dropped them,
-    /// so the permit opens a new connection. That try tells a dead connection from a dead server.
-    Stale(Permit<C>),
+    /// The server closed the connection, and the other idle ones with it. The pool dropped them.
+    /// A call that can run again opens a new connection with the permit, and that try tells a
+    /// dead connection from a dead server. A call that must run at most once returns the error.
+    Stale {
+        error: RedisError,
+        permit: Permit<C>,
+    },
 }
 
 impl<C> IdleLease<C> {
@@ -335,17 +375,10 @@ impl<C> IdleLease<C> {
                 let Held { conn, permit } = self.0;
                 drop(conn);
                 permit.idle.lock().clear();
-                Settled::Stale(permit)
+                Settled::Stale { error, permit }
             }
             result => Settled::Done(Lease(self.0).settle(result)),
         }
-    }
-}
-
-/// A caller that doesn't retry uses an idle connection as any other.
-impl<C> From<IdleLease<C>> for Lease<C> {
-    fn from(lease: IdleLease<C>) -> Self {
-        Lease(lease.0)
     }
 }
 
@@ -447,11 +480,13 @@ impl TryFrom<&ConnectionInfo> for Node {
 }
 
 impl Node {
-    /// The node of a slot range. An empty host is the node that answered, and `?` is unknown, so
-    /// neither one is reachable.
+    /// The node of a slot range. A NULL host is the endpoint that the caller asked, and an empty
+    /// one is the node that answered. The cluster client doesn't say which node it asked, so
+    /// neither is reachable, and nor is the unknown `?`. The caller still has the seeds.
     fn reachable(node: &SlotNode) -> Option<Self> {
-        (!node.host.is_empty() && node.host != "?").then(|| Self::Tcp {
-            host: node.host.clone(),
+        let host = node.host.as_deref()?;
+        (!host.is_empty() && host != "?").then(|| Self::Tcp {
+            host: host.to_string(),
             port: node.port,
         })
     }
@@ -710,6 +745,7 @@ impl BlockingPool {
                     tokio::time::sleep_until(deadline.min(Instant::now() + RESHARD_WAIT)).await;
                     return Ok(false);
                 }
+                Step::Fail if matches!(route, Route::Standalone) => return Err(misrouted(error)),
                 Step::Fail => return Err(error),
             }
         }
@@ -726,7 +762,7 @@ impl BlockingPool {
                 let answer = self.run(lease.conn(), read).await?;
                 match lease.settle(answer) {
                     Settled::Done(answer) => return answer,
-                    Settled::Stale(permit) => permit.open(node.open()).await?,
+                    Settled::Stale { permit, .. } => permit.open(node.open()).await?,
                 }
             }
         };
@@ -899,6 +935,18 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_redirect_from_a_standalone_server_is_a_config_error() {
+        use temporalio_streams::{Reason, StreamError};
+        let moved = redis::parse_redis_value(b"-MOVED 3999 127.0.0.1:7292\r\n").unwrap();
+        let error = StreamError::from(crate::RedisStoreError::from(not_moved(&moved).unwrap_err()));
+        assert_eq!(error.reason, Reason::Invalid);
+        assert!(error.message.contains("set `cluster`"), "{error}");
+        assert!(not_moved(&Value::Okay).is_ok());
+        let other = misrouted(reply("WRONGTYPE not a stream"));
+        assert_eq!(other.code(), Some("WRONGTYPE"));
+    }
+
     #[tokio::test]
     #[ignore = "needs Redis"]
     async fn a_cached_slot_on_a_dead_node_goes_back_to_the_seed() {
@@ -930,9 +978,10 @@ mod tests {
     #[test]
     fn the_cluster_slots_reply_gives_each_range_its_primary() {
         let reply = redis::parse_redis_value(
-            b"*2\r\n*4\r\n:0\r\n:5460\r\n*3\r\n$9\r\n127.0.0.1\r\n:7001\r\n$1\r\na\r\n\
+            b"*3\r\n*4\r\n:0\r\n:5460\r\n*3\r\n$9\r\n127.0.0.1\r\n:7001\r\n$1\r\na\r\n\
               *3\r\n$9\r\n127.0.0.1\r\n:7004\r\n$1\r\nb\r\n\
-              *3\r\n:5461\r\n:16383\r\n*3\r\n$0\r\n\r\n:7002\r\n$1\r\nc\r\n",
+              *3\r\n:5461\r\n:10922\r\n*3\r\n$0\r\n\r\n:7002\r\n$1\r\nc\r\n\
+              *3\r\n:10923\r\n:16383\r\n*3\r\n$-1\r\n:7003\r\n$1\r\nd\r\n",
         )
         .unwrap();
         let ranges: Vec<SlotRange> = redis::from_redis_value(reply).unwrap();
@@ -942,8 +991,9 @@ mod tests {
             .iter()
             .map(|range| Node::reachable(&range.primary))
             .collect();
-        // The second range has no usable host.
-        assert_eq!(reachable, [Some(node("127.0.0.1", 7001)), None]);
+        // The second range has an empty host, and the third a NULL one.
+        assert_eq!(ranges[2].primary.host, None);
+        assert_eq!(reachable, [Some(node("127.0.0.1", 7001)), None, None]);
         let short = redis::parse_redis_value(b"*1\r\n*2\r\n:0\r\n:1\r\n").unwrap();
         assert!(redis::from_redis_value::<Vec<SlotRange>>(short).is_err());
     }
@@ -1121,10 +1171,12 @@ mod tests {
         ));
         let mut dead = idle(lease(&pool, 0).await);
         assert_eq!(*dead.conn(), 2);
-        let Settled::Stale(permit) = dead.settle::<()>(Err(io(std::io::ErrorKind::BrokenPipe)))
+        let Settled::Stale { error, permit } =
+            dead.settle::<()>(Err(io(std::io::ErrorKind::BrokenPipe)))
         else {
             panic!("a dead idle connection gives its permit back");
         };
+        assert!(error.is_io_error());
         let mut retry = permit.open(async { Ok(4) }).await.unwrap();
         assert_eq!(*retry.conn(), 4);
         // The pool dropped connection 1 with the dead one.

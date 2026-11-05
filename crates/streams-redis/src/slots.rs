@@ -6,8 +6,10 @@ use std::ops::RangeInclusive;
 /// A node of a slot range.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SlotNode {
-    /// The host. It is empty for the node that answered, and `?` when the cluster doesn't know it.
-    pub host: String,
+    /// The host. Redis gives NULL, as `None`, when the node's endpoint is unknown and the client
+    /// must use the one that it asked. The host is empty for the node that answered, and `?` when
+    /// the cluster doesn't know the hostname.
+    pub host: Option<String>,
     /// The port.
     pub port: u16,
     /// The node id.
@@ -38,7 +40,7 @@ impl FromRedisValue for SlotNode {
         let fields: Vec<Value> = FromRedisValue::from_redis_value(value)?;
         let mut fields = fields.into_iter();
         Ok(Self {
-            host: String::from_redis_value(next(&mut fields, "node")?)?,
+            host: Option::from_redis_value(next(&mut fields, "node")?)?,
             port: u16::from_redis_value(next(&mut fields, "node")?)?,
             id: String::from_redis_value(next(&mut fields, "node")?)?,
         })

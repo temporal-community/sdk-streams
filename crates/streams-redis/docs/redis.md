@@ -165,9 +165,15 @@ these lists on a standalone server and on a cluster.
   Without `+config|get`, it warns that it can't read the eviction policy.
 - A user with write access can write as any Producer.
 - The ACLs don't limit CPU or memory, since `+script|load` lets a user run any Lua. A Reader with no
-  `+script|load` needs an admin to load the read script on each primary, after each restart,
-  failover or `SCRIPT FLUSH`. The script's SHA is of its exact bytes, so load it with
-  `{ printf '#!lua flags=no-writes\n'; cat lua/read.lua; } | redis-cli -x SCRIPT LOAD`.
+  `+script|load` needs an admin to load the two read scripts on each primary, after each restart,
+  failover or `SCRIPT FLUSH`. A script's SHA is of its exact bytes, so load them with this command.
+
+  ```sh
+  for script in read read_back; do
+    { printf '#!lua flags=no-writes\n'; cat lua/batch.lua "lua/$script.lua"; } |
+      redis-cli -x SCRIPT LOAD
+  done
+  ```
 
 ## Eviction and replication
 

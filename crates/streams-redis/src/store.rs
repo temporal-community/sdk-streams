@@ -7,14 +7,14 @@ mod replies;
 mod scripts;
 
 use crate::{KeyPrefix, RedisStoreError, RedisStoreOptions, RedisStoreResult};
-use conn::{BlockingPool, Endpoint, Lease, Leased, Origin, SharedConnection, WaitPool};
+use conn::{BlockingPool, Endpoint, Leased, Origin, Settled, SharedConnection, WaitPool};
 use prost::Message;
-use records::{Body, LogEntry, with_producers, without_producer};
+use records::{with_producers, without_producer};
 use redis::{
     Cmd, ErrorKind, FromRedisValue, InfoDict, Pipeline, RedisError, RedisResult, RedisWrite,
     Script, ServerErrorKind, ToRedisArgs, Value,
 };
-use replies::{AppendReply, CloseReply, CreateReply, ReadReply};
+use replies::{AppendReply, CloseReply, CreateReply, ReadBackReply, ReadReply};
 use std::{collections::HashMap, num::NonZeroUsize, sync::Arc, time::Duration};
 use temporalio_streams::{
     StreamResult,
@@ -98,46 +98,30 @@ impl RedisStore {
     async fn write<T: FromRedisValue>(&self, call: &ScriptCall) -> RedisStoreResult<T> {
         let reply = match &self.wait {
             None => call.run(&mut self.shared.clone()).await?,
-            Some(wait) => {
-                let mut lease = match wait.pool.take().await? {
-                    Leased::Busy => {
-                        return Err(RedisStoreError::unavailable(
-                            "Every connection for writes with WAIT stayed busy for the response \
-                             timeout",
-                        ));
+            Some(wait) => match wait.pool.take().await? {
+                Leased::Busy => {
+                    return Err(RedisStoreError::unavailable(
+                        "Every connection for writes with WAIT stayed busy for the response \
+                         timeout",
+                    ));
+                }
+                Leased::New(mut lease) => {
+                    let reply = Self::write_and_wait(wait, call, lease.conn()).await;
+                    lease.settle(reply)??
+                }
+                Leased::Idle(mut lease) => {
+                    let reply = Self::write_and_wait(wait, call, lease.conn()).await;
+                    match lease.settle(reply) {
+                        Settled::Done(reply) => reply??,
+                        // No second try. The server may have run the write before the connection
+                        // closed, and a batch with sequence 0 or a create with no request id has
+                        // no dedupe. The caller gets `StorageUnavailable` and decides on a retry.
+                        Settled::Stale { error, .. } => return Err(error.into()),
                     }
-                    // A write runs once, since the server may have run it before its connection
-                    // closed.
-                    Leased::Idle(lease) => Lease::from(lease),
-                    Leased::New(lease) => lease,
-                };
-                let reply = Self::write_and_wait(wait, call, lease.conn()).await;
-                lease.settle(reply)??
-            }
+                }
+            },
         };
         redis::from_redis_value(reply).map_err(|error| corrupt("A script answer", error))
-    }
-
-    /// The Producer of the batch of `entry`, when the batch starts before `entry`.
-    async fn batch_producer(
-        &self,
-        keys: &StreamKeys,
-        entry: &LogEntry,
-    ) -> RedisStoreResult<Option<Producer>> {
-        let Body::Later { first, .. } = &entry.body else {
-            return Ok(None);
-        };
-        let first = first.to_string();
-        let reply: Value = redis::cmd("XRANGE")
-            .arg(keys.log())
-            .arg(&first)
-            .arg(&first)
-            .query_async(&mut self.shared.clone())
-            .await?;
-        Ok(log_entries(reply)?
-            .into_iter()
-            .next()
-            .and_then(LogEntry::producer))
     }
 
     /// The outer error comes from the connection, or from a script load that Redis refused. The
@@ -300,7 +284,8 @@ impl Store for RedisStore {
         Ok((state, with_producers(entries, earlier)?))
     }
 
-    /// Reads up to `count` entries at or before `before`, newest first, with `XREVRANGE`.
+    /// Reads up to `count` entries at or before `before`, newest first. One script reads the
+    /// page and the Producer of its oldest entry's batch, so the log can't expire between them.
     async fn read_back(
         &self,
         namespace: &str,
@@ -309,22 +294,17 @@ impl Store for RedisStore {
         count: usize,
     ) -> StreamResult<Vec<Entry>> {
         let keys = self.keys(namespace, stream_id);
-        let reply: Value = redis::cmd("XREVRANGE")
-            .arg(keys.log())
-            .arg(entry_id_of_offset(before))
-            .arg("-")
-            .arg("COUNT")
-            .arg(count)
-            .query_async(&mut self.shared.clone())
+        let mut call = ScriptCall::read_back(&keys);
+        call.cmd.arg(entry_id_of_offset(before)).arg(count);
+        let reply = call
+            .run(&mut self.shared.clone())
             .await
             .map_err(RedisStoreError::from)?;
-        let mut entries = log_entries(reply)?;
+        let ReadBackReply {
+            mut entries,
+            earlier,
+        } = redis::from_redis_value(reply).map_err(|error| corrupt("The log", error))?;
         entries.reverse();
-        // The oldest entry's batch can start below the page, so its Producer comes from there.
-        let earlier = match entries.first() {
-            Some(oldest) => self.batch_producer(&keys, oldest).await?,
-            None => None,
-        };
         let mut entries = with_producers(entries, earlier)?;
         entries.reverse();
         Ok(entries)
@@ -380,6 +360,14 @@ impl ScriptCall {
             .arg(2)
             .arg(keys.meta())
             .arg(keys.log());
+        Self { script, cmd }
+    }
+
+    /// The reverse read script call, also with `EVALSHA_RO`. It needs only the log.
+    fn read_back(keys: &StreamKeys) -> Self {
+        let script = &*scripts::READ_BACK_SCRIPT;
+        let mut cmd = redis::cmd("EVALSHA_RO");
+        cmd.arg(script.get_hash()).arg(1).arg(keys.log());
         Self { script, cmd }
     }
 
@@ -479,11 +467,6 @@ impl ToRedisArgs for TaskArgs<'_> {
     }
 }
 
-/// The entries of an `XRANGE` or `XREVRANGE` reply.
-fn log_entries(reply: Value) -> RedisStoreResult<Vec<LogEntry>> {
-    redis::from_redis_value(reply).map_err(|error| corrupt("A log entry", error))
-}
-
 /// A value that Redis keeps or answers and that the Store can't decode.
 fn corrupt(what: &str, error: impl std::fmt::Display) -> RedisStoreError {
     RedisStoreError::corrupt(format!("{what} doesn't decode: {error}"))
@@ -553,7 +536,7 @@ async fn check_server(shared: &SharedConnection) -> RedisStoreResult<()> {
             }
         }
         // A user with only the Store's commands may not have INFO. Then a Redis before 7.0 fails at
-        // the first read, on the flags of the read script.
+        // the first read, on the flags of a read script.
         Err(error) if error.kind() == ErrorKind::Server(ServerErrorKind::NoPerm) => {
             tracing::debug!("Could not read the Redis version: {error}");
         }

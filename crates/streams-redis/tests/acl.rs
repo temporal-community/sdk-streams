@@ -395,11 +395,11 @@ struct Primary {
 }
 
 impl Primary {
-    /// An empty host is the node that answered, which is local in the test cluster.
+    /// An empty or NULL host is the node that answered, which is local in the test cluster.
     fn host(&self) -> &str {
-        match self.node.host.as_str() {
-            "" => "127.0.0.1",
-            host => host,
+        match self.node.host.as_deref() {
+            None | Some("") => "127.0.0.1",
+            Some(host) => host,
         }
     }
 
