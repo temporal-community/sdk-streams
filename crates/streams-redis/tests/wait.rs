@@ -5,9 +5,7 @@ use prost::Message;
 use std::{num::NonZeroUsize, time::Duration};
 use temporalio_streams::{
     Reason,
-    proto::{
-        ClientEpoch, Producer, ProducerEpoch, StreamHandle, StreamRecord, producer_epoch::Kind,
-    },
+    proto::{ClientEpoch, Producer, ProducerEpoch, StreamRecord, StreamRef, producer_epoch::Kind},
     store::{Batch, Create, CreateOutcome, Store, Withdrawal},
 };
 use temporalio_streams_redis::{
@@ -163,7 +161,7 @@ async fn a_write_that_too_few_replicas_have_fails_on_a_redis_cluster() {
 }
 
 async fn too_few_replicas(topology: Topology) {
-    let handle = StreamHandle {
+    let handle = StreamRef {
         id: format!("s-{}", std::process::id()),
         ..Default::default()
     };
@@ -195,7 +193,7 @@ async fn too_few_replicas(topology: Topology) {
         }
     }
     let refused = create(&waits).await.unwrap_err();
-    assert_eq!(refused.reason, Reason::Storage, "{refused}");
+    assert_eq!(refused.reason, Reason::StorageUnavailable, "{refused}");
     let plain = store(&topology, None).await;
     assert_eq!(
         create(&plain).await.unwrap().outcome,
@@ -228,7 +226,7 @@ async fn a_cluster_write_waits_for_the_replica_of_its_own_primary() {
     let create = |store: RedisStore, id: &'static str| {
         let namespace = namespace.clone();
         async move {
-            let handle = StreamHandle {
+            let handle = StreamRef {
                 id: id.to_string(),
                 ..Default::default()
             };
@@ -239,7 +237,7 @@ async fn a_cluster_write_waits_for_the_replica_of_its_own_primary() {
     let paused = pause(&replicas).await;
     let refused = create(short, "paused").await;
     drop(paused);
-    assert_eq!(refused.unwrap_err().reason, Reason::Storage);
+    assert_eq!(refused.unwrap_err().reason, Reason::StorageUnavailable);
     let acked = create(store(&cluster_at(&url), wait_for(1, LONG)).await, "acked").await;
     assert_eq!(acked.unwrap().outcome, CreateOutcome::Created);
 }
@@ -257,7 +255,7 @@ async fn a_call_that_finds_its_write_waits_for_the_replicas() {
     );
     let (namespace, handle) = (
         unique("ns"),
-        StreamHandle {
+        StreamRef {
             id: "s".to_string(),
             ..Default::default()
         },
@@ -279,7 +277,7 @@ async fn a_call_that_finds_its_write_waits_for_the_replicas() {
         digest: [0; 16],
         withdrawal: none(),
     };
-    let other = StreamHandle {
+    let other = StreamRef {
         id: "other".to_string(),
         ..Default::default()
     };
@@ -293,12 +291,9 @@ async fn a_call_that_finds_its_write_waits_for_the_replicas() {
         .append(&namespace, &handle, &batch)
         .await
         .map(|_| ());
-    plain
-        .close(&namespace, &handle, &producer, b"")
-        .await
-        .unwrap();
+    plain.close(&namespace, &handle, &producer).await.unwrap();
     let closed = waits[1]
-        .close(&namespace, &handle, &producer, b"")
+        .close(&namespace, &handle, &producer)
         .await
         .map(|_| ());
     // The second create is a retry of the first, so it finds its write done.
@@ -316,15 +311,12 @@ async fn a_call_that_finds_its_write_waits_for_the_replicas() {
         .map(|_| ());
     drop(paused);
     for result in [resent, closed, found] {
-        assert_eq!(result.unwrap_err().reason, Reason::Storage);
+        assert_eq!(result.unwrap_err().reason, Reason::StorageUnavailable);
     }
     let enough = store(&standalone, wait_for(replicas.len(), LONG)).await;
     let resent = enough.append(&namespace, &handle, &batch).await.unwrap();
     assert!(resent.resend);
-    let closed = enough
-        .close(&namespace, &handle, &producer, b"")
-        .await
-        .unwrap();
+    let closed = enough.close(&namespace, &handle, &producer).await.unwrap();
     assert!(closed.already);
 }
 
@@ -350,7 +342,7 @@ async fn writes_wait_for_their_replicas_at_once() {
         .await
         .create(
             &namespace,
-            &StreamHandle {
+            &StreamRef {
                 id: "loads".to_string(),
                 ..Default::default()
             },
@@ -362,7 +354,7 @@ async fn writes_wait_for_their_replicas_at_once() {
     for i in 0..4 {
         let (waits, namespace) = (waits.clone(), namespace.clone());
         writes.spawn(async move {
-            let handle = StreamHandle {
+            let handle = StreamRef {
                 id: format!("s{i}"),
                 ..Default::default()
             };
@@ -393,7 +385,7 @@ async fn writes_wait_for_their_replicas_at_once() {
         assert_eq!(unblocked, 1, "client {id} was no longer blocked");
     }
     for result in writes.join_all().await {
-        assert_eq!(result.unwrap_err().reason, Reason::Storage);
+        assert_eq!(result.unwrap_err().reason, Reason::StorageUnavailable);
     }
 }
 

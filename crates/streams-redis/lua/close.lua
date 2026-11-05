@@ -1,13 +1,18 @@
--- Closes the Stream with one close Record.
+-- Closes the Stream. A close writes no log entry, so it adds one entry to the `:closed` key, which
+-- wakes each read that waits on the Stream.
 --
--- ARGV: format version, kind, Producer id, encoded run id, the 40-byte epoch key, Tombstone ms,
--- close Record, the run chain that the close's handle gives as `<workflow id>:<first run id>` with
--- each part encoded (empty for none), `1` when a `WAIT` runs after it.
+-- ARGV: the `:closed` key, format version, kind, Producer id, encoded run id, the 40-byte epoch
+-- key, Tombstone ms, the run chain that the close's ref gives as `<workflow id>:<first run id>`
+-- with each part encoded (empty for none), `1` when a `WAIT` runs after it.
 --
--- Returns {'closed' or 'already', close id}.
+-- The `:closed` key is an argument and not one of KEYS. It doesn't exist before the close, and
+-- while its slot migrates, a script with a key that doesn't exist yet gets `TRYAGAIN`. Redis lets
+-- a script use a key of its own slot that KEYS doesn't name.
+--
+-- Returns {'closed' or 'already'}.
 local meta, log, producers = KEYS[1], KEYS[2], KEYS[3]
-local version, kind, producer, run = tonumber(ARGV[1]), ARGV[2], ARGV[3], ARGV[4]
-local epoch, tombstone, record = ARGV[5], tonumber(ARGV[6]), ARGV[7]
+local closed_key, version, kind = ARGV[1], tonumber(ARGV[2]), ARGV[3]
+local producer, run, epoch, tombstone = ARGV[4], ARGV[5], ARGV[6], tonumber(ARGV[7])
 local chain, wait = ARGV[8], ARGV[9]
 
 local now = now_ms()
@@ -21,7 +26,7 @@ if refused then
 end
 if redis.call('HGET', meta, 'closed') then
   touch(meta, wait)
-  return {'already', redis.call('HGET', meta, 'close_id')}
+  return {'already'}
 end
 if run ~= '' and redis.call('HGET', meta, 'wr|' .. run) then
   return refuse('FENCED', 'a Workflow retry withdrew the run of the Producer')
@@ -35,14 +40,8 @@ if stored and bytes_below(epoch, stored.fence) then
   return refuse('FENCED', 'the epoch is lower than the newest one of the Producer')
 end
 
-refused = check_ids_fit(meta, log, now, 1)
-if refused then
-  return refused
-end
-
-trim(meta, log, now)
-local id = add(log, {'r', record})
-redis.call('HSET', meta, 'closed', '1', 'close_id', id, 'newest', id)
+redis.call('HSET', meta, 'closed', '1')
+redis.call('XADD', closed_key, '*', 'closed', '1')
 -- Safety TTL 0, since a closed Stream keeps its Retention.
-refresh(meta, log, producers, now, 0, tombstone)
-return {'closed', id}
+refresh(meta, log, producers, closed_key, now, 0, tombstone)
+return {'closed'}

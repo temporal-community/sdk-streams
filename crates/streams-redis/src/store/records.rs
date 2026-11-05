@@ -1,7 +1,7 @@
 //! The log keeps the Producer of a batch once, on its first data entry. The Store takes it off
 //! each data Record before the append and puts it back on each one after a read.
 
-use super::bad_reply;
+use super::corrupt;
 use crate::{RedisStoreError, RedisStoreResult};
 use prost::Message;
 use redis::{FromRedisValue, ParsingError, Value};
@@ -56,8 +56,8 @@ impl fmt::Display for EntryId {
 /// batch's Producer only on the first one.
 #[derive(Debug, PartialEq)]
 pub(super) enum Body {
-    /// A Record that the log keeps whole, such as a close Record, or no Record.
-    Whole(Option<Vec<u8>>),
+    /// No Record, as on an entry with only a Superseded item.
+    NoRecord,
     /// The first data Record of a batch, with the batch's Producer.
     First { record: Vec<u8>, producer: Producer },
     /// A later data Record of a batch, with the id of the batch's first entry.
@@ -77,7 +77,7 @@ impl LogEntry {
     pub(super) fn producer(self) -> Option<Producer> {
         match self.body {
             Body::First { producer, .. } => Some(producer),
-            Body::Whole(_) | Body::Later { .. } => None,
+            Body::NoRecord | Body::Later { .. } => None,
         }
     }
 }
@@ -91,7 +91,7 @@ impl FromRedisValue for LogEntry {
         let offset = offset_of_entry_id(&text).map_err(|error| error.to_string())?;
         let record = fields.remove("r");
         let body = match (record, fields.remove("p"), fields.remove("b")) {
-            (record, None, None) => Body::Whole(record),
+            (None, None, None) => Body::NoRecord,
             (Some(record), Some(producer), None) => Body::First {
                 record,
                 producer: Producer::decode(producer.as_slice())
@@ -127,15 +127,15 @@ pub(super) fn with_producers(
         .into_iter()
         .map(|entry| {
             let record = match entry.body {
-                Body::Whole(record) => record,
+                Body::NoRecord => None,
                 Body::First {
                     record,
                     producer: first,
                 } => Some(restored(&record, producer.insert(first))?),
                 Body::Later { record, .. } => {
-                    let producer = producer
-                        .as_ref()
-                        .ok_or_else(|| bad_reply("read", "a Record with no Producer"))?;
+                    let producer = producer.as_ref().ok_or_else(|| {
+                        RedisStoreError::corrupt("A data Record of the log has no Producer")
+                    })?;
                     Some(restored(&record, producer)?)
                 }
             };
@@ -149,7 +149,8 @@ pub(super) fn with_producers(
 }
 
 fn restored(record: &[u8], producer: &Producer) -> RedisStoreResult<Vec<u8>> {
-    let mut stored = StreamRecord::decode(record).map_err(|error| bad_reply("read", error))?;
+    let mut stored =
+        StreamRecord::decode(record).map_err(|error| corrupt("A stored Record", error))?;
     if let Some(Item::Data(data)) = &mut stored.item
         && data.producer.is_none()
     {
@@ -217,8 +218,6 @@ mod tests {
                 },
             ),
             entry(3, later(data(None))),
-            // A whole Record, as a close keeps it.
-            entry(4, Body::Whole(Some(data(Some(a.clone()))))),
         ];
         let records: Vec<_> = with_producers(entries, Some(a.clone()))
             .unwrap()
@@ -227,12 +226,7 @@ mod tests {
             .collect();
         assert_eq!(
             records,
-            [
-                data(Some(a.clone())),
-                data(Some(b.clone())),
-                data(Some(b)),
-                data(Some(a))
-            ]
+            [data(Some(a)), data(Some(b.clone())), data(Some(b))]
         );
     }
 
@@ -265,9 +259,10 @@ mod tests {
             reply(&[("r", b"x"), ("p", &encoded)]).unwrap().producer(),
             Some(producer("a"))
         );
-        assert_eq!(reply(&[("s", b"y")]).unwrap().body, Body::Whole(None));
+        assert_eq!(reply(&[("s", b"y")]).unwrap().body, Body::NoRecord);
         // A data entry has a Record and one place in its batch, and a batch start is a number.
         for fields in [
+            &[("r", b"x".as_slice())][..],
             &[("r", b"x".as_slice()), ("p", &encoded), ("b", b"1")][..],
             &[("p", &encoded)],
             &[("r", b"x"), ("b", b"one")],

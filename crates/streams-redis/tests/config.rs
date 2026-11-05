@@ -3,7 +3,7 @@
 use prost::Message;
 use temporalio_streams::{
     MemoryStreamRuntime,
-    proto::{CreateStreamRequest, CreateStreamResponse, StreamHandle},
+    proto::{CreateStreamRequest, CreateStreamResponse, StreamRef},
 };
 use temporalio_streams_redis::proto::RedisStreamConfig;
 
@@ -17,7 +17,7 @@ async fn the_memory_runtime_takes_the_redis_config() {
     let runtime = MemoryStreamRuntime::from_config_bytes(&config.encode_to_vec(), None).unwrap();
     let request = CreateStreamRequest {
         namespace: "ns".to_string(),
-        stream_handle: Some(StreamHandle {
+        stream_ref: Some(StreamRef {
             id: "s".to_string(),
             ..Default::default()
         }),
@@ -28,5 +28,5 @@ async fn the_memory_runtime_takes_the_redis_config() {
         .await
         .unwrap();
     let created = CreateStreamResponse::decode(bytes.as_slice()).unwrap();
-    assert_eq!(created.handle.unwrap().backend, "redis-a");
+    assert_eq!(created.r#ref.unwrap().backend, "redis-a");
 }
