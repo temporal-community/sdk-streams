@@ -18,6 +18,10 @@ form, and the `testdata/` of `temporalio-streams` has its test vectors.
   create.
 - A close writes no log entry. It adds one entry to `:closed`, so a read that waits on the log and
   on `:closed` wakes. `:closed` expires with the log.
+- The close script gets `:closed` as an argument, not in `KEYS`. While a slot migrates, a script
+  with a declared key that doesn't exist yet gets `TRYAGAIN`, so each close would fail. Redis
+  doesn't promise a script a key that `KEYS` doesn't name, but it allows one of the script's own
+  slot, and the slot migration case of `tests/acl.rs` checks it.
 
 ## The meta hash
 
