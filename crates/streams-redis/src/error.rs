@@ -71,13 +71,6 @@ fn from_redis(error: &RedisError) -> StreamError {
                 "Redis refused the call for good: NOPERM {detail}"
             ));
         }
-        // The cluster client handles redirects, so one that reaches here is from a cluster node
-        // that the options give as one server.
-        ErrorKind::Server(ServerErrorKind::Moved) => {
-            return StreamError::invalid(format!(
-                "A Redis Cluster node answered, so set `cluster`: MOVED {detail}"
-            ));
-        }
         ErrorKind::Server(ServerErrorKind::ResponseError) if detail.contains("user_script") => {
             return StreamError::invalid(format!("A Stream script failed: {detail}"));
         }
@@ -162,8 +155,11 @@ mod tests {
                 (reason, "why it refused")
             );
         }
-        // A script that a flush or a failover dropped again after its reload is a passing state.
-        for code in ["READONLY", "OOM", "LOADING", "BUSY", "TRYAGAIN", "NOSCRIPT"] {
+        // A script that a flush or a failover dropped again after its reload is a passing state,
+        // and so is a redirect that the cluster client gave up on.
+        for code in [
+            "READONLY", "OOM", "LOADING", "BUSY", "TRYAGAIN", "NOSCRIPT", "MOVED",
+        ] {
             let error = server(code, "x");
             assert_eq!(error.reason, Reason::StorageUnavailable, "{code}");
             assert!(error.message.contains(code), "{error}");
@@ -182,7 +178,6 @@ mod tests {
                 "unknown command 'EVALSHA_RO', with args beginning with:",
             ),
             ("ERR", "This instance has cluster support disabled"),
-            ("MOVED", "3999 127.0.0.1:7292"),
         ] {
             let error = server(code, detail);
             assert_eq!(error.reason, Reason::Invalid, "{code}");

@@ -85,7 +85,10 @@ async fn cluster_replicas(url: &str) -> Vec<String> {
     let mut urls: Vec<String> = ranges
         .iter()
         .flat_map(|range| &range.replicas)
-        .map(|node| format!("redis://{}:{}/0", node.host, node.port))
+        .map(|node| {
+            let host = node.host.as_deref().unwrap_or("127.0.0.1");
+            format!("redis://{host}:{}/0", node.port)
+        })
         .collect();
     urls.sort();
     urls.dedup();

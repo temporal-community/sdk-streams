@@ -72,16 +72,6 @@ pub(super) struct LogEntry {
     superseded: Option<Vec<u8>>,
 }
 
-impl LogEntry {
-    /// The batch's Producer, when this is the batch's first data entry.
-    pub(super) fn producer(self) -> Option<Producer> {
-        match self.body {
-            Body::First { producer, .. } => Some(producer),
-            Body::NoRecord | Body::Later { .. } => None,
-        }
-    }
-}
-
 /// An entry of an `XRANGE` reply, `[id, [field, value, ...]]`. `docs/redis.md` has the fields.
 impl FromRedisValue for LogEntry {
     fn from_redis_value(value: Value) -> Result<Self, ParsingError> {
@@ -116,13 +106,13 @@ impl FromRedisValue for LogEntry {
     }
 }
 
-/// The entries, oldest first, with the batch's Producer on each data Record. `earlier` is the
-/// Producer of the first entry's batch, when that batch starts before the first entry.
+/// The entries, oldest first, with the batch's Producer on each data Record. `producer` starts as
+/// the Producer of the first entry's batch, when that batch starts before the first entry, and
+/// each batch's first entry replaces it.
 pub(super) fn with_producers(
     entries: Vec<LogEntry>,
-    earlier: Option<Producer>,
+    mut producer: Option<Producer>,
 ) -> RedisStoreResult<Vec<Entry>> {
-    let mut producer = earlier;
     entries
         .into_iter()
         .map(|entry| {
@@ -256,8 +246,11 @@ mod tests {
             }
         );
         assert_eq!(
-            reply(&[("r", b"x"), ("p", &encoded)]).unwrap().producer(),
-            Some(producer("a"))
+            reply(&[("r", b"x"), ("p", &encoded)]).unwrap().body,
+            Body::First {
+                record: b"x".to_vec(),
+                producer: producer("a"),
+            }
         );
         assert_eq!(reply(&[("s", b"y")]).unwrap().body, Body::NoRecord);
         // A data entry has a Record and one place in its batch, and a batch start is a number.
