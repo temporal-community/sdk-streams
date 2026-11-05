@@ -627,3 +627,61 @@ async fn the_documented_commands_serve_a_cluster_while_a_slot_moves() {
     assert!(!waited.unwrap());
     closed.unwrap();
 }
+
+/// A standalone Store at a cluster node, with a user that can't run `INFO`, gets past `connect`.
+/// Then each key of another node gets `MOVED`, which is a config error and not a passing state, so
+/// no caller retries it for good.
+#[tokio::test]
+#[ignore = "needs a Redis cluster"]
+async fn a_standalone_store_at_a_cluster_node_fails_with_a_config_error() {
+    let url = cluster_url();
+    let unique = unique();
+    let namespace = format!("ns-{unique}");
+    let mut cluster = redis::cluster::ClusterClient::new(vec![url.as_str()])
+        .unwrap()
+        .get_async_connection()
+        .await
+        .unwrap();
+    let nodes = primaries(&mut cluster).await;
+    assert!(nodes.len() > 1, "the case needs a key on another primary");
+    let mut stream = None;
+    for i in 0.. {
+        let id = format!("s{i}");
+        let slot: u16 = redis::cmd("CLUSTER")
+            .arg("KEYSLOT")
+            .arg(StreamKeys::new(PREFIX, &namespace, &id).meta())
+            .query_async(&mut cluster)
+            .await
+            .unwrap();
+        if !nodes[0].owns(slot) {
+            stream = Some(id);
+            break;
+        }
+    }
+    let handle = StreamRef {
+        id: stream.unwrap(),
+        ..Default::default()
+    };
+    // Both roles, as the docs list them, and so no `+info`.
+    let name = format!("both-{unique}");
+    let commands = format!("{} {}", PRODUCER.1, READER.1);
+    let _: () = set_user(&name, &namespace, (PRODUCER.0, &commands))
+        .query_async(&mut cluster)
+        .await
+        .unwrap();
+    let store = store(login(&nodes[0].url(), &name)).await;
+    let created = store.create(&namespace, &handle, &Create::default()).await;
+    let read = store.read(&namespace, &handle.id, 0, 10).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+    let waited = store.wait_after(&namespace, &handle.id, 0, deadline).await;
+    let _: () = redis::cmd("ACL")
+        .arg("DELUSER")
+        .arg(&name)
+        .query_async(&mut cluster)
+        .await
+        .unwrap();
+    for error in [created.unwrap_err(), read.unwrap_err(), waited.unwrap_err()] {
+        assert_eq!(error.reason, Reason::Invalid, "{error}");
+        assert!(error.message.contains("set `cluster`"), "{error}");
+    }
+}
