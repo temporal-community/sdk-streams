@@ -11,13 +11,14 @@ use temporalio_common::protos::temporal::api::common::v1::Payload;
 use temporalio_streams::{
     Reason,
     digest::batch_digest,
+    epoch::ProducerKind,
     ids::{StreamKeys, client_producer_id},
     offset::offset_of_entry_id,
     proto::{
-        AppendRecord, Producer, ProducerEpoch, StreamData, StreamHandle, StreamProducerKind,
-        StreamRecord, stream_record::Item,
+        AppendRecord, ClientEpoch, Producer, ProducerEpoch, StreamData, StreamHandle, StreamRecord,
+        producer_epoch::Kind, stream_record::Item,
     },
-    store::{Batch, Owner, Store, Withdrawal},
+    store::{Batch, Create, Owner, Store, Withdrawal},
 };
 use temporalio_streams_redis::{
     RedisStore, RedisStoreError, RedisStoreOptions, Topology, WaitOptions,
@@ -118,11 +119,9 @@ fn one_record() -> (Vec<Vec<u8>>, [u8; 16]) {
 
 fn client_named(process: &str) -> Producer {
     Producer {
-        kind: StreamProducerKind::Client as i32,
         id: client_producer_id("me", process),
         epoch: Some(ProducerEpoch {
-            attempt: 1,
-            ..Default::default()
+            kind: Some(Kind::Client(ClientEpoch { attempt: 1 })),
         }),
         run_id: String::new(),
     }
@@ -149,13 +148,7 @@ async fn the_documented_commands_run_every_call_of_each_role() {
 
     let producer = store(user(&url, &producer_name, &namespace, PRODUCER).await).await;
     producer
-        .create(
-            &namespace,
-            &handle,
-            None,
-            Owner::Client,
-            &Withdrawal::default(),
-        )
+        .create(&namespace, &handle, &Create::default())
         .await
         .unwrap();
     let (stored, digest) = one_record();
@@ -223,9 +216,11 @@ async fn the_documented_commands_run_every_call_of_each_role() {
         .create(
             &namespace,
             &short,
-            Some(retention),
-            Owner::Workflow,
-            &Withdrawal::default(),
+            &Create {
+                retention: Some(retention),
+                owner: Owner::Workflow,
+                ..Create::default()
+            },
         )
         .await
         .unwrap();
@@ -236,7 +231,7 @@ async fn the_documented_commands_run_every_call_of_each_role() {
     let old = format!("{old_ms}-1");
     let field = format!(
         "p|{}|{}",
-        StreamProducerKind::Client as i32,
+        ProducerKind::Client as i32,
         client_named("old").id
     );
     let _: () = redis::pipe()
@@ -288,9 +283,7 @@ async fn the_documented_commands_run_every_call_of_each_role() {
                 id: "waits".to_string(),
                 ..Default::default()
             },
-            None,
-            Owner::Client,
-            &Withdrawal::default(),
+            &Create::default(),
         )
         .await
         .unwrap_err();
@@ -486,9 +479,8 @@ async fn the_documented_commands_serve_a_cluster_while_a_slot_moves() {
         digest,
         withdrawal: Withdrawal::default(),
     };
-    let none = Withdrawal::default();
     producer
-        .create(&namespace, &handle, None, Owner::Client, &none)
+        .create(&namespace, &handle, &Create::default())
         .await
         .unwrap();
     producer

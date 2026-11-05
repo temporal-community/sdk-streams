@@ -5,8 +5,10 @@ use prost::Message;
 use std::{num::NonZeroUsize, time::Duration};
 use temporalio_streams::{
     Reason,
-    proto::{Producer, ProducerEpoch, StreamHandle, StreamProducerKind, StreamRecord},
-    store::{Batch, CreateOutcome, Owner, Store, Withdrawal},
+    proto::{
+        ClientEpoch, Producer, ProducerEpoch, StreamHandle, StreamRecord, producer_epoch::Kind,
+    },
+    store::{Batch, Create, CreateOutcome, Store, Withdrawal},
 };
 use temporalio_streams_redis::{
     RedisStore, RedisStoreOptions, Topology, WaitOptions,
@@ -138,11 +140,9 @@ fn unique(name: &str) -> String {
 
 fn client() -> Producer {
     Producer {
-        kind: StreamProducerKind::Client as i32,
         id: "client:wait".to_string(),
         epoch: Some(ProducerEpoch {
-            attempt: 1,
-            ..Default::default()
+            kind: Some(Kind::Client(ClientEpoch { attempt: 1 })),
         }),
         run_id: String::new(),
     }
@@ -171,15 +171,12 @@ async fn too_few_replicas(topology: Topology) {
     let create = |store: &RedisStore| {
         let (store, namespace, handle) = (store.clone(), namespace.clone(), handle.clone());
         async move {
-            store
-                .create(
-                    &namespace,
-                    &handle,
-                    None,
-                    Owner::Client,
-                    &Withdrawal::default(),
-                )
-                .await
+            // Each create is a retry of the first one, so it gets the Stream as created.
+            let create = Create {
+                request_id: "too-few",
+                ..Create::default()
+            };
+            store.create(&namespace, &handle, &create).await
         }
     };
     // No test server has this many replicas.
@@ -200,14 +197,17 @@ async fn too_few_replicas(topology: Topology) {
     let refused = create(&waits).await.unwrap_err();
     assert_eq!(refused.reason, Reason::Storage, "{refused}");
     let plain = store(&topology, None).await;
-    assert_eq!(create(&plain).await.unwrap().outcome, CreateOutcome::Exists);
+    assert_eq!(
+        create(&plain).await.unwrap().outcome,
+        CreateOutcome::Created
+    );
     if let Topology::Standalone(url) = &topology {
         let count = replicas(url).await.len();
         assert!(count > 0, "the server at STREAMS_REDIS_URL needs a replica");
         let enough = store(&topology, wait_for(count, LONG)).await;
         assert_eq!(
             create(&enough).await.unwrap().outcome,
-            CreateOutcome::Exists
+            CreateOutcome::Created
         );
     }
 }
@@ -232,15 +232,7 @@ async fn a_cluster_write_waits_for_the_replica_of_its_own_primary() {
                 id: id.to_string(),
                 ..Default::default()
             };
-            store
-                .create(
-                    &namespace,
-                    &handle,
-                    None,
-                    Owner::Client,
-                    &Withdrawal::default(),
-                )
-                .await
+            store.create(&namespace, &handle, &Create::default()).await
         }
     };
     let short = store(&cluster_at(&url), wait_for(1, SHORT)).await;
@@ -292,7 +284,7 @@ async fn a_call_that_finds_its_write_waits_for_the_replicas() {
         ..Default::default()
     };
     plain
-        .create(&namespace, &handle, None, Owner::Client, &none())
+        .create(&namespace, &handle, &Create::default())
         .await
         .unwrap();
     let paused = pause(&replicas).await;
@@ -309,12 +301,17 @@ async fn a_call_that_finds_its_write_waits_for_the_replicas() {
         .close(&namespace, &handle, &producer, b"")
         .await
         .map(|_| ());
+    // The second create is a retry of the first, so it finds its write done.
+    let retry_of_other = Create {
+        request_id: "other",
+        ..Create::default()
+    };
     plain
-        .create(&namespace, &other, None, Owner::Client, &none())
+        .create(&namespace, &other, &retry_of_other)
         .await
         .unwrap();
     let found = waits[2]
-        .create(&namespace, &other, None, Owner::Client, &none())
+        .create(&namespace, &other, &retry_of_other)
         .await
         .map(|_| ());
     drop(paused);
@@ -357,9 +354,7 @@ async fn writes_wait_for_their_replicas_at_once() {
                 id: "loads".to_string(),
                 ..Default::default()
             },
-            None,
-            Owner::Client,
-            &Withdrawal::default(),
+            &Create::default(),
         )
         .await
         .unwrap();
@@ -371,15 +366,7 @@ async fn writes_wait_for_their_replicas_at_once() {
                 id: format!("s{i}"),
                 ..Default::default()
             };
-            waits
-                .create(
-                    &namespace,
-                    &handle,
-                    None,
-                    Owner::Client,
-                    &Withdrawal::default(),
-                )
-                .await
+            waits.create(&namespace, &handle, &Create::default()).await
         });
     }
     // Writes that share a connection would run their `WAIT`s one after the other, so the server

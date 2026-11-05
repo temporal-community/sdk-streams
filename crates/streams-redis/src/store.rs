@@ -18,13 +18,13 @@ use replies::{AppendReply, CloseReply, CreateReply, ReadReply};
 use std::{collections::HashMap, num::NonZeroUsize, sync::Arc, time::Duration};
 use temporalio_streams::{
     StreamResult,
-    epoch::epoch_key,
+    epoch::{ProducerKind, epoch_key},
     ids::StreamKeys,
     offset::entry_id_of_offset,
     proto::{Producer, StreamHandle},
     store::{
-        Appended, Batch, Capabilities, Closed, Created, Entry, FORMAT_VERSION, MAX_TTL, Owner,
-        Store, StreamState, TOMBSTONE, Withdrawal, owner_chain,
+        Appended, Batch, Capabilities, Closed, ConflictPolicy, Create, Created, Entry,
+        FORMAT_VERSION, MAX_TTL, Owner, Store, StreamState, TOMBSTONE, owner_chain,
     },
 };
 use tokio::time::Instant;
@@ -181,13 +181,12 @@ impl Store for RedisStore {
         &self,
         namespace: &str,
         handle: &StreamHandle,
-        retention: Option<Duration>,
-        owner: Owner,
-        _withdrawal: &Withdrawal<'_>,
+        create: &Create<'_>,
     ) -> StreamResult<Created> {
         let keys = self.keys(namespace, &handle.id);
-        let retention = retention.filter(|r| !r.is_zero()).unwrap_or(self.retention);
-        let (owner, chain) = match owner {
+        let retention = create.retention.filter(|r| !r.is_zero());
+        let retention = retention.unwrap_or(self.retention);
+        let (owner, chain) = match create.owner {
             Owner::Workflow => ("wf", owner_chain(handle)),
             Owner::Client => ("client", String::new()),
         };
@@ -199,6 +198,8 @@ impl Store for RedisStore {
             .arg(self.safety_ttl.as_millis())
             .arg(TOMBSTONE.as_millis())
             .arg(chain)
+            .arg(create.request_id)
+            .arg(create.conflict == ConflictPolicy::UseExisting)
             .arg(self.wait.is_some());
         let CreateReply(created) = self.write(&call).await?;
         Ok(created)
@@ -217,7 +218,7 @@ impl Store for RedisStore {
         let mut call = ScriptCall::write(&scripts::APPEND_SCRIPT, &keys);
         call.cmd
             .arg(FORMAT_VERSION)
-            .arg(producer.kind)
+            .arg(ProducerKind::try_from(producer)? as i32)
             .arg(&producer.id)
             .arg(&epoch_key(&epoch)[..])
             .arg(batch.sequence)
@@ -248,7 +249,7 @@ impl Store for RedisStore {
         let mut call = ScriptCall::write(&scripts::CLOSE_SCRIPT, &keys);
         call.cmd
             .arg(FORMAT_VERSION)
-            .arg(producer.kind)
+            .arg(ProducerKind::try_from(producer)? as i32)
             .arg(&producer.id)
             .arg(&epoch_key(&epoch)[..])
             .arg(TOMBSTONE.as_millis())
@@ -607,8 +608,12 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs Redis"]
     async fn a_read_inside_a_batch_gets_the_producer_of_the_batch() {
-        use temporalio_streams::proto::{
-            StreamData, StreamProducerKind, StreamRecord, stream_record::Item,
+        use temporalio_streams::{
+            proto::{
+                ClientEpoch, ProducerEpoch, StreamData, StreamRecord, producer_epoch::Kind,
+                stream_record::Item,
+            },
+            store::Withdrawal,
         };
         let mut options = RedisStoreOptions::new(crate::testing::standalone_url());
         options.key_prefix = "streams-unit".parse().unwrap();
@@ -621,18 +626,14 @@ mod tests {
             },
         );
         store
-            .create(
-                &namespace,
-                &handle,
-                None,
-                Owner::Client,
-                &Withdrawal::default(),
-            )
+            .create(&namespace, &handle, &Create::default())
             .await
             .unwrap();
         let producer = Producer {
-            kind: StreamProducerKind::Client as i32,
             id: "client:unit".to_string(),
+            epoch: Some(ProducerEpoch {
+                kind: Some(Kind::Client(ClientEpoch { attempt: 1 })),
+            }),
             ..Default::default()
         };
         let record = StreamRecord {
