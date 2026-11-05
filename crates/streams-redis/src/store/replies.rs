@@ -98,13 +98,7 @@ impl FromRedisValue for ReadReply {
     fn from_redis_value(value: Value) -> Result<Self, ParsingError> {
         let (meta, (seconds, micros), entries, producer): (MetaFields, (i64, i64), _, Vec<u8>) =
             FromRedisValue::from_redis_value(value)?;
-        let earlier = match producer.as_slice() {
-            b"" => None,
-            bytes => Some(
-                Producer::decode(bytes)
-                    .map_err(|error| format!("the read script gave a bad Producer: {error}"))?,
-            ),
-        };
+        let earlier = earlier(&producer)?;
         let now_ms = seconds * 1000 + micros / 1000;
         let (version, closed, newest, trimmed, retention, expires) = meta;
         // A create sets `v`, `ret` and `exp` together, so a Stream with no `v` doesn't exist.
@@ -139,6 +133,34 @@ impl FromRedisValue for ReadReply {
             entries,
             earlier,
         })
+    }
+}
+
+/// The answer of `read_back.lua`, `[entries, Producer]`, with the entries newest first. The
+/// Producer is the one of the oldest entry's batch, when that batch starts before that entry, and
+/// `''` otherwise.
+pub(super) struct ReadBackReply {
+    pub(super) entries: Vec<LogEntry>,
+    pub(super) earlier: Option<Producer>,
+}
+
+impl FromRedisValue for ReadBackReply {
+    fn from_redis_value(value: Value) -> Result<Self, ParsingError> {
+        let (entries, producer): (_, Vec<u8>) = FromRedisValue::from_redis_value(value)?;
+        Ok(Self {
+            entries,
+            earlier: earlier(&producer)?,
+        })
+    }
+}
+
+/// The Producer that a read script gives for a batch that starts before the page.
+fn earlier(producer: &[u8]) -> Result<Option<Producer>, ParsingError> {
+    match producer {
+        b"" => Ok(None),
+        bytes => Producer::decode(bytes)
+            .map(Some)
+            .map_err(|error| format!("a read script gave a bad Producer: {error}").into()),
     }
 }
 
