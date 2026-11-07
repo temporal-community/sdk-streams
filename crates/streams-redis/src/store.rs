@@ -200,14 +200,13 @@ impl Store for RedisStore {
     ) -> StreamResult<Appended> {
         let keys = self.keys(namespace, &stream_ref.id);
         let producer = batch.producer;
-        let epoch = producer.epoch.unwrap_or_default();
         let withdrawal = &batch.withdrawal;
         let mut call = ScriptCall::write(&scripts::APPEND_SCRIPT, &keys);
         call.cmd
             .arg(FORMAT_VERSION)
             .arg(ProducerKind::try_from(producer)? as i32)
             .arg(&producer.id)
-            .arg(&epoch_key(&epoch)[..])
+            .arg(&epoch_key(producer.kind.as_ref())[..])
             .arg(batch.sequence)
             .arg(withdrawal.superseded)
             .arg(self.safety_ttl.as_millis())
@@ -231,7 +230,6 @@ impl Store for RedisStore {
         producer: &Producer,
     ) -> StreamResult<Closed> {
         let keys = self.keys(namespace, &stream_ref.id);
-        let epoch = producer.epoch.unwrap_or_default();
         let mut call = ScriptCall::write(&scripts::CLOSE_SCRIPT, &keys);
         // An argument and not a key. `close.lua` says why.
         call.cmd
@@ -239,7 +237,7 @@ impl Store for RedisStore {
             .arg(FORMAT_VERSION)
             .arg(ProducerKind::try_from(producer)? as i32)
             .arg(&producer.id)
-            .arg(&epoch_key(&epoch)[..])
+            .arg(&epoch_key(producer.kind.as_ref())[..])
             .arg(TOMBSTONE.as_millis())
             .arg(owner_chain(stream_ref))
             .arg(self.wait.is_some());
@@ -603,7 +601,7 @@ mod tests {
     async fn a_read_inside_a_batch_gets_the_producer_of_the_batch() {
         use temporalio_streams::{
             proto::{
-                ClientEpoch, ProducerEpoch, StreamData, StreamRecord, producer_epoch::Kind,
+                ClientEpoch, ClientProducer, StreamData, StreamRecord, producer::Kind,
                 stream_record::Item,
             },
             store::Withdrawal,
@@ -624,10 +622,9 @@ mod tests {
             .unwrap();
         let producer = Producer {
             id: "client:unit".to_string(),
-            epoch: Some(ProducerEpoch {
-                kind: Some(Kind::Client(ClientEpoch { attempt: 1 })),
-            }),
-            ..Default::default()
+            kind: Some(Kind::Client(ClientProducer {
+                epoch: Some(ClientEpoch { attempt: 1 }),
+            })),
         };
         let record = StreamRecord {
             item: Some(Item::Data(StreamData {

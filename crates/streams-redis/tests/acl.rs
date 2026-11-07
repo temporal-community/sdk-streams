@@ -16,8 +16,8 @@ use temporalio_streams::{
     ids::{StreamKeys, client_producer_id},
     offset::offset_of_entry_id,
     proto::{
-        AppendRecord, ClientEpoch, Producer, ProducerEpoch, StreamData, StreamRecord, StreamRef,
-        producer_epoch::Kind, stream_record::Item,
+        AppendRecord, ClientEpoch, ClientProducer, Producer, StreamData, StreamRecord, StreamRef,
+        producer::Kind, stream_record::Item,
     },
     store::{Batch, Create, Owner, Store, Withdrawal},
 };
@@ -128,10 +128,9 @@ fn one_record() -> (Vec<Vec<u8>>, [u8; 16]) {
 fn client_named(process: &str) -> Producer {
     Producer {
         id: client_producer_id("me", process),
-        epoch: Some(ProducerEpoch {
-            kind: Some(Kind::Client(ClientEpoch { attempt: 1 })),
-        }),
-        run_id: String::new(),
+        kind: Some(Kind::Client(ClientProducer {
+            epoch: Some(ClientEpoch { attempt: 1 }),
+        })),
     }
 }
 

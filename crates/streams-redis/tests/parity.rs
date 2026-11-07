@@ -26,9 +26,10 @@ use temporalio_streams::{
     },
     memory::MemoryStore,
     proto::{
-        ActivityEpoch, AppendRecord, ClientEpoch, LocalActivityEpoch, Producer, ProducerEpoch,
-        StreamData, StreamRecord, StreamRef, StreamSuperseded, StreamWriter, WorkflowTaskEpoch,
-        producer_epoch::Kind, stream_record,
+        ActivityEpoch, ActivityProducer, AppendRecord, ClientEpoch, ClientProducer,
+        LocalActivityEpoch, LocalActivityProducer, Producer, StreamData, StreamRecord, StreamRef,
+        StreamSuperseded, StreamWriter, WorkflowProducer, WorkflowTaskEpoch, producer::Kind,
+        stream_record,
     },
     store::{Batch, ConflictPolicy, Create, CreateOutcome, Entry, Owner, Store, Withdrawal},
 };
@@ -123,42 +124,48 @@ impl Rng {
 /// The Producers of the calls. Some share an id with another epoch, so that the fences and the
 /// withdrawals of a newer epoch run.
 fn producers() -> Vec<Producer> {
-    let epoch = |kind| Some(ProducerEpoch { kind: Some(kind) });
     let client = |id: String, attempt| Producer {
         id,
-        epoch: epoch(Kind::Client(ClientEpoch { attempt })),
-        run_id: String::new(),
+        kind: Some(Kind::Client(ClientProducer {
+            epoch: Some(ClientEpoch { attempt }),
+        })),
     };
     let activity = |attempt| Producer {
         id: activity_producer_id("r1", "a", "s"),
-        epoch: epoch(Kind::Activity(ActivityEpoch {
-            attempt_scheduled_time: Some(prost_types::Timestamp {
-                seconds: 100 + i64::from(attempt),
-                nanos: 0,
+        kind: Some(Kind::Activity(ActivityProducer {
+            run_id: "r1".to_string(),
+            epoch: Some(ActivityEpoch {
+                attempt_scheduled_time: Some(prost_types::Timestamp {
+                    seconds: 100 + i64::from(attempt),
+                    nanos: 0,
+                }),
+                attempt,
             }),
-            attempt,
         })),
-        run_id: "r1".to_string(),
     };
     let local_activity = |attempt| Producer {
         id: local_activity_producer_id("r1", "call-3"),
-        epoch: epoch(Kind::LocalActivity(LocalActivityEpoch {
-            task: Some(WorkflowTaskEpoch {
-                started_event_id: 3,
-                attempt: 1,
-                started_time: Some(prost_types::Timestamp {
-                    seconds: 3,
-                    nanos: 0,
+        kind: Some(Kind::LocalActivity(LocalActivityProducer {
+            run_id: "r1".to_string(),
+            epoch: Some(LocalActivityEpoch {
+                task: Some(WorkflowTaskEpoch {
+                    started_event_id: 3,
+                    attempt: 1,
+                    started_time: Some(prost_types::Timestamp {
+                        seconds: 3,
+                        nanos: 0,
+                    }),
                 }),
+                attempt,
             }),
-            attempt,
         })),
-        run_id: "r1".to_string(),
     };
     let workflow = Producer {
         id: workflow_producer_id("r1"),
-        epoch: epoch(Kind::Workflow(WorkflowTaskEpoch::default())),
-        run_id: "r1".to_string(),
+        kind: Some(Kind::Workflow(WorkflowProducer {
+            run_id: "r1".to_string(),
+            epoch: Some(WorkflowTaskEpoch::default()),
+        })),
     };
     let me = || client_producer_id("me", "p1");
     vec![
