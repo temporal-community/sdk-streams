@@ -1,0 +1,3 @@
+# The tests may unwrap, since a failed unwrap there is a failed case.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
