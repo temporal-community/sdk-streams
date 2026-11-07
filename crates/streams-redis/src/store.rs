@@ -11,20 +11,20 @@ use conn::{BlockingPool, Endpoint, Leased, Origin, Settled, SharedConnection, Wa
 use prost::Message;
 use records::{with_producers, without_producer};
 use redis::{
-    Cmd, ErrorKind, FromRedisValue, InfoDict, Pipeline, RedisError, RedisResult, Script,
-    ServerErrorKind, Value,
+    Cmd, ErrorKind, FromRedisValue, InfoDict, Pipeline, RedisError, RedisResult, RedisWrite,
+    Script, ServerErrorKind, ToRedisArgs, Value,
 };
 use replies::{AppendReply, CloseReply, CreateReply, ReadBackReply, ReadReply};
 use std::{collections::HashMap, num::NonZeroUsize, sync::Arc, time::Duration};
 use temporalio_streams::{
     StreamResult,
-    epoch::{ProducerKind, epoch_key},
-    ids::StreamKeys,
+    epoch::{ProducerKind, TASK_KEY_LEN, epoch_key, producer_run_id, task_key, task_of},
+    ids::{StreamKeys, encode_part},
     offset::entry_id_of_offset,
-    proto::{Producer, StreamRef},
+    proto::{Producer, StreamRef, WorkflowTaskEpoch},
     store::{
         Appended, Batch, Capabilities, Closed, ConflictPolicy, Create, Created, Entry,
-        FORMAT_VERSION, MAX_TTL, Owner, Store, StreamState, TOMBSTONE, owner_chain,
+        FORMAT_VERSION, MAX_TTL, Owner, Store, StreamState, TOMBSTONE, TaskFacts, owner_chain,
     },
 };
 use tokio::time::Instant;
@@ -157,13 +157,14 @@ impl RedisStore {
 // A Redis error converts through the crate's error, since this crate can't add that `From`.
 #[async_trait::async_trait]
 impl Store for RedisStore {
-    // Every rule but the run fence is in the Lua scripts.
+    // Every rule is in the Lua scripts.
     fn capabilities(&self) -> Capabilities {
-        Capabilities::ALL.without(Capabilities::RUN_FENCE)
+        Capabilities::ALL
     }
 
-    /// Creates a Stream, or finds it. A Workflow-owned Stream stores its ref's run chain, which
-    /// later creates and closes must match.
+    /// Creates a Stream, or finds it. A retry run's create withdraws its previous run. A
+    /// Workflow-owned Stream stores its ref's run chain, which later creates and closes must
+    /// match.
     async fn create(
         &self,
         namespace: &str,
@@ -184,6 +185,8 @@ impl Store for RedisStore {
             .arg(owner)
             .arg(self.safety_ttl.as_millis())
             .arg(TOMBSTONE.as_millis())
+            .arg(encode_part(create.withdrawal.withdraw_run))
+            .arg(create.withdrawal.superseded)
             .arg(chain)
             .arg(create.request_id)
             .arg(create.conflict == ConflictPolicy::UseExisting)
@@ -200,17 +203,21 @@ impl Store for RedisStore {
     ) -> StreamResult<Appended> {
         let keys = self.keys(namespace, &stream_ref.id);
         let producer = batch.producer;
+        let kind = ProducerKind::try_from(producer)?;
         let withdrawal = &batch.withdrawal;
         let mut call = ScriptCall::write(&scripts::APPEND_SCRIPT, &keys);
         call.cmd
             .arg(FORMAT_VERSION)
-            .arg(ProducerKind::try_from(producer)? as i32)
+            .arg(kind as i32)
             .arg(&producer.id)
+            .arg(encode_part(producer_run_id(producer)))
             .arg(&epoch_key(producer.kind.as_ref())[..])
             .arg(batch.sequence)
+            .arg(encode_part(withdrawal.withdraw_run))
             .arg(withdrawal.superseded)
             .arg(self.safety_ttl.as_millis())
             .arg(TOMBSTONE.as_millis())
+            .arg(TaskArgs::of(kind, batch))
             .arg(&batch.digest[..])
             .arg(self.wait.is_some())
             .arg(producer.encode_to_vec());
@@ -237,6 +244,7 @@ impl Store for RedisStore {
             .arg(FORMAT_VERSION)
             .arg(ProducerKind::try_from(producer)? as i32)
             .arg(&producer.id)
+            .arg(encode_part(producer_run_id(producer)))
             .arg(&epoch_key(producer.kind.as_ref())[..])
             .arg(TOMBSTONE.as_millis())
             .arg(owner_chain(stream_ref))
@@ -400,6 +408,63 @@ async fn write_replies(pipe: &Pipeline, conn: &mut SharedConnection) -> RedisRes
     })
 }
 
+/// What an append batch gives the script about its Workflow Task.
+enum TaskArgs<'a> {
+    /// The batch isn't of a Local Activity of a run, so the script tracks no task.
+    Untracked,
+    /// A Local Activity's task, with no task facts, as from an older Core.
+    Task([u8; TASK_KEY_LEN]),
+    /// A Local Activity's task, with the run's task facts.
+    Facts {
+        task: [u8; TASK_KEY_LEN],
+        facts: TaskFacts<'a>,
+    },
+}
+
+impl<'a> TaskArgs<'a> {
+    fn of(kind: ProducerKind, batch: &Batch<'a>) -> Self {
+        let producer = batch.producer;
+        if kind != ProducerKind::LocalActivity || producer_run_id(producer).is_empty() {
+            return Self::Untracked;
+        }
+        let task = task_key(&task_of(producer.kind.as_ref()));
+        match batch.withdrawal.tasks {
+            None => Self::Task(task),
+            Some(facts) => Self::Facts { task, facts },
+        }
+    }
+}
+
+/// The four task arguments of `append.lua`. These are the task key, the completed task key, the
+/// failed tasks' started event ids, 8 bytes each, and the task Superseded facts. With no task
+/// facts, the completed task is empty, and before the run's first completed task it is the zero
+/// key.
+impl ToRedisArgs for TaskArgs<'_> {
+    fn write_redis_args<W: ?Sized + RedisWrite>(&self, out: &mut W) {
+        let (task, facts) = match self {
+            Self::Untracked => (&[][..], None),
+            Self::Task(task) => (&task[..], None),
+            Self::Facts { task, facts } => (&task[..], Some(facts)),
+        };
+        out.write_arg(task);
+        let Some(facts) = facts else {
+            for _ in 0..3 {
+                out.write_arg(b"");
+            }
+            return;
+        };
+        let zero = WorkflowTaskEpoch::default();
+        out.write_arg(&task_key(facts.completed.unwrap_or(&zero)));
+        let failed: Vec<u8> = facts
+            .failed_tasks
+            .iter()
+            .flat_map(|id| id.to_be_bytes())
+            .collect();
+        out.write_arg(&failed);
+        out.write_arg(facts.superseded);
+    }
+}
+
 /// A value that Redis keeps or answers and that the Store can't decode.
 fn corrupt(what: &str, error: impl std::fmt::Display) -> RedisStoreError {
     RedisStoreError::corrupt(format!("{what} doesn't decode: {error}"))
@@ -550,6 +615,7 @@ fn check_version(node: &Origin, info: &InfoDict) -> RedisStoreResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use temporalio_streams::{Reason, StreamError, store::DEFAULT_SAFETY_TTL};
 
     #[test]
     fn a_server_before_redis_7_is_refused() {
@@ -593,6 +659,74 @@ mod tests {
         ];
         for change in changes {
             assert!(matches!(check(change), Err(RedisStoreError::Invalid(_))));
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "needs Redis"]
+    async fn bad_task_facts_are_refused_before_the_first_write() {
+        let mut options = RedisStoreOptions::new(crate::testing::standalone_url());
+        options.key_prefix = "streams-unit".parse().unwrap();
+        let store = RedisStore::connect(options).await.unwrap();
+        let namespace = format!("ns-{}", std::process::id());
+        // The script is the format that every SDK calls, so these are arguments that no Rust type
+        // can build. They are a task key of another length, a completed task key of another
+        // length, and failed ids that aren't 8 bytes each.
+        let zero = task_key(&Default::default());
+        let cases: [(&[u8], &[u8], &[u8]); 3] = [
+            (b"zz", &zero, b""),
+            (&zero, b"zz", b""),
+            (&zero, &zero, b"abc"),
+        ];
+        for (i, (task, completed, failed)) in cases.into_iter().enumerate() {
+            let handle = StreamRef {
+                id: format!("s{i}"),
+                ..Default::default()
+            };
+            store
+                .create(&namespace, &handle, &Create::default())
+                .await
+                .unwrap();
+            let keys = store.keys(&namespace, &handle.id);
+            let mut shared = store.shared.clone();
+            let _: () = redis::cmd("HSET")
+                .arg(keys.meta())
+                .arg("run|r0")
+                .arg("1")
+                .query_async(&mut shared)
+                .await
+                .unwrap();
+            // A Local Activity of run r1 that withdraws r0, with one malformed task fact.
+            let mut call = ScriptCall::write(&scripts::APPEND_SCRIPT, &keys);
+            call.cmd
+                .arg(FORMAT_VERSION)
+                .arg(ProducerKind::LocalActivity as i32)
+                .arg("la")
+                .arg("r1")
+                .arg(&epoch_key(None)[..])
+                .arg(1)
+                .arg("r0")
+                .arg(b"")
+                .arg(DEFAULT_SAFETY_TTL.as_millis())
+                .arg(TOMBSTONE.as_millis())
+                .arg(task)
+                .arg(completed)
+                .arg(failed)
+                .arg(b"")
+                .arg(&[0; 16][..])
+                .arg("")
+                .arg(b"")
+                .arg(b"r");
+            let error = call.run(&mut shared).await.unwrap_err();
+            let error = StreamError::from(RedisStoreError::from(error));
+            assert_eq!(error.reason, Reason::Invalid, "{error}");
+            let fence: Option<String> = redis::cmd("HGET")
+                .arg(keys.meta())
+                .arg("wr|r0")
+                .query_async(&mut shared)
+                .await
+                .unwrap();
+            assert_eq!(fence, None);
         }
     }
 

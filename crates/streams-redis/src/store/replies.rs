@@ -11,12 +11,14 @@ use temporalio_streams::{
     store::{Appended, Closed, CreateOutcome, Created, StreamState},
 };
 
-/// The answer of `create.lua`, `[outcome, Retention ms]`.
+/// The answer of `create.lua`, `[outcome, Retention ms, flag]`. The flag is set when the create
+/// withdrew a previous run's Records.
 pub(super) struct CreateReply(pub(super) Created);
 
 impl FromRedisValue for CreateReply {
     fn from_redis_value(value: Value) -> Result<Self, ParsingError> {
-        let (outcome, retention): (String, u64) = FromRedisValue::from_redis_value(value)?;
+        let (outcome, retention, Flag(flagged)): (String, u64, Flag) =
+            FromRedisValue::from_redis_value(value)?;
         let outcome = match outcome.as_str() {
             "created" => CreateOutcome::Created,
             "exists" => CreateOutcome::Exists,
@@ -25,7 +27,7 @@ impl FromRedisValue for CreateReply {
         Ok(Self(Created {
             outcome,
             retention: Duration::from_millis(retention),
-            flagged: false,
+            flagged,
         }))
     }
 }
@@ -36,7 +38,7 @@ pub(super) struct AppendReply(pub(super) Appended);
 
 impl FromRedisValue for AppendReply {
     fn from_redis_value(value: Value) -> Result<Self, ParsingError> {
-        let (outcome, first, last, flag): (String, String, String, String) =
+        let (outcome, first, last, Flag(flagged)): (String, String, String, Flag) =
             FromRedisValue::from_redis_value(value)?;
         let resend = match outcome.as_str() {
             "ok" => false,
@@ -46,11 +48,6 @@ impl FromRedisValue for AppendReply {
         let offsets = match (first.as_str(), last.as_str()) {
             ("", "") => None,
             (first, last) => Some((offset(first)?, offset(last)?)),
-        };
-        let flagged = match flag.as_str() {
-            "1" => true,
-            "" => false,
-            other => return Err(unknown("append", other)),
         };
         Ok(Self(Appended {
             offsets,
@@ -168,6 +165,19 @@ fn offset(id: &str) -> Result<i64, ParsingError> {
     offset_of_entry_id(id).map_err(|error| error.to_string().into())
 }
 
+/// A script's flag, `1` when set and `''` otherwise.
+struct Flag(bool);
+
+impl FromRedisValue for Flag {
+    fn from_redis_value(value: Value) -> Result<Self, ParsingError> {
+        match String::from_redis_value(value)?.as_str() {
+            "1" => Ok(Self(true)),
+            "" => Ok(Self(false)),
+            other => Err(format!("a script gave the unknown flag {other:?}").into()),
+        }
+    }
+}
+
 fn unknown(script: &str, answer: &str) -> ParsingError {
     format!("the {script} script gave the unknown answer {answer:?}").into()
 }
@@ -207,7 +217,11 @@ mod tests {
                 "{items:?}"
             );
         }
-        assert!(CreateReply::from_redis_value(answer(&["made", "1000"])).is_err());
+        assert!(CreateReply::from_redis_value(answer(&["made", "1000", ""])).is_err());
+        assert!(CreateReply::from_redis_value(answer(&["created", "1000"])).is_err());
+        let CreateReply(created) =
+            CreateReply::from_redis_value(answer(&["exists", "1000", "1"])).unwrap();
+        assert!(created.flagged);
         assert!(CloseReply::from_redis_value(answer(&["closed", "x"])).is_err());
     }
 }

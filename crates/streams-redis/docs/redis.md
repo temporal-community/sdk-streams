@@ -14,7 +14,8 @@ form, and the `testdata/` of `temporalio-streams` has its test vectors.
 
 - Each part is percent-encoded. The hash tag puts the four keys in one cluster slot.
 - The prefix has only letters, digits, `-`, `.`, `_` and `~`, so a key pattern shows it as written.
-- A create writes `:meta`. An append writes `:producers` and `:log`.
+- A create writes `:meta`. An append writes `:producers` and `:log`, and so does a retry run's
+  create.
 - A close writes no log entry. It adds one entry to `:closed`, so a read that waits on the log and
   on `:closed` wakes. `:closed` expires with the log.
 - The close script gets `:closed` as an argument, not in `KEYS`. While a slot migrates, a script
@@ -36,8 +37,14 @@ form, and the `testdata/` of `temporalio-streams` has its test vectors.
 | `newest` | The entry id of the newest entry |
 | `trimmed` | The entry id of the newest entry that Retention or the log's expiry dropped |
 | `p\|<kind>\|<producer id>` | The Producer's fence, held epoch and last batch, 129 bytes |
+| `oa\|<run>` | The run's Local Activity task keys here that may not have completed |
+| `ow\|<run>\|<task key>` | Set when an orphan item withdrew the task's Local Activity Records |
+| `tf\|<run>` | The task facts of the run's highest task, as task keys back to back |
+| `run\|<run>` | Set when a Producer of the run wrote a Record here |
+| `wr\|<run>` | Set when a Workflow retry withdrew the run |
 
-`<kind>` is the `ProducerKind` number. The `p|` value has big-endian numbers in this order.
+`<kind>` is the `ProducerKind` number, and `<run>` is the percent-encoded run id. The `p|` value
+has big-endian numbers in this order.
 
 | Bytes | Field |
 |---|---|
@@ -52,9 +59,13 @@ form, and the `testdata/` of `temporalio-streams` has its test vectors.
 - The ids are zero when the last batch wrote no entry. A real entry id is never `0-0`.
 - A call that finds a value of another length, another flag bit, or only one zero id fails with
   `stream_storage_corrupt`, since a later format may write it.
-- An epoch key is the task key (started event id 8, attempt 4, started seconds 8 and nanos 4),
-  then the attempt's scheduled seconds 8 and nanos 4 and the attempt 4. A negative field is zero.
-- The scripts compare two epoch keys byte by byte. Lua's `<` collates with the server's locale.
+- A task key is the started event id 8, the attempt 4, and the started seconds 8 and nanos 4.
+- An epoch key is the task key, then the attempt's scheduled seconds 8 and nanos 4 and the
+  attempt 4. A negative field is zero.
+- `oa|` and `tf|` hold 24-byte task keys back to back, and `ow|` ends in the raw task key. A call
+  that finds `oa|` or `tf|` ending in a partial key, or `tf|` with fewer than two keys, fails with
+  `stream_storage_corrupt`.
+- The scripts compare two keys byte by byte. Lua's `<` collates with the server's locale.
 - The digest is the first 16 bytes of the batch's SHA-256.
 
 `:producers` scores each `<kind>|<producer id>` with the ms of its last append. An append drops the
@@ -86,9 +97,44 @@ create with another owner (`stream_not_owner`) and a closed Stream (`stream_clos
   a batch gets `p` with one lookup. An entry never has both `p` and `b`.
 - A batch's entries share one millisecond, and a trim drops whole milliseconds, so a batch keeps
   its `p` entry for as long as it has any entry.
-- `s` is the encoded `StreamSuperseded` with the withdrawal facts, on the first entry of a batch
-  that withdraws. A read builds the Superseded item from it. An entry can have only `s`.
+- `s` is the encoded `StreamSuperseded` with the withdrawal facts. A read builds the Superseded
+  item from it.
+- A batch that withdraws has `s` on its first entry. The orphan rule adds an entry with only `s`
+  before it, so one batch can have two.
 - An offset is the entry id `<ms>-<seq>`, packed as `ms << 20 | seq`.
+
+## Orphaned Local Activity Records
+
+A Local Activity batch's `writer` can give its run's last completed Workflow Task
+(`previous_completed_task`) and failed tasks (`failed_tasks`). Then the append withdraws the run's
+tasks in `oa` that never completed.
+
+- These are the tasks after the completed task and before the batch's task, the failed tasks, and
+  the lower attempts of the batch's task and of the completed task.
+- One entry with only `s` withdraws them. The `writer` of its `StreamSuperseded` has the run's
+  Workflow Producer at the batch's task, and the completed and failed tasks.
+- The append then drops the tasks at or before the completed task from `oa`.
+- Each Local Activity batch with Records adds its task to `oa`, also a batch with no task facts.
+- Each `ow|<run>|<task key>` fences a late write of that task.
+- A batch with no task facts skips the rule.
+- `tf|<run>` keeps the facts of the run's highest task. These are its own key, the completed
+  task's key or the zero key before the first, and the key of each failed task's started event id.
+- A write of a task that `tf|` shows never completed fails with `stream_fenced`, since a task can
+  fail before its call writes.
+
+## Retry runs
+
+- A Workflow retry run gives its previous run in `withdraw_run` on its create, and in
+  `writer.withdraw_run` on the first batch of each of its Local Activities.
+- The first such call sets `wr|<previous run>`, also when the create makes the Stream.
+- When `run|<previous run>` is set, the call also writes `s`. A create writes it on an entry of its
+  own, and an append on the first entry of its batch.
+- When `run|<previous run>` isn't set, a create that finds the Stream sets only `wr|`, and `exp`
+  stays as it is.
+- When `wr|<run>` is set, each later append and close of the run's Producers fails with
+  `stream_fenced`. A resend still gets its first answer, and a close of a closed Stream gets
+  `already`.
+- An append with Records sets `run|<run>`.
 
 ## TTLs
 
@@ -151,6 +197,20 @@ these lists on a standalone server and on a cluster.
   until its safety TTL passes. The native server closes it when the owner's run ends.
 - A Stream with no owner takes a close from any Workflow or client, since the Store can't tell
   which one made it.
+- A failed task's Local Activity Records go only when the retry task runs the same call again, or
+  a later Local Activity write gives the failed task. Otherwise they stay, as in the memory Store.
+- Core sends only the last 100 failed Workflow Tasks of a run. An older failed task before the last
+  completed one keeps its Local Activity Records.
+- A Local Activity that runs longer than its Workflow Task keeps its Records when the task where it
+  resolves fails. Only a later run of the same call withdraws them.
+- A retry run withdraws only its previous run. If that run never wrote, older runs keep their
+  Records, since the Store can't tell a retry attempt from a continue-as-new run.
+- A run that closes its Stream and then fails under a retry policy leaves it closed, so each retry
+  run's create fails with `stream_closed`. The close's Readers have ended, so it can't be withdrawn.
+- A reset run doesn't withdraw the base run's Records after the reset point, and it doesn't fence
+  the base run's Producers.
+- The meta keeps the `run|`, `oa|`, `ow|`, `tf|` and `wr|` fields of each run until the Stream
+  expires, so a long run chain adds fields for as long as it writes.
 - Redis can't tie a run to its run chain. A run of another chain that holds the owner's handle,
   such as a child Workflow with its parent's Stream, can still close it. The native server checks
   the run.
