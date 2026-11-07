@@ -16,8 +16,9 @@ use temporalio_streams::{
     ids::{StreamKeys, client_producer_id, local_activity_producer_id},
     offset::offset_of_entry_id,
     proto::{
-        AppendRecord, ClientEpoch, LocalActivityEpoch, Producer, ProducerEpoch, StreamData,
-        StreamRecord, StreamRef, WorkflowTaskEpoch, producer_epoch::Kind, stream_record::Item,
+        AppendRecord, ClientEpoch, ClientProducer, LocalActivityEpoch, LocalActivityProducer,
+        Producer, StreamData, StreamRecord, StreamRef, WorkflowTaskEpoch, producer::Kind,
+        stream_record::Item,
     },
     store::{Batch, ConflictPolicy, Create, Owner, Store, TaskFacts, Withdrawal},
 };
@@ -128,10 +129,9 @@ fn one_record() -> (Vec<Vec<u8>>, [u8; 16]) {
 fn client_named(process: &str) -> Producer {
     Producer {
         id: client_producer_id("me", process),
-        epoch: Some(ProducerEpoch {
-            kind: Some(Kind::Client(ClientEpoch { attempt: 1 })),
-        }),
-        run_id: String::new(),
+        kind: Some(Kind::Client(ClientProducer {
+            epoch: Some(ClientEpoch { attempt: 1 }),
+        })),
     }
 }
 
@@ -151,13 +151,13 @@ fn task(started: i64) -> WorkflowTaskEpoch {
 fn local_activity(run: &str, task: &WorkflowTaskEpoch) -> Producer {
     Producer {
         id: local_activity_producer_id(run, &format!("call-{}", task.started_event_id)),
-        epoch: Some(ProducerEpoch {
-            kind: Some(Kind::LocalActivity(LocalActivityEpoch {
+        kind: Some(Kind::LocalActivity(LocalActivityProducer {
+            run_id: run.to_string(),
+            epoch: Some(LocalActivityEpoch {
                 task: Some(*task),
                 attempt: 1,
-            })),
-        }),
-        run_id: run.to_string(),
+            }),
+        })),
     }
 }
 
