@@ -110,6 +110,9 @@ impl TestBackend for RedisBackend {
                 .map_or(0, |wait| i32::try_from(wait.replicas.get()).unwrap()),
             wait_timeout: Some(seconds(WAIT_TIMEOUT)),
             response_timeout: Some(seconds(2 * WAIT_TIMEOUT)),
+            // The writer cases leave megabytes of Records, which a local server keeps for the
+            // Retention.
+            retention: Some(seconds(Duration::from_secs(300))),
             ..Default::default()
         };
         RedisStreamRuntime::from_config_bytes(&config.encode_to_vec(), None).unwrap()
