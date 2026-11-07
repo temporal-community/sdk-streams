@@ -5,7 +5,7 @@ use prost::Message;
 use std::{num::NonZeroUsize, time::Duration};
 use temporalio_streams::{
     Reason,
-    proto::{ClientEpoch, Producer, ProducerEpoch, StreamRecord, StreamRef, producer_epoch::Kind},
+    proto::{ClientEpoch, ClientProducer, Producer, StreamRecord, StreamRef, producer::Kind},
     store::{Batch, Create, CreateOutcome, Store, Withdrawal},
 };
 use temporalio_streams_redis::{
@@ -144,10 +144,9 @@ fn unique(name: &str) -> String {
 fn client() -> Producer {
     Producer {
         id: "client:wait".to_string(),
-        epoch: Some(ProducerEpoch {
-            kind: Some(Kind::Client(ClientEpoch { attempt: 1 })),
-        }),
-        run_id: String::new(),
+        kind: Some(Kind::Client(ClientProducer {
+            epoch: Some(ClientEpoch { attempt: 1 }),
+        })),
     }
 }
 

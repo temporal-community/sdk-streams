@@ -18,7 +18,7 @@ use replies::{AppendReply, CloseReply, CreateReply, ReadBackReply, ReadReply};
 use std::{collections::HashMap, num::NonZeroUsize, sync::Arc, time::Duration};
 use temporalio_streams::{
     StreamResult,
-    epoch::{ProducerKind, TASK_KEY_LEN, epoch_key, task_key, task_of},
+    epoch::{ProducerKind, TASK_KEY_LEN, epoch_key, producer_run_id, task_key, task_of},
     ids::{StreamKeys, encode_part},
     offset::entry_id_of_offset,
     proto::{Producer, StreamRef, WorkflowTaskEpoch},
@@ -204,15 +204,14 @@ impl Store for RedisStore {
         let keys = self.keys(namespace, &stream_ref.id);
         let producer = batch.producer;
         let kind = ProducerKind::try_from(producer)?;
-        let epoch = producer.epoch.unwrap_or_default();
         let withdrawal = &batch.withdrawal;
         let mut call = ScriptCall::write(&scripts::APPEND_SCRIPT, &keys);
         call.cmd
             .arg(FORMAT_VERSION)
             .arg(kind as i32)
             .arg(&producer.id)
-            .arg(encode_part(&producer.run_id))
-            .arg(&epoch_key(&epoch)[..])
+            .arg(encode_part(producer_run_id(producer)))
+            .arg(&epoch_key(producer.kind.as_ref())[..])
             .arg(batch.sequence)
             .arg(encode_part(withdrawal.withdraw_run))
             .arg(withdrawal.superseded)
@@ -238,7 +237,6 @@ impl Store for RedisStore {
         producer: &Producer,
     ) -> StreamResult<Closed> {
         let keys = self.keys(namespace, &stream_ref.id);
-        let epoch = producer.epoch.unwrap_or_default();
         let mut call = ScriptCall::write(&scripts::CLOSE_SCRIPT, &keys);
         // An argument and not a key. `close.lua` says why.
         call.cmd
@@ -246,8 +244,8 @@ impl Store for RedisStore {
             .arg(FORMAT_VERSION)
             .arg(ProducerKind::try_from(producer)? as i32)
             .arg(&producer.id)
-            .arg(encode_part(&producer.run_id))
-            .arg(&epoch_key(&epoch)[..])
+            .arg(encode_part(producer_run_id(producer)))
+            .arg(&epoch_key(producer.kind.as_ref())[..])
             .arg(TOMBSTONE.as_millis())
             .arg(owner_chain(stream_ref))
             .arg(self.wait.is_some());
@@ -426,10 +424,10 @@ enum TaskArgs<'a> {
 impl<'a> TaskArgs<'a> {
     fn of(kind: ProducerKind, batch: &Batch<'a>) -> Self {
         let producer = batch.producer;
-        if kind != ProducerKind::LocalActivity || producer.run_id.is_empty() {
+        if kind != ProducerKind::LocalActivity || producer_run_id(producer).is_empty() {
             return Self::Untracked;
         }
-        let task = task_key(&task_of(&producer.epoch.unwrap_or_default()));
+        let task = task_key(&task_of(producer.kind.as_ref()));
         match batch.withdrawal.tasks {
             None => Self::Task(task),
             Some(facts) => Self::Facts { task, facts },
@@ -705,7 +703,7 @@ mod tests {
                 .arg(ProducerKind::LocalActivity as i32)
                 .arg("la")
                 .arg("r1")
-                .arg(&epoch_key(&Default::default())[..])
+                .arg(&epoch_key(None)[..])
                 .arg(1)
                 .arg("r0")
                 .arg(b"")
@@ -737,7 +735,7 @@ mod tests {
     async fn a_read_inside_a_batch_gets_the_producer_of_the_batch() {
         use temporalio_streams::{
             proto::{
-                ClientEpoch, ProducerEpoch, StreamData, StreamRecord, producer_epoch::Kind,
+                ClientEpoch, ClientProducer, StreamData, StreamRecord, producer::Kind,
                 stream_record::Item,
             },
             store::Withdrawal,
@@ -758,10 +756,9 @@ mod tests {
             .unwrap();
         let producer = Producer {
             id: "client:unit".to_string(),
-            epoch: Some(ProducerEpoch {
-                kind: Some(Kind::Client(ClientEpoch { attempt: 1 })),
-            }),
-            ..Default::default()
+            kind: Some(Kind::Client(ClientProducer {
+                epoch: Some(ClientEpoch { attempt: 1 }),
+            })),
         };
         let record = StreamRecord {
             item: Some(Item::Data(StreamData {

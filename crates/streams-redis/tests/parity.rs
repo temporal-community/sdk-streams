@@ -20,15 +20,17 @@ use temporalio_common::protos::temporal::api::{
 use temporalio_streams::{
     Reason, StreamResult,
     digest::batch_digest,
+    epoch::producer_run_id,
     ids::{
         StreamKeys, activity_producer_id, client_producer_id, local_activity_producer_id,
         named_client_producer_id, workflow_producer_id,
     },
     memory::MemoryStore,
     proto::{
-        ActivityEpoch, AppendRecord, ClientEpoch, LocalActivityEpoch, Producer, ProducerEpoch,
-        StreamData, StreamRecord, StreamRef, StreamSuperseded, StreamWriter, WorkflowTaskEpoch,
-        producer_epoch::Kind, stream_record,
+        ActivityEpoch, ActivityProducer, AppendRecord, ClientEpoch, ClientProducer,
+        LocalActivityEpoch, LocalActivityProducer, Producer, RunWithdrawal, StreamData,
+        StreamRecord, StreamRef, StreamSuperseded, StreamWriter, WorkflowProducer, WorkflowTaskEpoch,
+        producer::Kind, stream_record,
     },
     store::{
         Batch, ConflictPolicy, Create, CreateOutcome, Entry, Owner, Store, TaskFacts, Withdrawal,
@@ -126,35 +128,41 @@ impl Rng {
 /// withdrawals of a newer epoch run. The run `r1` is a retry of `r0`, and its Local Activities
 /// come from three Workflow Tasks, so that the task facts withdraw and fence them.
 fn producers() -> Vec<Producer> {
-    let epoch = |kind| Some(ProducerEpoch { kind: Some(kind) });
     let client = |id: String, attempt| Producer {
         id,
-        epoch: epoch(Kind::Client(ClientEpoch { attempt })),
-        run_id: String::new(),
+        kind: Some(Kind::Client(ClientProducer {
+            epoch: Some(ClientEpoch { attempt }),
+        })),
     };
     let activity = |run: &str, attempt| Producer {
         id: activity_producer_id(run, "a", "s"),
-        epoch: epoch(Kind::Activity(ActivityEpoch {
-            attempt_scheduled_time: Some(prost_types::Timestamp {
-                seconds: 100 + i64::from(attempt),
-                nanos: 0,
+        kind: Some(Kind::Activity(ActivityProducer {
+            run_id: run.to_string(),
+            epoch: Some(ActivityEpoch {
+                attempt_scheduled_time: Some(prost_types::Timestamp {
+                    seconds: 100 + i64::from(attempt),
+                    nanos: 0,
+                }),
+                attempt,
             }),
-            attempt,
         })),
-        run_id: run.to_string(),
     };
     let local_activity = |run: &str, started: i64, attempt| Producer {
         id: local_activity_producer_id(run, &format!("call-{started}")),
-        epoch: epoch(Kind::LocalActivity(LocalActivityEpoch {
-            task: Some(task(started)),
-            attempt,
+        kind: Some(Kind::LocalActivity(LocalActivityProducer {
+            run_id: run.to_string(),
+            epoch: Some(LocalActivityEpoch {
+                task: Some(task(started)),
+                attempt,
+            }),
         })),
-        run_id: run.to_string(),
     };
     let workflow = Producer {
         id: workflow_producer_id("r1"),
-        epoch: epoch(Kind::Workflow(WorkflowTaskEpoch::default())),
-        run_id: "r1".to_string(),
+        kind: Some(Kind::Workflow(WorkflowProducer {
+            run_id: "r1".to_string(),
+            epoch: Some(WorkflowTaskEpoch::default()),
+        })),
     };
     let me = || client_producer_id("me", "p1");
     vec![
@@ -447,8 +455,8 @@ impl Seed {
                     8 => last - 1,
                     _ => self.rng.pick(&[1, MAX_SEQUENCE, MAX_SEQUENCE + 1, -1]),
                 };
-                let run = self.producers[producer].run_id.as_str();
-                let facts = match self.producers[producer].epoch.and_then(|epoch| epoch.kind) {
+                let run = producer_run_id(&self.producers[producer]);
+                let facts = match self.producers[producer].kind.as_ref() {
                     Some(Kind::LocalActivity(_)) if self.rng.below(3) != 0 => Some(Facts {
                         completed: self.rng.pick(&[None, Some(3), Some(5)]),
                         failed: self.rng.pick(&[&[][..], &[3], &[5], &[3, 5]]).to_vec(),
@@ -515,10 +523,10 @@ impl Seed {
                 let withdraw_run = if *withdraws { "r0" } else { "" };
                 let workflow = Producer {
                     id: workflow_producer_id("r1"),
-                    epoch: Some(ProducerEpoch {
-                        kind: Some(Kind::Workflow(WorkflowTaskEpoch::default())),
-                    }),
-                    run_id: "r1".to_string(),
+                    kind: Some(Kind::Workflow(WorkflowProducer {
+                        run_id: "r1".to_string(),
+                        epoch: Some(WorkflowTaskEpoch::default()),
+                    })),
                 };
                 let superseded = superseded(&workflow, withdraw_run);
                 let create = Create {
@@ -697,8 +705,10 @@ fn superseded(producer: &Producer, withdraw_run: &str) -> Vec<u8> {
     StreamSuperseded {
         writer: Some(StreamWriter {
             producer: Some(producer.clone()),
-            withdraw_run: withdraw_run.to_string(),
-            ..Default::default()
+            withdrawal: Some(RunWithdrawal {
+                withdraw_run: withdraw_run.to_string(),
+                ..Default::default()
+            }),
         }),
     }
     .encode_to_vec()
@@ -711,22 +721,25 @@ fn task_superseded(
     completed: Option<WorkflowTaskEpoch>,
     failed: &[i64],
 ) -> Vec<u8> {
-    let task = match producer.epoch.and_then(|epoch| epoch.kind) {
-        Some(Kind::LocalActivity(epoch)) => epoch.task,
+    let task = match producer.kind.as_ref() {
+        Some(Kind::LocalActivity(la)) => la.epoch.as_ref().and_then(|epoch| epoch.task),
         _ => None,
     };
+    let run = producer_run_id(producer);
     StreamSuperseded {
         writer: Some(StreamWriter {
             producer: Some(Producer {
-                id: workflow_producer_id(&producer.run_id),
-                epoch: Some(ProducerEpoch {
-                    kind: task.map(Kind::Workflow),
-                }),
-                run_id: producer.run_id.clone(),
+                id: workflow_producer_id(run),
+                kind: Some(Kind::Workflow(WorkflowProducer {
+                    run_id: run.to_string(),
+                    epoch: task,
+                })),
             }),
-            previous_completed_task: completed,
-            failed_tasks: failed.to_vec(),
-            ..Default::default()
+            withdrawal: Some(RunWithdrawal {
+                previous_completed_task: completed,
+                failed_tasks: failed.to_vec(),
+                ..Default::default()
+            }),
         }),
     }
     .encode_to_vec()
