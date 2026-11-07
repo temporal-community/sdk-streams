@@ -29,8 +29,8 @@ use temporalio_streams::{
     proto::{
         ActivityEpoch, ActivityProducer, AppendRecord, ClientEpoch, ClientProducer,
         LocalActivityEpoch, LocalActivityProducer, Producer, RunWithdrawal, StreamData,
-        StreamRecord, StreamRef, StreamSuperseded, StreamWriter, WorkflowProducer, WorkflowTaskEpoch,
-        producer::Kind, stream_record,
+        StreamRecord, StreamRef, StreamSuperseded, StreamWriter, WorkflowProducer,
+        WorkflowTaskEpoch, producer::Kind, stream_record,
     },
     store::{
         Batch, ConflictPolicy, Create, CreateOutcome, Entry, Owner, Store, TaskFacts, Withdrawal,
