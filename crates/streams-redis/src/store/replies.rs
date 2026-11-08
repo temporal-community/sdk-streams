@@ -11,14 +11,12 @@ use temporalio_streams::{
     store::{Appended, Closed, CreateOutcome, Created, StreamState},
 };
 
-/// The answer of `create.lua`, `[outcome, Retention ms, flag]`. The flag is set when the create
-/// withdrew a previous run's Records.
+/// The answer of `create.lua`, `[outcome, Retention ms]`.
 pub(super) struct CreateReply(pub(super) Created);
 
 impl FromRedisValue for CreateReply {
     fn from_redis_value(value: Value) -> Result<Self, ParsingError> {
-        let (outcome, retention, Flag(flagged)): (String, u64, Flag) =
-            FromRedisValue::from_redis_value(value)?;
+        let (outcome, retention): (String, u64) = FromRedisValue::from_redis_value(value)?;
         let outcome = match outcome.as_str() {
             "created" => CreateOutcome::Created,
             "exists" => CreateOutcome::Exists,
@@ -27,18 +25,17 @@ impl FromRedisValue for CreateReply {
         Ok(Self(Created {
             outcome,
             retention: Duration::from_millis(retention),
-            flagged,
         }))
     }
 }
 
-/// The answer of `append.lua`, `[outcome, first id, last id, flag]`. A batch that wrote no entry
-/// gives `''` for both ids.
+/// The answer of `append.lua`, `[outcome, first id, last id]`. A batch that wrote no entry gives
+/// `''` for both ids.
 pub(super) struct AppendReply(pub(super) Appended);
 
 impl FromRedisValue for AppendReply {
     fn from_redis_value(value: Value) -> Result<Self, ParsingError> {
-        let (outcome, first, last, Flag(flagged)): (String, String, String, Flag) =
+        let (outcome, first, last): (String, String, String) =
             FromRedisValue::from_redis_value(value)?;
         let resend = match outcome.as_str() {
             "ok" => false,
@@ -49,11 +46,7 @@ impl FromRedisValue for AppendReply {
             ("", "") => None,
             (first, last) => Some((offset(first)?, offset(last)?)),
         };
-        Ok(Self(Appended {
-            offsets,
-            resend,
-            flagged,
-        }))
+        Ok(Self(Appended { offsets, resend }))
     }
 }
 
@@ -174,19 +167,6 @@ fn offset(id: &str) -> Result<i64, ParsingError> {
     offset_of_entry_id(id).map_err(|error| error.to_string().into())
 }
 
-/// A script's flag, `1` when set and `''` otherwise.
-struct Flag(bool);
-
-impl FromRedisValue for Flag {
-    fn from_redis_value(value: Value) -> Result<Self, ParsingError> {
-        match String::from_redis_value(value)?.as_str() {
-            "1" => Ok(Self(true)),
-            "" => Ok(Self(false)),
-            other => Err(format!("a script gave the unknown flag {other:?}").into()),
-        }
-    }
-}
-
 fn unknown(script: &str, answer: &str) -> ParsingError {
     format!("the {script} script gave the unknown answer {answer:?}").into()
 }
@@ -206,31 +186,27 @@ mod tests {
 
     #[test]
     fn a_script_answer_decodes_only_in_its_known_forms() {
+        let AppendReply(appended) = AppendReply::from_redis_value(answer(&["ok", "", ""])).unwrap();
+        assert_eq!((appended.offsets, appended.resend), (None, false));
         let AppendReply(appended) =
-            AppendReply::from_redis_value(answer(&["ok", "", "", ""])).unwrap();
-        assert_eq!(
-            (appended.offsets, appended.resend, appended.flagged),
-            (None, false, false)
-        );
-        let AppendReply(appended) =
-            AppendReply::from_redis_value(answer(&["resend", "1-0", "1-2", "1"])).unwrap();
-        assert!(appended.offsets.is_some() && appended.resend && appended.flagged);
+            AppendReply::from_redis_value(answer(&["resend", "1-0", "1-2"])).unwrap();
+        assert!(appended.offsets.is_some() && appended.resend);
         for items in [
-            &["done", "", "", ""][..],
-            &["ok", "1-0", "", ""],
-            &["ok", "", "", "yes"],
-            &["ok", "", ""],
+            &["done", "", ""][..],
+            &["ok", "1-0", ""],
+            &["ok", "", "", ""],
+            &["ok", ""],
         ] {
             assert!(
                 AppendReply::from_redis_value(answer(items)).is_err(),
                 "{items:?}"
             );
         }
-        assert!(CreateReply::from_redis_value(answer(&["made", "1000", ""])).is_err());
-        assert!(CreateReply::from_redis_value(answer(&["created", "1000"])).is_err());
+        assert!(CreateReply::from_redis_value(answer(&["made", "1000"])).is_err());
+        assert!(CreateReply::from_redis_value(answer(&["exists", "1000", "1"])).is_err());
         let CreateReply(created) =
-            CreateReply::from_redis_value(answer(&["exists", "1000", "1"])).unwrap();
-        assert!(created.flagged);
+            CreateReply::from_redis_value(answer(&["exists", "1000"])).unwrap();
+        assert_eq!(created.retention, Duration::from_millis(1000));
         assert!(CloseReply::from_redis_value(answer(&["closed", "x"])).is_err());
     }
 

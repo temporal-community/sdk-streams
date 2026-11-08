@@ -13,14 +13,13 @@ use temporalio_streams::{
     Reason,
     digest::batch_digest,
     epoch::ProducerKind,
-    ids::{StreamKeys, client_producer_id, local_activity_producer_id},
+    ids::{StreamKeys, client_producer_id},
     offset::offset_of_entry_id,
     proto::{
-        AppendRecord, ClientEpoch, ClientProducer, LocalActivityEpoch, LocalActivityProducer,
-        Producer, StreamData, StreamRecord, StreamRef, WorkflowTaskEpoch, producer::Kind,
-        stream_record::Item,
+        AppendRecord, ClientEpoch, ClientProducer, Producer, StreamData, StreamRecord, StreamRef,
+        producer::Kind, stream_record::Item,
     },
-    store::{Batch, ConflictPolicy, Create, Owner, Store, TaskFacts, Withdrawal},
+    store::{Batch, Create, Store},
 };
 use temporalio_streams_redis::{
     RedisStore, RedisStoreError, RedisStoreOptions, Topology, WaitOptions,
@@ -135,32 +134,6 @@ fn client_named(process: &str) -> Producer {
     }
 }
 
-/// The Workflow Task of a run that starts at the event `started`.
-fn task(started: i64) -> WorkflowTaskEpoch {
-    WorkflowTaskEpoch {
-        started_event_id: started,
-        attempt: 1,
-        started_time: Some(prost_types::Timestamp {
-            seconds: started,
-            nanos: 0,
-        }),
-    }
-}
-
-/// A Local Activity of the run `run`, dispatched by `task`.
-fn local_activity(run: &str, task: &WorkflowTaskEpoch) -> Producer {
-    Producer {
-        id: local_activity_producer_id(run, &format!("call-{}", task.started_event_id)),
-        kind: Some(Kind::LocalActivity(LocalActivityProducer {
-            run_id: run.to_string(),
-            epoch: Some(LocalActivityEpoch {
-                task: Some(*task),
-                attempt: 1,
-            }),
-        })),
-    }
-}
-
 #[tokio::test]
 #[ignore = "needs Redis"]
 async fn the_documented_commands_run_every_call_of_each_role() {
@@ -191,7 +164,6 @@ async fn the_documented_commands_run_every_call_of_each_role() {
         sequence: 1,
         records: &stored,
         digest,
-        withdrawal: Withdrawal::default(),
     };
     let appended = producer.append(&namespace, &handle, &batch).await.unwrap();
     let (first, _) = appended.offsets.unwrap();
@@ -237,58 +209,6 @@ async fn the_documented_commands_run_every_call_of_each_role() {
         .await
         .unwrap();
 
-    // An orphan append and a retry run's create run with the Producer's commands too.
-    let retry = StreamRef {
-        id: "retry".to_string(),
-        ..Default::default()
-    };
-    producer
-        .create(&namespace, &retry, &Create::default())
-        .await
-        .unwrap();
-    let la_append = |task: &WorkflowTaskEpoch, completed, failed: &'static [i64]| {
-        let (producer, namespace, retry) = (&producer, &namespace, &retry);
-        let (records, digest) = (&stored, digest);
-        let la = local_activity("r0", task);
-        async move {
-            let facts = TaskFacts {
-                completed,
-                failed_tasks: failed,
-                superseded: b"facts",
-            };
-            let batch = Batch {
-                producer: &la,
-                sequence: 1,
-                records,
-                digest,
-                withdrawal: Withdrawal {
-                    tasks: Some(facts),
-                    ..Withdrawal::default()
-                },
-            };
-            producer.append(namespace, retry, &batch).await.unwrap()
-        }
-    };
-    let (failed, completed, next) = (task(3), task(5), task(7));
-    la_append(&failed, None, &[]).await;
-    let orphan = la_append(&next, Some(&completed), &[3]).await;
-    assert!(orphan.flagged);
-    // The retry run's create uses the Stream that the first run made.
-    let withdraw = Create {
-        conflict: ConflictPolicy::UseExisting,
-        withdrawal: Withdrawal {
-            withdraw_run: "r0",
-            superseded: b"run",
-            tasks: None,
-        },
-        ..Create::default()
-    };
-    let created = producer
-        .create(&namespace, &retry, &withdraw)
-        .await
-        .unwrap();
-    assert!(created.flagged);
-
     // An append trims the Records older than the Retention, and prunes the Producers with no
     // append for one Retention. The scripts read the server's `TIME`, so raw writes age an entry
     // and a Producer, and the case doesn't wait.
@@ -297,14 +217,13 @@ async fn the_documented_commands_run_every_call_of_each_role() {
         ..Default::default()
     };
     let retention = Duration::from_secs(60);
-    // A Workflow Stream has the safety TTL, so it doesn't expire with the Retention.
+    // An open Stream has the safety TTL, so it doesn't expire with the Retention.
     producer
         .create(
             &namespace,
             &short,
             &Create {
                 retention: Some(retention),
-                owner: Owner::Workflow,
                 ..Create::default()
             },
         )
@@ -565,7 +484,6 @@ async fn the_documented_commands_serve_a_cluster_while_a_slot_moves() {
         sequence,
         records: &stored,
         digest,
-        withdrawal: Withdrawal::default(),
     };
     producer
         .create(&namespace, &handle, &Create::default())

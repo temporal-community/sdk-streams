@@ -69,7 +69,6 @@ pub(super) enum Body {
 pub(super) struct LogEntry {
     pub(super) offset: i64,
     pub(super) body: Body,
-    superseded: Option<Vec<u8>>,
 }
 
 /// An entry of an `XRANGE` reply, `[id, [field, value, ...]]`. `docs/redis.md` has the fields.
@@ -98,11 +97,7 @@ impl FromRedisValue for LogEntry {
             },
             _ => return Err(format!("{id} has batch fields that don't fit together").into()),
         };
-        Ok(Self {
-            offset,
-            body,
-            superseded: fields.remove("s"),
-        })
+        Ok(Self { offset, body })
     }
 }
 
@@ -132,7 +127,6 @@ pub(super) fn with_producers(
             Ok(Entry {
                 offset: entry.offset,
                 record,
-                superseded: entry.superseded,
             })
         })
         .collect()
@@ -175,11 +169,7 @@ mod tests {
     }
 
     fn entry(seq: i64, body: Body) -> LogEntry {
-        LogEntry {
-            offset: seq,
-            body,
-            superseded: None,
-        }
+        LogEntry { offset: seq, body }
     }
 
     #[test]

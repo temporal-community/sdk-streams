@@ -11,20 +11,20 @@ use conn::{BlockingPool, Endpoint, Leased, Origin, Settled, SharedConnection, Wa
 use prost::Message;
 use records::{with_producers, without_producer};
 use redis::{
-    Cmd, ErrorKind, FromRedisValue, InfoDict, Pipeline, RedisError, RedisResult, RedisWrite,
-    Script, ServerErrorKind, ToRedisArgs, Value,
+    Cmd, ErrorKind, FromRedisValue, InfoDict, Pipeline, RedisError, RedisResult, Script,
+    ServerErrorKind, Value,
 };
 use replies::{AppendReply, CloseReply, CreateReply, ReadBackReply, ReadReply};
 use std::{collections::HashMap, num::NonZeroUsize, sync::Arc, time::Duration};
 use temporalio_streams::{
     StreamResult,
-    epoch::{ProducerKind, TASK_KEY_LEN, epoch_key, producer_run_id, task_key, task_of},
-    ids::{StreamKeys, encode_part},
+    epoch::{ProducerKind, epoch_key},
+    ids::StreamKeys,
     offset::entry_id_of_offset,
-    proto::{Producer, StreamRef, WorkflowTaskEpoch},
+    proto::{Producer, StreamRef},
     store::{
         Appended, Batch, Capabilities, Closed, ConflictPolicy, Create, Created, Entry,
-        FORMAT_VERSION, MAX_TTL, Owner, Store, StreamState, TOMBSTONE, TaskFacts, owner_chain,
+        FORMAT_VERSION, MAX_TTL, Store, StreamState, TOMBSTONE,
     },
 };
 use tokio::time::Instant;
@@ -162,9 +162,7 @@ impl Store for RedisStore {
         Capabilities::ALL
     }
 
-    /// Creates a Stream, or finds it. A retry run's create withdraws its previous run. A
-    /// Workflow-owned Stream stores its ref's run chain, which later creates and closes must
-    /// match.
+    /// Creates a Stream, or finds it.
     async fn create(
         &self,
         namespace: &str,
@@ -174,20 +172,12 @@ impl Store for RedisStore {
         let keys = self.keys(namespace, &stream_ref.id);
         let retention = create.retention.filter(|r| !r.is_zero());
         let retention = retention.unwrap_or(self.retention);
-        let (owner, chain) = match create.owner {
-            Owner::Workflow => ("wf", owner_chain(stream_ref)),
-            Owner::Client => ("client", String::new()),
-        };
         let mut call = ScriptCall::write(&scripts::CREATE_SCRIPT, &keys);
         call.cmd
             .arg(FORMAT_VERSION)
             .arg(retention.as_millis())
-            .arg(owner)
             .arg(self.safety_ttl.as_millis())
             .arg(TOMBSTONE.as_millis())
-            .arg(encode_part(create.withdrawal.withdraw_run))
-            .arg(create.withdrawal.superseded)
-            .arg(chain)
             .arg(create.request_id)
             .arg(create.conflict == ConflictPolicy::UseExisting)
             .arg(self.wait.is_some());
@@ -204,20 +194,15 @@ impl Store for RedisStore {
         let keys = self.keys(namespace, &stream_ref.id);
         let producer = batch.producer;
         let kind = ProducerKind::try_from(producer)?;
-        let withdrawal = &batch.withdrawal;
         let mut call = ScriptCall::write(&scripts::APPEND_SCRIPT, &keys);
         call.cmd
             .arg(FORMAT_VERSION)
             .arg(kind as i32)
             .arg(&producer.id)
-            .arg(encode_part(producer_run_id(producer)))
             .arg(&epoch_key(producer.kind.as_ref())[..])
             .arg(batch.sequence)
-            .arg(encode_part(withdrawal.withdraw_run))
-            .arg(withdrawal.superseded)
             .arg(self.safety_ttl.as_millis())
             .arg(TOMBSTONE.as_millis())
-            .arg(TaskArgs::of(kind, batch))
             .arg(&batch.digest[..])
             .arg(self.wait.is_some())
             .arg(producer.encode_to_vec());
@@ -228,8 +213,8 @@ impl Store for RedisStore {
         Ok(appended)
     }
 
-    /// Closes a Stream, if the Producer's kind and the ref's run chain are the owner's. The close
-    /// writes no entry, so it adds one to the `:closed` key, which wakes the blocked reads.
+    /// Closes a Stream. The close writes no entry, so it adds one to the `:closed` key, which wakes
+    /// the blocked reads.
     async fn close(
         &self,
         namespace: &str,
@@ -244,10 +229,8 @@ impl Store for RedisStore {
             .arg(FORMAT_VERSION)
             .arg(ProducerKind::try_from(producer)? as i32)
             .arg(&producer.id)
-            .arg(encode_part(producer_run_id(producer)))
             .arg(&epoch_key(producer.kind.as_ref())[..])
             .arg(TOMBSTONE.as_millis())
-            .arg(owner_chain(stream_ref))
             .arg(self.wait.is_some())
             // The closer, which a read builds the final StreamClose item from.
             .arg(producer.encode_to_vec());
@@ -410,63 +393,6 @@ async fn write_replies(pipe: &Pipeline, conn: &mut SharedConnection) -> RedisRes
     })
 }
 
-/// What an append batch gives the script about its Workflow Task.
-enum TaskArgs<'a> {
-    /// The batch isn't of a Local Activity of a run, so the script tracks no task.
-    Untracked,
-    /// A Local Activity's task, with no task facts, as from an older Core.
-    Task([u8; TASK_KEY_LEN]),
-    /// A Local Activity's task, with the run's task facts.
-    Facts {
-        task: [u8; TASK_KEY_LEN],
-        facts: TaskFacts<'a>,
-    },
-}
-
-impl<'a> TaskArgs<'a> {
-    fn of(kind: ProducerKind, batch: &Batch<'a>) -> Self {
-        let producer = batch.producer;
-        if kind != ProducerKind::LocalActivity || producer_run_id(producer).is_empty() {
-            return Self::Untracked;
-        }
-        let task = task_key(&task_of(producer.kind.as_ref()));
-        match batch.withdrawal.tasks {
-            None => Self::Task(task),
-            Some(facts) => Self::Facts { task, facts },
-        }
-    }
-}
-
-/// The four task arguments of `append.lua`. These are the task key, the completed task key, the
-/// failed tasks' started event ids, 8 bytes each, and the task Superseded facts. With no task
-/// facts, the completed task is empty, and before the run's first completed task it is the zero
-/// key.
-impl ToRedisArgs for TaskArgs<'_> {
-    fn write_redis_args<W: ?Sized + RedisWrite>(&self, out: &mut W) {
-        let (task, facts) = match self {
-            Self::Untracked => (&[][..], None),
-            Self::Task(task) => (&task[..], None),
-            Self::Facts { task, facts } => (&task[..], Some(facts)),
-        };
-        out.write_arg(task);
-        let Some(facts) = facts else {
-            for _ in 0..3 {
-                out.write_arg(b"");
-            }
-            return;
-        };
-        let zero = WorkflowTaskEpoch::default();
-        out.write_arg(&task_key(facts.completed.unwrap_or(&zero)));
-        let failed: Vec<u8> = facts
-            .failed_tasks
-            .iter()
-            .flat_map(|id| id.to_be_bytes())
-            .collect();
-        out.write_arg(&failed);
-        out.write_arg(facts.superseded);
-    }
-}
-
 /// A value that Redis keeps or answers and that the Store can't decode.
 fn corrupt(what: &str, error: impl std::fmt::Display) -> RedisStoreError {
     RedisStoreError::corrupt(format!("{what} doesn't decode: {error}"))
@@ -617,7 +543,6 @@ fn check_version(node: &Origin, info: &InfoDict) -> RedisStoreResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use temporalio_streams::{Reason, StreamError, store::DEFAULT_SAFETY_TTL};
 
     #[test]
     fn a_server_before_redis_7_is_refused() {
@@ -666,81 +591,10 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "needs Redis"]
-    async fn bad_task_facts_are_refused_before_the_first_write() {
-        let mut options = RedisStoreOptions::new(crate::testing::standalone_url());
-        options.key_prefix = "streams-unit".parse().unwrap();
-        let store = RedisStore::connect(options).await.unwrap();
-        let namespace = format!("ns-{}", std::process::id());
-        // The script is the format that every SDK calls, so these are arguments that no Rust type
-        // can build. They are a task key of another length, a completed task key of another
-        // length, and failed ids that aren't 8 bytes each.
-        let zero = task_key(&Default::default());
-        let cases: [(&[u8], &[u8], &[u8]); 3] = [
-            (b"zz", &zero, b""),
-            (&zero, b"zz", b""),
-            (&zero, &zero, b"abc"),
-        ];
-        for (i, (task, completed, failed)) in cases.into_iter().enumerate() {
-            let handle = StreamRef {
-                id: format!("s{i}"),
-                ..Default::default()
-            };
-            store
-                .create(&namespace, &handle, &Create::default())
-                .await
-                .unwrap();
-            let keys = store.keys(&namespace, &handle.id);
-            let mut shared = store.shared.clone();
-            let _: () = redis::cmd("HSET")
-                .arg(keys.meta())
-                .arg("run|r0")
-                .arg("1")
-                .query_async(&mut shared)
-                .await
-                .unwrap();
-            // A Local Activity of run r1 that withdraws r0, with one malformed task fact.
-            let mut call = ScriptCall::write(&scripts::APPEND_SCRIPT, &keys);
-            call.cmd
-                .arg(FORMAT_VERSION)
-                .arg(ProducerKind::LocalActivity as i32)
-                .arg("la")
-                .arg("r1")
-                .arg(&epoch_key(None)[..])
-                .arg(1)
-                .arg("r0")
-                .arg(b"")
-                .arg(DEFAULT_SAFETY_TTL.as_millis())
-                .arg(TOMBSTONE.as_millis())
-                .arg(task)
-                .arg(completed)
-                .arg(failed)
-                .arg(b"")
-                .arg(&[0; 16][..])
-                .arg("")
-                .arg(b"")
-                .arg(b"r");
-            let error = call.run(&mut shared).await.unwrap_err();
-            let error = StreamError::from(RedisStoreError::from(error));
-            assert_eq!(error.reason, Reason::Invalid, "{error}");
-            let fence: Option<String> = redis::cmd("HGET")
-                .arg(keys.meta())
-                .arg("wr|r0")
-                .query_async(&mut shared)
-                .await
-                .unwrap();
-            assert_eq!(fence, None);
-        }
-    }
-
-    #[tokio::test]
-    #[ignore = "needs Redis"]
     async fn a_read_inside_a_batch_gets_the_producer_of_the_batch() {
-        use temporalio_streams::{
-            proto::{
-                ClientEpoch, ClientProducer, StreamData, StreamRecord, producer::Kind,
-                stream_record::Item,
-            },
-            store::Withdrawal,
+        use temporalio_streams::proto::{
+            ClientEpoch, ClientProducer, StreamData, StreamRecord, producer::Kind,
+            stream_record::Item,
         };
         let mut options = RedisStoreOptions::new(crate::testing::standalone_url());
         options.key_prefix = "streams-unit".parse().unwrap();
@@ -776,7 +630,6 @@ mod tests {
             sequence: 1,
             records: &records,
             digest: [0; 16],
-            withdrawal: Withdrawal::default(),
         };
         let (first, last) = store
             .append(&namespace, &handle, &batch)

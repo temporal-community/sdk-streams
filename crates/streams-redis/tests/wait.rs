@@ -6,7 +6,7 @@ use std::{num::NonZeroUsize, time::Duration};
 use temporalio_streams::{
     Reason,
     proto::{ClientEpoch, ClientProducer, Producer, StreamRecord, StreamRef, producer::Kind},
-    store::{Batch, Create, CreateOutcome, Store, Withdrawal},
+    store::{Batch, Create, CreateOutcome, Store},
 };
 use temporalio_streams_redis::{
     RedisStore, RedisStoreOptions, Topology, WaitOptions,
@@ -271,7 +271,6 @@ async fn a_call_that_finds_its_write_waits_for_the_replicas() {
     for _ in 0..3 {
         waits.push(store(&standalone, wait_for(replicas.len(), SHORT)).await);
     }
-    let none = Withdrawal::default;
     let producer = client();
     let records = [StreamRecord::default().encode_to_vec()];
     let batch = Batch {
@@ -279,7 +278,6 @@ async fn a_call_that_finds_its_write_waits_for_the_replicas() {
         sequence: 1,
         records: &records,
         digest: [0; 16],
-        withdrawal: none(),
     };
     let other = StreamRef {
         id: "other".to_string(),
