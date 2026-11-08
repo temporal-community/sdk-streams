@@ -34,6 +34,8 @@ form, and the `testdata/` of `temporalio-streams` has its test vectors.
 | `exp` | When the Stream stops taking writes, in ms since 1970 |
 | `rid` | The request id of the create that made the Stream, absent when it gave none |
 | `closed` | Set by the close |
+| `closer` | The encoded Producer that closed the Stream, which a read builds the close item from |
+| `cstat` | The close status, `1` for CLOSED, which a Brook Store is the only one it sets |
 | `newest` | The entry id of the newest entry |
 | `trimmed` | The entry id of the newest entry that Retention or the log's expiry dropped |
 | `p\|<kind>\|<producer id>` | The Producer's fence, held epoch and last batch, 129 bytes |

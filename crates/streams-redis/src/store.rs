@@ -248,7 +248,9 @@ impl Store for RedisStore {
             .arg(&epoch_key(producer.kind.as_ref())[..])
             .arg(TOMBSTONE.as_millis())
             .arg(owner_chain(stream_ref))
-            .arg(self.wait.is_some());
+            .arg(self.wait.is_some())
+            // The closer, which a read builds the final StreamClose item from.
+            .arg(producer.encode_to_vec());
         let CloseReply(closed) = self.write(&call).await?;
         Ok(closed)
     }

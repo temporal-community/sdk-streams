@@ -89,6 +89,8 @@ type MetaFields = (
     Option<String>,
     Option<u64>,
     Option<i64>,
+    Option<Vec<u8>>,
+    Option<i32>,
 );
 
 impl FromRedisValue for ReadReply {
@@ -97,11 +99,16 @@ impl FromRedisValue for ReadReply {
             FromRedisValue::from_redis_value(value)?;
         let earlier = earlier(&producer)?;
         let now_ms = seconds * 1000 + micros / 1000;
-        let (version, closed, newest, trimmed, retention, expires) = meta;
+        let (version, closed, newest, trimmed, retention, expires, closer, cstat) = meta;
         // A create sets `v`, `ret` and `exp` together, so a Stream with no `v` doesn't exist.
         let Some(version) = version else {
             let texts = [&closed, &newest, &trimmed];
-            if texts.iter().any(|text| text.is_some()) || retention.is_some() || expires.is_some() {
+            if texts.iter().any(|text| text.is_some())
+                || retention.is_some()
+                || expires.is_some()
+                || closer.is_some()
+                || cstat.is_some()
+            {
                 return Err("a Stream has meta fields but no format version".into());
             }
             return Ok(Self {
@@ -119,6 +126,8 @@ impl FromRedisValue for ReadReply {
             exists: true,
             version,
             closed: closed.is_some(),
+            closer,
+            close_status: cstat.unwrap_or(0),
             newest: offset_or_zero(newest)?,
             trimmed: offset_or_zero(trimmed)?,
             retention: Duration::from_millis(retention.ok_or("a Stream has no Retention")?),
@@ -223,5 +232,42 @@ mod tests {
             CreateReply::from_redis_value(answer(&["exists", "1000", "1"])).unwrap();
         assert!(created.flagged);
         assert!(CloseReply::from_redis_value(answer(&["closed", "x"])).is_err());
+    }
+
+    /// A read reply of a closed Stream carries the closer and the status, so a read builds the
+    /// final close item from them.
+    #[test]
+    fn a_read_reply_carries_the_closer_and_the_status() {
+        use temporalio_streams::proto::{ClientEpoch, ClientProducer, producer::Kind};
+        let producer = Producer {
+            id: "client:me".to_string(),
+            kind: Some(Kind::Client(ClientProducer {
+                epoch: Some(ClientEpoch { attempt: 1 }),
+            })),
+        };
+        let closer = producer.encode_to_vec();
+        let meta = Value::Array(vec![
+            Value::BulkString(b"1".to_vec()),
+            Value::BulkString(b"1".to_vec()),
+            Value::BulkString(b"5-0".to_vec()),
+            Value::Nil,
+            Value::BulkString(b"1000".to_vec()),
+            Value::BulkString(b"123".to_vec()),
+            Value::BulkString(closer.clone()),
+            Value::BulkString(b"1".to_vec()),
+        ]);
+        let reply = Value::Array(vec![
+            meta,
+            Value::Array(vec![
+                Value::BulkString(b"0".to_vec()),
+                Value::BulkString(b"0".to_vec()),
+            ]),
+            Value::Array(vec![]),
+            Value::BulkString(vec![]),
+        ]);
+        let ReadReply { state, .. } = ReadReply::from_redis_value(reply).unwrap();
+        assert!(state.closed);
+        assert_eq!(state.close_status, 1);
+        assert_eq!(state.closer.as_deref(), Some(closer.as_slice()));
     }
 }
