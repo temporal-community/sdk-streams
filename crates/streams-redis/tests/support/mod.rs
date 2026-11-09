@@ -10,7 +10,7 @@ use temporalio_streams::{
     testing::{Needs, RawKeys, TestBackend},
 };
 use temporalio_streams_redis::{
-    RedisStore, RedisStoreOptions, RedisStreamRuntime, Topology, WaitOptions,
+    RedisStore, RedisStoreOptions, RedisStreamRuntime, Topology, Url, WaitOptions,
     proto::RedisStreamConfig,
     testing::{cluster_url, standalone_url},
 };
@@ -25,19 +25,19 @@ pub(crate) fn standalone() -> Vec<Arc<dyn TestBackend>> {
         has_replica(&url),
         "the server at STREAMS_REDIS_URL needs a replica"
     );
-    backends(Topology::Standalone(url))
+    backends(Topology::Standalone(url.parse().unwrap()))
 }
 
 /// The backends of the cluster, with `WAIT` on each primary's replica and with none.
 pub(crate) fn cluster() -> Vec<Arc<dyn TestBackend>> {
     backends(Topology::Cluster {
-        first: cluster_url(),
+        first: cluster_url().parse().unwrap(),
         rest: Vec::new(),
     })
 }
 
 // Each write of the first backend goes through the `WAIT` pipeline, refusals too.
-fn backends(topology: Topology) -> Vec<Arc<dyn TestBackend>> {
+fn backends(topology: Topology<Url>) -> Vec<Arc<dyn TestBackend>> {
     let waits = RedisBackend {
         topology: topology.clone(),
         wait: Some(WaitOptions {
@@ -65,7 +65,7 @@ pub(crate) fn has_replica(url: &str) -> bool {
 
 /// The Redis of a backend, and its `WAIT`, if any.
 pub(crate) struct RedisBackend {
-    topology: Topology,
+    topology: Topology<Url>,
     wait: Option<WaitOptions>,
 }
 
@@ -101,7 +101,7 @@ impl TestBackend for RedisBackend {
             nanos: 0,
         };
         let config = RedisStreamConfig {
-            urls: self.topology.servers().cloned().collect(),
+            urls: self.topology.servers().map(|url| url.to_string()).collect(),
             cluster: matches!(self.topology, Topology::Cluster { .. }),
             key_prefix: PREFIX.to_string(),
             backend: backend.to_string(),
@@ -128,7 +128,7 @@ enum Raw {
 }
 
 impl Raw {
-    async fn open(topology: &Topology) -> Self {
+    async fn open(topology: &Topology<Url>) -> Self {
         match topology {
             Topology::Standalone(url) => {
                 let client = redis::Client::open(url.as_str()).unwrap();
@@ -136,7 +136,7 @@ impl Raw {
             }
             Topology::Cluster { .. } => {
                 let client =
-                    redis::cluster::ClusterClient::new(topology.servers().map(String::as_str))
+                    redis::cluster::ClusterClient::new(topology.servers().map(Url::as_str))
                         .unwrap();
                 Raw::Cluster(client.get_async_connection().await.unwrap())
             }

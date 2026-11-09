@@ -6,6 +6,7 @@ use temporalio_streams::{
     ids::{DEFAULT_KEY_PREFIX, encode_part},
     store::{DEFAULT_RETENTION, DEFAULT_SAFETY_TTL},
 };
+use url::Url;
 
 /// Where the Store's Redis is. Each server is a `redis://` or `rediss://` URL, which also sets the
 /// credentials and TLS.
@@ -48,7 +49,7 @@ impl<T> Topology<T> {
 }
 
 // The URLs can hold a password, so the debug form shows them with no user info.
-impl std::fmt::Debug for Topology {
+impl std::fmt::Debug for Topology<Url> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.try_map(|url| Ok::<_, std::convert::Infallible>(redacted(url))) {
             Ok(Topology::Standalone(url)) => f.debug_tuple("Standalone").field(&url).finish(),
@@ -67,7 +68,7 @@ impl std::fmt::Debug for Topology {
 #[non_exhaustive]
 pub struct RedisStoreOptions {
     /// Where the Redis is.
-    pub topology: Topology,
+    pub topology: Topology<Url>,
     /// The prefix of every key.
     pub key_prefix: KeyPrefix,
     /// The Retention of a Stream whose create sets none.
@@ -88,15 +89,22 @@ const DEFAULT_BLOCKING_READS_PER_NODE: NonZeroUsize = match NonZeroUsize::new(25
 };
 
 impl RedisStoreOptions {
-    /// The defaults for one Redis at `url`.
-    pub fn new(url: impl Into<String>) -> Self {
-        Topology::Standalone(url.into()).into()
+    /// The defaults for one Redis at `url`. The URL is parsed now, so a wrong URL fails here, not
+    /// at connect time.
+    pub fn new(url: impl AsRef<str>) -> RedisStoreResult<Self> {
+        Ok(Topology::Standalone(parse_url(url.as_ref())?).into())
     }
 }
 
+/// Parses a server URL once, so the Store carries a typed `Url` and a wrong URL fails early.
+pub(crate) fn parse_url(url: &str) -> RedisStoreResult<Url> {
+    Url::parse(url)
+        .map_err(|error| RedisStoreError::invalid(format!("The Redis URL is wrong. {error}")))
+}
+
 /// The defaults for the Redis at `topology`.
-impl From<Topology> for RedisStoreOptions {
-    fn from(topology: Topology) -> Self {
+impl From<Topology<Url>> for RedisStoreOptions {
+    fn from(topology: Topology<Url>) -> Self {
         Self {
             topology,
             key_prefix: KeyPrefix::default(),
@@ -110,23 +118,17 @@ impl From<Topology> for RedisStoreOptions {
 }
 
 /// The URL with `***` in place of its user info and its query. A socket URL gives its password in
-/// the query.
-fn redacted(url: &str) -> String {
-    // Redact by hand, so the result never shows the password. A Redis socket URL is not a
-    // standard URL. A URL parser can reject it, and a fallback would then show the raw URL. The
-    // hand parse hides the user info and the query for every URL form.
-    let (url, query) = match url.split_once('?') {
-        Some((url, _)) => (url, "?***"),
-        None => (url, ""),
-    };
-    let start = url.find("://").map_or(0, |scheme| scheme + 3);
-    let authority = url[start..]
-        .find('/')
-        .map_or(url.len(), |path| start + path);
-    match url[start..authority].rfind('@') {
-        Some(at) => format!("{}***{}{query}", &url[..start], &url[start + at..]),
-        None => format!("{url}{query}"),
+/// the query, so the query is hidden too.
+fn redacted(url: &Url) -> String {
+    let mut url = url.clone();
+    if !url.username().is_empty() || url.password().is_some() {
+        let _ = url.set_username("***");
+        let _ = url.set_password(None);
     }
+    if url.query().is_some() {
+        url.set_query(Some("***"));
+    }
+    url.to_string()
 }
 
 /// How many replicas must have each write before it answers, with `WAIT`. A write that fewer
@@ -220,7 +222,7 @@ mod tests {
 
     #[test]
     fn the_debug_form_hides_the_user_info_of_a_url() {
-        let options = RedisStoreOptions::new("rediss://user:p@ss@redis.example:6380/0");
+        let options = RedisStoreOptions::new("rediss://user:p@ss@redis.example:6380/0").unwrap();
         let debug = format!("{options:?}");
         assert!(
             !debug.contains("user") && !debug.contains("p@ss"),
@@ -230,9 +232,10 @@ mod tests {
             debug.contains("rediss://***@redis.example:6380/0"),
             "{debug}"
         );
-        assert_eq!(redacted("redis://h:1/0"), "redis://h:1/0");
+        let redact = |url: &str| redacted(&Url::parse(url).unwrap());
+        assert_eq!(redact("redis://h:1/0"), "redis://h:1/0");
         assert_eq!(
-            redacted("redis+unix:///tmp/redis.sock?db=0&pass=secret"),
+            redact("redis+unix:///tmp/redis.sock?db=0&pass=secret"),
             "redis+unix:///tmp/redis.sock?***"
         );
     }

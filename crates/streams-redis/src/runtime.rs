@@ -31,10 +31,13 @@ impl TryFrom<RedisStreamConfig> for RuntimeOptions {
         let first = urls
             .next()
             .ok_or_else(|| RedisStoreError::invalid("The Redis Stream backend needs a URL"))?;
+        let first = crate::options::parse_url(&first)?;
         let topology = match (config.cluster, urls.len()) {
             (true, _) => Topology::Cluster {
                 first,
-                rest: urls.collect(),
+                rest: urls
+                    .map(|url| crate::options::parse_url(&url))
+                    .collect::<RedisStoreResult<_>>()?,
             },
             (false, 0) => Topology::Standalone(first),
             // A standalone Store connects to one server, so the other URLs would have no effect.

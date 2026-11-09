@@ -88,7 +88,7 @@ async fn user(url: &str, name: &str, namespace: &str, role: (&str, &str)) -> Str
 }
 
 async fn store(url: String) -> Box<dyn Store> {
-    store_with(RedisStoreOptions::new(url)).await
+    store_with(RedisStoreOptions::new(url).unwrap()).await
 }
 
 async fn store_with(mut options: RedisStoreOptions) -> Box<dyn Store> {
@@ -275,7 +275,8 @@ async fn the_documented_commands_run_every_call_of_each_role() {
 
     // With `+wait`, too few replicas is a Store failure, not a refusal.
     let mut options =
-        RedisStoreOptions::new(user(&url, &producer_name, &namespace, role(&PRODUCER)).await);
+        RedisStoreOptions::new(user(&url, &producer_name, &namespace, role(&PRODUCER)).await)
+            .unwrap();
     options.wait = Some(WaitOptions {
         replicas: NonZeroUsize::new(16).unwrap(),
         timeout: Duration::from_millis(50),
@@ -296,7 +297,8 @@ async fn the_documented_commands_run_every_call_of_each_role() {
     // Without `+wait`, each write would run its script and then fail, so connect refuses it.
     let no_wait = PRODUCER.1.replace(" +wait", "");
     let no_wait = (PRODUCER.0, no_wait.as_str());
-    let mut options = RedisStoreOptions::new(user(&url, &producer_name, &namespace, no_wait).await);
+    let mut options =
+        RedisStoreOptions::new(user(&url, &producer_name, &namespace, no_wait).await).unwrap();
     options.key_prefix = PREFIX.parse().unwrap();
     options.wait = Some(WaitOptions {
         replicas: NonZeroUsize::MIN,
@@ -470,7 +472,7 @@ async fn the_documented_commands_serve_a_cluster_while_a_slot_moves() {
     }
     let connect = |name: &str| {
         let mut options = RedisStoreOptions::from(Topology::Cluster {
-            first: login(&url, name),
+            first: login(&url, name).parse().unwrap(),
             rest: Vec::new(),
         });
         options.key_prefix = PREFIX.parse().unwrap();

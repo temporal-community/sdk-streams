@@ -25,6 +25,8 @@ pub use error::{RedisStoreError, RedisStoreResult};
 pub use options::{KeyPrefix, RedisStoreOptions, Topology, WaitOptions};
 pub use runtime::{REDIS_RUNTIME_NAME, RedisStreamRuntime, RuntimeOptions};
 pub use store::RedisStore;
+// A server is a parsed URL, so the public API gives the `url::Url` type and its exact version.
+pub use url::Url;
 
 /// The config that lang builds for the Redis runtime.
 pub mod proto {

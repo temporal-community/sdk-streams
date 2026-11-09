@@ -556,7 +556,7 @@ mod tests {
     #[test]
     fn a_wait_timeout_must_leave_half_the_response_timeout() {
         let check = |timeout: Duration| {
-            let mut options = RedisStoreOptions::new("redis://127.0.0.1:1");
+            let mut options = RedisStoreOptions::new("redis://127.0.0.1:1").unwrap();
             options.wait = Some(crate::WaitOptions {
                 replicas: NonZeroUsize::MIN,
                 timeout,
@@ -575,7 +575,7 @@ mod tests {
     #[test]
     fn the_ttls_and_the_response_timeout_must_be_at_least_1_ms() {
         let check = |change: fn(&mut RedisStoreOptions)| {
-            let mut options = RedisStoreOptions::new("redis://127.0.0.1:1");
+            let mut options = RedisStoreOptions::new("redis://127.0.0.1:1").unwrap();
             change(&mut options);
             check_options(&options)
         };
@@ -596,7 +596,7 @@ mod tests {
             ClientEpoch, ClientProducer, StreamData, StreamRecord, producer::Kind,
             stream_record::Item,
         };
-        let mut options = RedisStoreOptions::new(crate::testing::standalone_url());
+        let mut options = RedisStoreOptions::new(crate::testing::standalone_url()).unwrap();
         options.key_prefix = "streams-unit".parse().unwrap();
         let store = RedisStore::connect(options).await.unwrap();
         let (namespace, handle) = (

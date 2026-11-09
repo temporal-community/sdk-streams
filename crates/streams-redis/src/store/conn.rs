@@ -23,6 +23,7 @@ use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore},
     time::Instant,
 };
+use url::Url;
 
 /// How long a blocking read waits for a free connection. Then it returns with no wake, so a read
 /// over the pool's size polls about once a second.
@@ -50,11 +51,11 @@ struct Seed {
     node: Node,
 }
 
-impl FromStr for Seed {
-    type Err = RedisError;
+impl TryFrom<&Url> for Seed {
+    type Error = RedisError;
 
-    fn from_str(url: &str) -> RedisResult<Self> {
-        let info = url.into_connection_info()?;
+    fn try_from(url: &Url) -> RedisResult<Self> {
+        let info = url.clone().into_connection_info()?;
         let node = Node::try_from(&info)?;
         Ok(Self { info, node })
     }
@@ -66,7 +67,7 @@ impl TryFrom<&RedisStoreOptions> for Endpoint {
 
     fn try_from(options: &RedisStoreOptions) -> RedisResult<Self> {
         Ok(Self {
-            topology: options.topology.try_map(|url| url.parse::<Seed>())?,
+            topology: options.topology.try_map(|url| Seed::try_from(url))?,
             response_timeout: options.response_timeout,
         })
     }
@@ -884,18 +885,18 @@ mod tests {
         RedisError::from(std::io::Error::new(kind, "test"))
     }
 
-    fn standalone_at(url: &str) -> Topology {
-        Topology::Standalone(url.to_string())
+    fn standalone_at(url: &str) -> Topology<Url> {
+        Topology::Standalone(url.parse().unwrap())
     }
 
-    fn cluster_at(url: &str) -> Topology {
+    fn cluster_at(url: &str) -> Topology<Url> {
         Topology::Cluster {
-            first: url.to_string(),
+            first: url.parse().unwrap(),
             rest: Vec::new(),
         }
     }
 
-    fn endpoint(topology: Topology) -> Arc<Endpoint> {
+    fn endpoint(topology: Topology<Url>) -> Arc<Endpoint> {
         let options = RedisStoreOptions {
             response_timeout: Duration::from_secs(1),
             ..RedisStoreOptions::from(topology)

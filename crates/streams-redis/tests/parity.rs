@@ -30,7 +30,7 @@ use temporalio_streams::{
     store::{Batch, ConflictPolicy, Create, CreateOutcome, Entry, Store},
 };
 use temporalio_streams_redis::{
-    RedisStore, RedisStoreOptions, Topology, WaitOptions,
+    RedisStore, RedisStoreOptions, Topology, Url, WaitOptions,
     testing::{cluster_url, standalone_url},
 };
 
@@ -47,7 +47,8 @@ const TEXTS: [&str; 5] = ["a", "b", "c", "dd", "eee"];
 #[tokio::test]
 #[ignore = "needs Redis"]
 async fn the_redis_store_answers_as_the_memory_store_on_redis() {
-    let mut options = RedisStoreOptions::from(Topology::Standalone(standalone_url()));
+    let mut options =
+        RedisStoreOptions::from(Topology::Standalone(standalone_url().parse().unwrap()));
     // The `WAIT` pipeline has its own path for script loads and errors.
     options.wait = Some(WaitOptions {
         replicas: std::num::NonZeroUsize::MIN,
@@ -61,7 +62,7 @@ async fn the_redis_store_answers_as_the_memory_store_on_redis() {
 #[ignore = "needs a Redis cluster"]
 async fn the_redis_store_answers_as_the_memory_store_on_a_redis_cluster() {
     run(RedisStoreOptions::from(Topology::Cluster {
-        first: cluster_url(),
+        first: cluster_url().parse().unwrap(),
         rest: Vec::new(),
     }))
     .await;
@@ -632,14 +633,14 @@ enum Raw {
 }
 
 impl Raw {
-    async fn open(topology: &Topology) -> Self {
+    async fn open(topology: &Topology<Url>) -> Self {
         match topology {
             Topology::Standalone(url) => {
                 let client = redis::Client::open(url.as_str()).unwrap();
                 Raw::Standalone(client.get_connection_manager().await.unwrap())
             }
             Topology::Cluster { .. } => {
-                let seeds = topology.servers().map(String::as_str);
+                let seeds = topology.servers().map(Url::as_str);
                 let client = redis::cluster::ClusterClient::new(seeds).unwrap();
                 Raw::Cluster(client.get_async_connection().await.unwrap())
             }
