@@ -1,34 +1,28 @@
 -- Creates the Stream's meta key, or finds it. On a Stream that exists, it refuses one that is
--- expired, has another owner or is closed, in that order. Then a retry of the create that made the
--- Stream gets `created` again. Any other create fails with `ALREADY_EXISTS`, unless it uses the
--- existing Stream.
+-- expired or closed, in that order. Then a retry of the create that made the Stream gets `created`
+-- again. Any other create fails with `ALREADY_EXISTS`, unless it uses the existing Stream.
 --
--- ARGV: format version, Retention ms, owner (`wf` or `client`), safety TTL ms, Tombstone ms, the
--- owner's run chain as `<workflow id>:<first run id>` with each part encoded (empty for a client),
--- the request id (empty for none), `1` when the create uses an existing Stream, `1` when a `WAIT`
--- runs after it.
+-- ARGV: format version, Retention ms, safety TTL ms, Tombstone ms, the request id (empty for none),
+-- `1` when the create uses an existing Stream, `1` when a `WAIT` runs after it.
 --
 -- Returns {outcome, stored Retention ms}. The outcome is `created` or `exists`. A Stream that
 -- exists keeps its own Retention.
 local meta, log, producers = KEYS[1], KEYS[2], KEYS[3]
-local version, retention, owner = tonumber(ARGV[1]), ARGV[2], ARGV[3]
-local safety, tombstone = tonumber(ARGV[4]), tonumber(ARGV[5])
-local chain, request_id, use_existing, wait = ARGV[6], ARGV[7], ARGV[8], ARGV[9]
+local version, retention = tonumber(ARGV[1]), ARGV[2]
+local safety, tombstone = tonumber(ARGV[3]), tonumber(ARGV[4])
+local request_id, use_existing, wait = ARGV[5], ARGV[6], ARGV[7]
 
 local now = now_ms()
 local stored = redis.call('HGET', meta, 'ret')
 if not stored then
-  redis.call('HSET', meta, 'v', version, 'ret', retention, 'own', owner)
-  if chain ~= '' then
-    redis.call('HSET', meta, 'oc', chain)
-  end
+  redis.call('HSET', meta, 'v', version, 'ret', retention)
   if request_id ~= '' then
     redis.call('HSET', meta, 'rid', request_id)
   end
   refresh(meta, log, producers, nil, now, safety, tombstone)
   return {'created', retention}
 end
-local refused = check_live(meta, version, now) or check_identity(meta, owner, chain)
+local refused = check_live(meta, version, now)
 if refused then
   return refused
 end

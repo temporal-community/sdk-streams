@@ -28,43 +28,13 @@ local function check_live(meta, version, now)
   return nil
 end
 
--- Returns nil when the Producer kind may close the Stream, or else the refusal. Only the Workflow
--- Producer (1) closes a Workflow-owned Stream, with a handle of the run chain in `oc`. A Local
--- Activity (2) can't, since it writes before its task commits. A Workflow or a client (4) closes a
--- Stream with no owner.
-local function check_owner(meta, kind, chain)
-  if redis.call('HGET', meta, 'own') == 'wf' then
-    if kind ~= '1' then
-      return refuse('NOT_OWNER', 'only the close Activity of the owner run chain closes a ' ..
-        'Workflow-owned Stream')
-    end
-    local owner_chain = redis.call('HGET', meta, 'oc')
-    if owner_chain and chain ~= owner_chain then
-      return refuse('NOT_OWNER', 'the handle names another run chain than the owner')
-    end
-  elseif kind ~= '1' and kind ~= '4' then
-    return refuse('NOT_OWNER', 'only a Workflow or a client closes a Stream with no owner')
-  end
-  return nil
-end
-
--- Returns nil when a create gives the Stream's owner, or else the refusal. The owner is part of
--- the Stream's identity, so a create can't change it.
-local function check_identity(meta, owner, chain)
-  local stored = redis.call('HGET', meta, 'oc') or ''
-  if redis.call('HGET', meta, 'own') ~= owner or stored ~= chain then
-    return refuse('NOT_OWNER', 'the Stream has another owner than the create names')
-  end
-  return nil
-end
-
--- Sets the expiry after this write. It's the safety TTL for an open Workflow-owned Stream, or the
--- Retention otherwise. The meta key expires 30 days later, as the Tombstone. Only a close gives the
--- `closed` key, since a closed Stream takes no other write.
+-- Sets the expiry after this write. An open Stream keeps the safety TTL after its last write, and a
+-- closed one keeps the Retention. The meta key expires 30 days later, as the Tombstone. Only a
+-- close gives the `closed` key, since a closed Stream takes no other write.
 local function refresh(meta, log, producers, closed, now, safety, tombstone)
   local retention = tonumber(redis.call('HGET', meta, 'ret'))
   local exp = now + retention
-  if redis.call('HGET', meta, 'own') == 'wf' and not redis.call('HGET', meta, 'closed') then
+  if not redis.call('HGET', meta, 'closed') then
     exp = now + safety
   end
   redis.call('HSET', meta, 'exp', exp)
@@ -194,14 +164,12 @@ end
 
 local EPOCH_KEY_LEN, DIGEST_LEN = 40, 16
 
--- The `p|<kind>|<producer id>` field of a Producer is 129 bytes, with big-endian numbers. These
--- are the flags, the fence, the held epoch key or zeros, and the last batch's sequence (8), first
--- and last entry ids (the ms in 8 and the seq in 4, zeros for none) and digest. Flag bit 0 is set
--- when the held epoch is present. `docs/redis.md` has the layout.
-local PRODUCER_FIELD_LEN = 1 + 2 * EPOCH_KEY_LEN + 8 + 2 * 12 + DIGEST_LEN
-local HELD = 1
+-- The `p|<kind>|<producer id>` field of a Producer is 88 bytes, with big-endian numbers. These are
+-- the fence, and the last batch's sequence (8), first and last entry ids (the ms in 8 and the seq
+-- in 4, zeros for none) and digest. `docs/redis.md` has the layout.
+local PRODUCER_FIELD_LEN = EPOCH_KEY_LEN + 8 + 2 * 12 + DIGEST_LEN
 
--- The Producer field as a table, or nil when the Producer has none. A value of another format,
+-- The Producer field as a table, or nil when the Producer has none. A value of another length,
 -- which a later version may write, gives false and the refusal.
 local function read_producer(meta, field)
   local value = redis.call('HGET', meta, field)
@@ -212,28 +180,20 @@ local function read_producer(meta, field)
   if #value ~= PRODUCER_FIELD_LEN then
     return false, unknown
   end
-  local flags = string.byte(value, 1)
-  if flags ~= 0 and flags ~= HELD then
-    return false, unknown
-  end
-  local at = 2 + 2 * EPOCH_KEY_LEN
   local sequence, first_ms, first_seq, last_ms, last_seq =
-    struct.unpack('>I8I8I4I8I4', value, at)
+    struct.unpack('>I8I8I4I8I4', value, EPOCH_KEY_LEN + 1)
   -- A batch has both entry ids or neither.
   local first_none, last_none = first_ms + first_seq == 0, last_ms + last_seq == 0
   if first_none ~= last_none then
     return false, unknown
   end
   local stored = {
-    fence = string.sub(value, 2, 1 + EPOCH_KEY_LEN),
+    fence = string.sub(value, 1, EPOCH_KEY_LEN),
     sequence = sequence,
     first = '',
     last = '',
     digest = string.sub(value, -DIGEST_LEN),
   }
-  if flags == HELD then
-    stored.held = string.sub(value, 2 + EPOCH_KEY_LEN, 1 + 2 * EPOCH_KEY_LEN)
-  end
   if not first_none then
     stored.first = string.format('%.0f-%.0f', first_ms, first_seq)
     stored.last = string.format('%.0f-%.0f', last_ms, last_seq)
@@ -250,15 +210,10 @@ local function id_parts(id)
   return tonumber(ms), tonumber(seq)
 end
 
--- The Producer field of a batch. `held` is nil when no epoch of the Producer has Records, and the
--- ids are '' when the batch wrote no entry.
-local function producer_value(fence, held, sequence, first, last, digest)
-  local flags, held_key = 0, string.rep('\0', EPOCH_KEY_LEN)
-  if held then
-    flags, held_key = HELD, held
-  end
+-- The Producer field of a batch. The ids are '' when the batch wrote no entry.
+local function producer_value(fence, sequence, first, last, digest)
   local first_ms, first_seq = id_parts(first)
   local last_ms, last_seq = id_parts(last)
-  return string.char(flags) .. fence .. held_key ..
+  return fence ..
     struct.pack('>I8I8I4I8I4', sequence, first_ms, first_seq, last_ms, last_seq) .. digest
 end

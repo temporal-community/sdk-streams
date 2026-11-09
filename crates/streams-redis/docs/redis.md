@@ -28,33 +28,32 @@ form, and the `testdata/` of `temporalio-streams` has its test vectors.
 |---|---|
 | `v` | The format version, 1 |
 | `ret` | The Retention, in ms |
-| `own` | `wf` for a Workflow-owned Stream, `client` otherwise |
-| `oc` | The owner's run chain, `<workflow id>:<first run id>` with each part encoded |
 | `exp` | When the Stream stops taking writes, in ms since 1970 |
 | `rid` | The request id of the create that made the Stream, absent when it gave none |
 | `closed` | Set by the close |
+| `closer` | The encoded Producer that closed the Stream, which a read builds the close item from |
+| `cstat` | The close status, `1` for CLOSED, which a Brook Store is the only one it sets |
 | `newest` | The entry id of the newest entry |
 | `trimmed` | The entry id of the newest entry that Retention or the log's expiry dropped |
-| `p\|<kind>\|<producer id>` | The Producer's fence, held epoch and last batch, 129 bytes |
+| `p\|<kind>\|<producer id>` | The Producer's fence and last batch, 88 bytes |
 
 `<kind>` is the `ProducerKind` number. The `p|` value has big-endian numbers in this order.
 
 | Bytes | Field |
 |---|---|
-| 1 | Flags. Bit 0 is set when the held epoch is present, and the other bits are zero. |
 | 40 | The fence, the Producer's newest epoch key. It is also the epoch of the last batch. |
-| 40 | The held epoch key, the newest one that still has Records here, or zeros |
 | 8 | The last batch's sequence |
 | 12 | The last batch's first entry id, the ms in 8 bytes and the seq in 4 |
 | 12 | The last batch's last entry id, in the same form |
 | 16 | The last batch's digest, which a resend must match |
 
 - The ids are zero when the last batch wrote no entry. A real entry id is never `0-0`.
-- A call that finds a value of another length, another flag bit, or only one zero id fails with
+- A call that finds a value of another length, or only one zero id, fails with
   `stream_storage_corrupt`, since a later format may write it.
-- An epoch key is the task key (started event id 8, attempt 4, started seconds 8 and nanos 4),
-  then the attempt's scheduled seconds 8 and nanos 4 and the attempt 4. A negative field is zero.
-- The scripts compare two epoch keys byte by byte. Lua's `<` collates with the server's locale.
+- A task key is the started event id 8, the attempt 4, and the started seconds 8 and nanos 4.
+- An epoch key is the task key, then the attempt's scheduled seconds 8 and nanos 4 and the
+  attempt 4. A negative field is zero.
+- The scripts compare two keys byte by byte. Lua's `<` collates with the server's locale.
 - The digest is the first 16 bytes of the batch's SHA-256.
 
 `:producers` scores each `<kind>|<producer id>` with the ms of its last append. An append drops the
@@ -68,8 +67,8 @@ batches never get the same sequence. Nothing dedupes such a batch, so its retry 
 
 ## Create
 
-A create of a Stream that exists refuses, in this order, an expired Stream (`stream_expired`), a
-create with another owner (`stream_not_owner`) and a closed Stream (`stream_closed`). Then:
+A create of a Stream that exists refuses, in this order, an expired Stream (`stream_expired`) and a
+closed Stream (`stream_closed`). Then:
 
 - A create with the `rid` of the create that made the Stream is its retry, so it gets `created`
   again. With `WAIT`, it waits for the replicas to have the first create's write.
@@ -86,14 +85,12 @@ create with another owner (`stream_not_owner`) and a closed Stream (`stream_clos
   a batch gets `p` with one lookup. An entry never has both `p` and `b`.
 - A batch's entries share one millisecond, and a trim drops whole milliseconds, so a batch keeps
   its `p` entry for as long as it has any entry.
-- `s` is the encoded `StreamSuperseded` with the withdrawal facts, on the first entry of a batch
-  that withdraws. A read builds the Superseded item from it. An entry can have only `s`.
 - An offset is the entry id `<ms>-<seq>`, packed as `ms << 20 | seq`.
 
 ## TTLs
 
-- Each write sets `exp` to now plus the safety TTL for an open Workflow-owned Stream, and to now
-  plus the Retention otherwise.
+- Each write sets `exp` to now plus the safety TTL for an open Stream, and to now plus the Retention
+  for a closed one.
 - `:producers` expires at `exp`. The meta key expires 30 days after `exp`, as the Tombstone.
 - The log expires at `exp`, or one Retention after the write if that is earlier.
 - Each append drops the Records older than the Retention. A read hides them too.
@@ -140,20 +137,16 @@ these lists on a standalone server and on a cluster.
 - `WAIT` protects only the writer's answer. A Reader can see a write before its `WAIT` ends, and
   a failover can then lose that write.
 - On a cluster, the client sends a write again after it loses the reply. A batch with sequence 0
-  then gets two copies, and a resend answer has no flag.
+  then gets two copies.
 - With `WAIT`, a call that finds its write done, such as a resend, writes `v` again. Then its
   `WAIT` covers the earlier write.
 - A failover can still promote a replica that doesn't have an acknowledged write.
 
 ## Known limits
 
-- Nothing closes a Workflow-owned Stream whose owner was terminated or timed out, so it stays open
-  until its safety TTL passes. The native server closes it when the owner's run ends.
-- A Stream with no owner takes a close from any Workflow or client, since the Store can't tell
-  which one made it.
-- Redis can't tie a run to its run chain. A run of another chain that holds the owner's handle,
-  such as a child Workflow with its parent's Stream, can still close it. The native server checks
-  the run.
+- An open Stream stays until its safety TTL passes after its last write, even with a short
+  Retention. A closed Stream expires one Retention after the close.
+- Any Producer closes a Stream, since the Store doesn't track an owner.
 - A cluster with `cluster-preferred-endpoint-type unknown-endpoint` gives no hosts in
   `CLUSTER SLOTS` and in its redirects. A blocking read then finds a slot's node only through the
   seeds and `MOVED`. redis-rs doesn't follow an `ASK` with no host, so a call fails with

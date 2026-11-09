@@ -19,7 +19,7 @@ use temporalio_streams::{
         AppendRecord, ClientEpoch, ClientProducer, Producer, StreamData, StreamRecord, StreamRef,
         producer::Kind, stream_record::Item,
     },
-    store::{Batch, Create, Owner, Store, Withdrawal},
+    store::{Batch, Create, Store},
 };
 use temporalio_streams_redis::{
     RedisStore, RedisStoreError, RedisStoreOptions, Topology, WaitOptions,
@@ -164,7 +164,6 @@ async fn the_documented_commands_run_every_call_of_each_role() {
         sequence: 1,
         records: &stored,
         digest,
-        withdrawal: Withdrawal::default(),
     };
     let appended = producer.append(&namespace, &handle, &batch).await.unwrap();
     let (first, _) = appended.offsets.unwrap();
@@ -218,14 +217,13 @@ async fn the_documented_commands_run_every_call_of_each_role() {
         ..Default::default()
     };
     let retention = Duration::from_secs(60);
-    // A Workflow Stream has the safety TTL, so it doesn't expire with the Retention.
+    // An open Stream has the safety TTL, so it doesn't expire with the Retention.
     producer
         .create(
             &namespace,
             &short,
             &Create {
                 retention: Some(retention),
-                owner: Owner::Workflow,
                 ..Create::default()
             },
         )
@@ -486,7 +484,6 @@ async fn the_documented_commands_serve_a_cluster_while_a_slot_moves() {
         sequence,
         records: &stored,
         digest,
-        withdrawal: Withdrawal::default(),
     };
     producer
         .create(&namespace, &handle, &Create::default())

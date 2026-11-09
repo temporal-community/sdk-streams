@@ -24,7 +24,7 @@ use temporalio_streams::{
     proto::{Producer, StreamRef},
     store::{
         Appended, Batch, Capabilities, Closed, ConflictPolicy, Create, Created, Entry,
-        FORMAT_VERSION, MAX_TTL, Owner, Store, StreamState, TOMBSTONE, owner_chain,
+        FORMAT_VERSION, MAX_TTL, Store, StreamState, TOMBSTONE,
     },
 };
 use tokio::time::Instant;
@@ -157,13 +157,12 @@ impl RedisStore {
 // A Redis error converts through the crate's error, since this crate can't add that `From`.
 #[async_trait::async_trait]
 impl Store for RedisStore {
-    // Every rule but the run fence is in the Lua scripts.
+    // Every rule is in the Lua scripts.
     fn capabilities(&self) -> Capabilities {
-        Capabilities::ALL.without(Capabilities::RUN_FENCE)
+        Capabilities::ALL
     }
 
-    /// Creates a Stream, or finds it. A Workflow-owned Stream stores its ref's run chain, which
-    /// later creates and closes must match.
+    /// Creates a Stream, or finds it.
     async fn create(
         &self,
         namespace: &str,
@@ -173,18 +172,12 @@ impl Store for RedisStore {
         let keys = self.keys(namespace, &stream_ref.id);
         let retention = create.retention.filter(|r| !r.is_zero());
         let retention = retention.unwrap_or(self.retention);
-        let (owner, chain) = match create.owner {
-            Owner::Workflow => ("wf", owner_chain(stream_ref)),
-            Owner::Client => ("client", String::new()),
-        };
         let mut call = ScriptCall::write(&scripts::CREATE_SCRIPT, &keys);
         call.cmd
             .arg(FORMAT_VERSION)
             .arg(retention.as_millis())
-            .arg(owner)
             .arg(self.safety_ttl.as_millis())
             .arg(TOMBSTONE.as_millis())
-            .arg(chain)
             .arg(create.request_id)
             .arg(create.conflict == ConflictPolicy::UseExisting)
             .arg(self.wait.is_some());
@@ -200,15 +193,14 @@ impl Store for RedisStore {
     ) -> StreamResult<Appended> {
         let keys = self.keys(namespace, &stream_ref.id);
         let producer = batch.producer;
-        let withdrawal = &batch.withdrawal;
+        let kind = ProducerKind::try_from(producer)?;
         let mut call = ScriptCall::write(&scripts::APPEND_SCRIPT, &keys);
         call.cmd
             .arg(FORMAT_VERSION)
-            .arg(ProducerKind::try_from(producer)? as i32)
+            .arg(kind as i32)
             .arg(&producer.id)
             .arg(&epoch_key(producer.kind.as_ref())[..])
             .arg(batch.sequence)
-            .arg(withdrawal.superseded)
             .arg(self.safety_ttl.as_millis())
             .arg(TOMBSTONE.as_millis())
             .arg(&batch.digest[..])
@@ -221,8 +213,8 @@ impl Store for RedisStore {
         Ok(appended)
     }
 
-    /// Closes a Stream, if the Producer's kind and the ref's run chain are the owner's. The close
-    /// writes no entry, so it adds one to the `:closed` key, which wakes the blocked reads.
+    /// Closes a Stream. The close writes no entry, so it adds one to the `:closed` key, which wakes
+    /// the blocked reads.
     async fn close(
         &self,
         namespace: &str,
@@ -239,8 +231,9 @@ impl Store for RedisStore {
             .arg(&producer.id)
             .arg(&epoch_key(producer.kind.as_ref())[..])
             .arg(TOMBSTONE.as_millis())
-            .arg(owner_chain(stream_ref))
-            .arg(self.wait.is_some());
+            .arg(self.wait.is_some())
+            // The closer, which a read builds the final StreamClose item from.
+            .arg(producer.encode_to_vec());
         let CloseReply(closed) = self.write(&call).await?;
         Ok(closed)
     }
@@ -599,12 +592,9 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs Redis"]
     async fn a_read_inside_a_batch_gets_the_producer_of_the_batch() {
-        use temporalio_streams::{
-            proto::{
-                ClientEpoch, ClientProducer, StreamData, StreamRecord, producer::Kind,
-                stream_record::Item,
-            },
-            store::Withdrawal,
+        use temporalio_streams::proto::{
+            ClientEpoch, ClientProducer, StreamData, StreamRecord, producer::Kind,
+            stream_record::Item,
         };
         let mut options = RedisStoreOptions::new(crate::testing::standalone_url());
         options.key_prefix = "streams-unit".parse().unwrap();
@@ -640,7 +630,6 @@ mod tests {
             sequence: 1,
             records: &records,
             digest: [0; 16],
-            withdrawal: Withdrawal::default(),
         };
         let (first, last) = store
             .append(&namespace, &handle, &batch)

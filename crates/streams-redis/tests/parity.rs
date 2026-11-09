@@ -13,10 +13,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use temporalio_common::protos::temporal::api::{
-    common::v1::{Execution, Payload},
-    enums::v1::ExecutionType,
-};
+use temporalio_common::protos::temporal::api::common::v1::Payload;
 use temporalio_streams::{
     Reason, StreamResult,
     digest::batch_digest,
@@ -28,10 +25,9 @@ use temporalio_streams::{
     proto::{
         ActivityEpoch, ActivityProducer, AppendRecord, ClientEpoch, ClientProducer,
         LocalActivityEpoch, LocalActivityProducer, Producer, StreamData, StreamRecord, StreamRef,
-        StreamSuperseded, StreamWriter, WorkflowProducer, WorkflowTaskEpoch, producer::Kind,
-        stream_record,
+        WorkflowProducer, WorkflowTaskEpoch, producer::Kind, stream_record,
     },
-    store::{Batch, ConflictPolicy, Create, CreateOutcome, Entry, Owner, Store, Withdrawal},
+    store::{Batch, ConflictPolicy, Create, CreateOutcome, Entry, Store},
 };
 use temporalio_streams_redis::{
     RedisStore, RedisStoreOptions, Topology, WaitOptions,
@@ -121,8 +117,8 @@ impl Rng {
     }
 }
 
-/// The Producers of the calls. Some share an id with another epoch, so that the fences and the
-/// withdrawals of a newer epoch run.
+/// The Producers of the calls. Some share an id with another epoch, so that the fence of a newer
+/// epoch runs. The run `r1`'s Local Activities come from three Workflow Tasks.
 fn producers() -> Vec<Producer> {
     let client = |id: String, attempt| Producer {
         id,
@@ -130,10 +126,10 @@ fn producers() -> Vec<Producer> {
             epoch: Some(ClientEpoch { attempt }),
         })),
     };
-    let activity = |attempt| Producer {
-        id: activity_producer_id("r1", "a", "s"),
+    let activity = |run: &str, attempt| Producer {
+        id: activity_producer_id(run, "a", "s"),
         kind: Some(Kind::Activity(ActivityProducer {
-            run_id: "r1".to_string(),
+            run_id: run.to_string(),
             epoch: Some(ActivityEpoch {
                 attempt_scheduled_time: Some(prost_types::Timestamp {
                     seconds: 100 + i64::from(attempt),
@@ -143,19 +139,12 @@ fn producers() -> Vec<Producer> {
             }),
         })),
     };
-    let local_activity = |attempt| Producer {
-        id: local_activity_producer_id("r1", "call-3"),
+    let local_activity = |run: &str, started: i64, attempt| Producer {
+        id: local_activity_producer_id(run, &format!("call-{started}")),
         kind: Some(Kind::LocalActivity(LocalActivityProducer {
-            run_id: "r1".to_string(),
+            run_id: run.to_string(),
             epoch: Some(LocalActivityEpoch {
-                task: Some(WorkflowTaskEpoch {
-                    started_event_id: 3,
-                    attempt: 1,
-                    started_time: Some(prost_types::Timestamp {
-                        seconds: 3,
-                        nanos: 0,
-                    }),
-                }),
+                task: Some(task(started)),
                 attempt,
             }),
         })),
@@ -174,23 +163,34 @@ fn producers() -> Vec<Producer> {
         client(me(), 3),
         client(named_client_producer_id("other"), 1),
         client(named_client_producer_id("other"), 2),
-        activity(1),
-        activity(2),
-        local_activity(1),
-        local_activity(2),
+        activity("r1", 1),
+        activity("r1", 2),
+        activity("r0", 1),
+        local_activity("r1", 3, 1),
+        local_activity("r1", 3, 2),
+        local_activity("r1", 5, 1),
+        local_activity("r1", 7, 1),
+        local_activity("r0", 3, 1),
         workflow,
     ]
 }
 
-/// The ref of each Stream. The second one has a Workflow owner, so the owner checks run.
+/// The Workflow Task of a run that starts at the event `started`.
+fn task(started: i64) -> WorkflowTaskEpoch {
+    WorkflowTaskEpoch {
+        started_event_id: started,
+        attempt: 1,
+        started_time: Some(prost_types::Timestamp {
+            seconds: started,
+            nanos: 0,
+        }),
+    }
+}
+
+/// The ref of each Stream.
 fn stream_ref(stream: usize) -> StreamRef {
     StreamRef {
         id: STREAMS[stream].to_string(),
-        owner: (stream == 1).then(|| Execution {
-            r#type: ExecutionType::Workflow as i32,
-            business_id: "agent".to_string(),
-            run_id: "first-run".to_string(),
-        }),
         ..Default::default()
     }
 }
@@ -199,7 +199,6 @@ fn stream_ref(stream: usize) -> StreamRef {
 enum Call {
     Create {
         stream: usize,
-        owner: Owner,
         conflict: ConflictPolicy,
         retention: Option<Duration>,
         request_id: &'static str,
@@ -249,7 +248,7 @@ impl Call {
 }
 
 /// An entry, with its offset as its place in the log. Each Store makes its own offsets.
-type Item = (Place, Option<Vec<u8>>, Option<Vec<u8>>);
+type Item = (Place, Option<Vec<u8>>);
 
 /// The place of an offset in the Store's log, or the offset that isn't in it.
 #[derive(Debug, PartialEq)]
@@ -264,12 +263,10 @@ enum Answer {
     Created {
         outcome: CreateOutcome,
         retention: Duration,
-        flagged: bool,
     },
     Appended {
         places: Option<(Place, Place)>,
         resend: bool,
-        flagged: bool,
     },
     Closed {
         already: bool,
@@ -381,7 +378,6 @@ impl Seed {
         match self.rng.below(20) {
             0..=2 => Call::Create {
                 stream,
-                owner: self.rng.pick(&[Owner::Client, Owner::Workflow]),
                 conflict: self
                     .rng
                     .pick(&[ConflictPolicy::Fail, ConflictPolicy::UseExisting]),
@@ -446,6 +442,7 @@ impl Seed {
                 producer,
                 sequence,
                 texts,
+                ..
             },
             Answer::Appended { resend: false, .. },
         ) = (call, answer)
@@ -475,7 +472,6 @@ impl Seed {
         };
         let answer = match call {
             Call::Create {
-                owner,
                 conflict,
                 retention,
                 request_id,
@@ -483,10 +479,8 @@ impl Seed {
             } => {
                 let create = Create {
                     retention: *retention,
-                    owner: *owner,
                     conflict: *conflict,
                     request_id,
-                    withdrawal: Withdrawal::default(),
                 };
                 let created = side
                     .store
@@ -495,7 +489,6 @@ impl Seed {
                 created.map(|created| Answer::Created {
                     outcome: created.outcome,
                     retention: created.retention,
-                    flagged: created.flagged,
                 })
             }
             Call::Append {
@@ -506,7 +499,6 @@ impl Seed {
             } => {
                 let producer = &self.producers[*producer];
                 let (records, digest) = batch(producer, texts);
-                let superseded = superseded(producer);
                 let appended = side
                     .store
                     .append(
@@ -517,10 +509,6 @@ impl Seed {
                             sequence: *sequence,
                             records: &records,
                             digest,
-                            withdrawal: Withdrawal {
-                                superseded: &superseded,
-                                ..Default::default()
-                            },
                         },
                     )
                     .await;
@@ -531,7 +519,6 @@ impl Seed {
                         (place(side, stream, first), place(side, stream, last))
                     }),
                     resend: appended.resend,
-                    flagged: appended.flagged,
                 })
             }
             Call::Close { producer, .. } => {
@@ -595,13 +582,7 @@ fn place(side: &Side, stream: usize, offset: i64) -> Place {
 fn items(side: &Side, stream: usize, entries: Vec<Entry>) -> Vec<Item> {
     entries
         .into_iter()
-        .map(|entry| {
-            (
-                place(side, stream, entry.offset),
-                entry.record,
-                entry.superseded,
-            )
-        })
+        .map(|entry| (place(side, stream, entry.offset), entry.record))
         .collect()
 }
 
@@ -632,16 +613,6 @@ fn batch(producer: &Producer, texts: &[&str]) -> (Vec<Vec<u8>>, [u8; 16]) {
         .map(|body| AppendRecord { body: Some(body) })
         .collect();
     (records, batch_digest(&appended))
-}
-
-fn superseded(producer: &Producer) -> Vec<u8> {
-    StreamSuperseded {
-        writer: Some(StreamWriter {
-            producer: Some(producer.clone()),
-            ..Default::default()
-        }),
-    }
-    .encode_to_vec()
 }
 
 /// What a write can change in a Stream's keys. A hash with long values is a hash table, whose
