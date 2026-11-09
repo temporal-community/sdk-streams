@@ -680,6 +680,9 @@ impl BlockingPool {
     /// Waits for an entry after the entry id `after` in the log at `key`, or for the Stream's close
     /// on its `closed` key. Gives `false` when the read ends with neither, also early with no free
     /// connection or during a slot migration. Then the caller reads the Stream again.
+    //
+    // The pool works on raw keys, not on the Stream key layout, so the WAIT writes and the blocking
+    // reads share it. It only reads the keys, so it borrows them.
     pub(crate) async fn wait_after(
         &self,
         key: &str,

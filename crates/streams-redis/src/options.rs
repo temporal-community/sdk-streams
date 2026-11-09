@@ -112,6 +112,9 @@ impl From<Topology> for RedisStoreOptions {
 /// The URL with `***` in place of its user info and its query. A socket URL gives its password in
 /// the query.
 fn redacted(url: &str) -> String {
+    // Redact by hand, so the result never shows the password. A Redis socket URL is not a
+    // standard URL. A URL parser can reject it, and a fallback would then show the raw URL. The
+    // hand parse hides the user info and the query for every URL form.
     let (url, query) = match url.split_once('?') {
         Some((url, _)) => (url, "?***"),
         None => (url, ""),
