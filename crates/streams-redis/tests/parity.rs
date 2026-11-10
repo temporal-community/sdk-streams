@@ -621,7 +621,7 @@ fn batch(producer: &Producer, texts: &[&str]) -> (Vec<Vec<u8>>, [u8; 16]) {
 #[derive(Debug, PartialEq)]
 struct Snapshot {
     meta: BTreeMap<Vec<u8>, Vec<u8>>,
-    /// The expiry of each key, and the `DUMP` of the log, `:producers` and `:closed`.
+    /// The expiry of each key, and the `DUMP` of the log and `:closed`.
     rest: Vec<redis::Value>,
 }
 
@@ -653,7 +653,7 @@ impl Raw {
         let mut pipe = redis::pipe();
         pipe.cmd("HGETALL").arg(keys.meta());
         pipe.cmd("PEXPIRETIME").arg(keys.meta());
-        for key in [keys.log(), keys.producers(), keys.closed()] {
+        for key in [keys.log(), keys.closed()] {
             pipe.cmd("DUMP").arg(&key).cmd("PEXPIRETIME").arg(&key);
         }
         let (meta, rest): (BTreeMap<Vec<u8>, Vec<u8>>, Vec<redis::Value>) = {

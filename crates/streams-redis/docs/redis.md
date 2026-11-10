@@ -8,13 +8,12 @@ form, and the `testdata/` of `temporalio-streams` has its test vectors.
 ```text
 <prefix>:{<namespace>:<stream id>}:meta
 <prefix>:{<namespace>:<stream id>}:log
-<prefix>:{<namespace>:<stream id>}:producers
 <prefix>:{<namespace>:<stream id>}:closed
 ```
 
-- Each part is percent-encoded. The hash tag puts the four keys in one cluster slot.
+- Each part is percent-encoded. The hash tag puts the three keys in one cluster slot.
 - The prefix has only letters, digits, `-`, `.`, `_` and `~`, so a key pattern shows it as written.
-- A create writes `:meta`. An append writes `:producers` and `:log`.
+- A create writes `:meta`. An append writes `:meta` and `:log`.
 - A close writes no log entry. It adds one entry to `:closed`, so a read that waits on the log and
   on `:closed` wakes. `:closed` expires with the log.
 - The close script gets `:closed` as an argument, not in `KEYS`. While a slot migrates, a script
@@ -56,11 +55,9 @@ form, and the `testdata/` of `temporalio-streams` has its test vectors.
 - The scripts compare two keys byte by byte. Lua's `<` collates with the server's locale.
 - The digest is the first 16 bytes of the batch's SHA-256.
 
-`:producers` scores each `<kind>|<producer id>` with the ms of its last append. An append drops the
-`p|` field of up to 64 Producers with no append for one Retention. A resend of such a Producer's
-last batch then writes the batch again, and a lower epoch of the Producer is accepted. So the fence
-lasts one Retention after the last append. An open Stream keeps the first copy of such a batch, so
-a read then gets both copies.
+No write drops a Producer's `p|` field, however long ago its last append was. So a resend of a
+Producer's last batch gets the first answer, and a lower epoch of the Producer is fenced, for as
+long as the Stream exists.
 
 An append with sequence 0 takes the sequence after the last batch's when the fence is the batch's
 epoch key, and 1 otherwise. The script reads `p|` and writes the batch in one step, so two such
@@ -92,8 +89,7 @@ closed Stream (`stream_closed`). Then:
 
 - Each write sets `exp` to now plus the safety TTL for an open Stream, and to now plus the Retention
   for a closed one. So the Retention counts from the close.
-- The log and `:producers` expire at `exp`. The meta key expires 30 days after `exp`, as the
-  Tombstone.
+- The log expires at `exp`. The meta key expires 30 days after `exp`, as the Tombstone.
 - An open Stream keeps all its Records. No append drops a Record by its age, and no read hides one.
 - A write that finds the log gone, as after an eviction, sets `trimmed` to `newest`. Before that
   write, a read at or below `newest` that finds no entry fails with `stream_expired`.
@@ -104,8 +100,8 @@ Redis checks the ACL of the script call and of each command in the script. `test
 these lists on a standalone server and on a cluster.
 
 - A Producer creates, appends and closes. It needs the keys `~<prefix>:{<namespace>:*` and the
-  commands `+evalsha +script|load +time +hget +hset +hdel +exists +pexpireat +xadd +xrevrange
-  +zadd +zrangebyscore +zrem`. With `wait_replicas`, it also needs `+wait`.
+  commands `+evalsha +script|load +time +hget +hset +exists +pexpireat +xadd +xrevrange`. With
+  `wait_replicas`, it also needs `+wait`.
 - A Reader reads and describes. It needs the keys `%R~<prefix>:{<namespace>:*` and the commands
   `+evalsha_ro +script|load +time +hmget +xrange`. A read that waits also needs `+xread`, and a
   read of the last Records needs `+xrevrange`.
@@ -147,6 +143,8 @@ these lists on a standalone server and on a cluster.
 
 - An open Stream keeps all its Records until its safety TTL passes after its last write, even with
   a short Retention. A closed Stream expires one Retention after the close.
+- The meta hash keeps one 88-byte `p|` field for each Producer that wrote to the Stream, so a
+  Stream with many Producers has a large meta hash.
 - Any Producer closes a Stream, since the Store doesn't track an owner.
 - A cluster with `cluster-preferred-endpoint-type unknown-endpoint` gives no hosts in
   `CLUSTER SLOTS` and in its redirects. A blocking read then finds a slot's node only through the

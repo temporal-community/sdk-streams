@@ -1,6 +1,6 @@
--- The prelude of the write scripts. KEYS[1] is the Stream's meta hash, KEYS[2] its log, and KEYS[3]
--- the sorted set of its Producers' last appends. Each script checks everything that can refuse the
--- call before its first write, since Redis doesn't roll a script back.
+-- The prelude of the write scripts. KEYS[1] is the Stream's meta hash and KEYS[2] its log. Each
+-- script checks everything that can refuse the call before its first write, since Redis doesn't
+-- roll a script back.
 
 local function now_ms()
   local time = redis.call('TIME')
@@ -31,7 +31,7 @@ end
 -- Sets the expiry after this write. An open Stream keeps the safety TTL after its last write, and a
 -- closed one keeps the Retention. The meta key expires 30 days later, as the Tombstone. Only a
 -- close gives the `closed` key, since a closed Stream takes no other write.
-local function refresh(meta, log, producers, closed, now, safety, tombstone)
+local function refresh(meta, log, closed, now, safety, tombstone)
   local retention = tonumber(redis.call('HGET', meta, 'ret'))
   local exp = now + retention
   if not redis.call('HGET', meta, 'closed') then
@@ -39,10 +39,8 @@ local function refresh(meta, log, producers, closed, now, safety, tombstone)
   end
   redis.call('HSET', meta, 'exp', exp)
   redis.call('PEXPIREAT', meta, exp + tombstone)
-  for _, key in ipairs({producers, closed}) do
-    if redis.call('EXISTS', key) == 1 then
-      redis.call('PEXPIREAT', key, exp)
-    end
+  if closed and redis.call('EXISTS', closed) == 1 then
+    redis.call('PEXPIREAT', closed, exp)
   end
   if redis.call('EXISTS', log) == 1 then
     redis.call('PEXPIREAT', log, exp)
@@ -83,21 +81,6 @@ local function mark_log_gone(meta, log)
   local newest = redis.call('HGET', meta, 'newest')
   if newest then
     raise_trimmed(meta, newest)
-  end
-end
-
--- The most Producers that one append prunes, so that an append after a long gap stays short.
-local PRUNE_LIMIT = 64
-
--- Removes the field of each Producer whose last append is older than the Retention.
-local function prune(meta, producers, now)
-  local min = now - tonumber(redis.call('HGET', meta, 'ret'))
-  local old = redis.call('ZRANGEBYSCORE', producers, '-inf', '(' .. min, 'LIMIT', 0, PRUNE_LIMIT)
-  for _, producer in ipairs(old) do
-    redis.call('HDEL', meta, 'p|' .. producer)
-  end
-  if #old > 0 then
-    redis.call('ZREM', producers, unpack(old))
   end
 end
 

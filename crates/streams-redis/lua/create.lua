@@ -7,7 +7,7 @@
 --
 -- Returns {outcome, stored Retention ms}. The outcome is `created` or `exists`. A Stream that
 -- exists keeps its own Retention.
-local meta, log, producers = KEYS[1], KEYS[2], KEYS[3]
+local meta, log = KEYS[1], KEYS[2]
 local version, retention = tonumber(ARGV[1]), ARGV[2]
 local safety, tombstone = tonumber(ARGV[3]), tonumber(ARGV[4])
 local request_id, use_existing, wait = ARGV[5], ARGV[6], ARGV[7]
@@ -19,7 +19,7 @@ if not stored then
   if request_id ~= '' then
     redis.call('HSET', meta, 'rid', request_id)
   end
-  refresh(meta, log, producers, nil, now, safety, tombstone)
+  refresh(meta, log, nil, now, safety, tombstone)
   return {'created', retention}
 end
 local refused = check_live(meta, version, now)

@@ -5,7 +5,7 @@
 -- `1` when a `WAIT` runs after it, the encoded Producer that closed the Stream.
 --
 -- Returns {'closed' or 'already'}.
-local meta, log, producers = KEYS[1], KEYS[2], KEYS[3]
+local meta, log = KEYS[1], KEYS[2]
 -- Keep `:closed` out of KEYS. It doesn't exist before the close, and while its slot migrates, a
 -- script with a declared key that doesn't exist yet gets `TRYAGAIN`, so each close would fail.
 -- Redis doesn't promise a script a key that KEYS doesn't name, and no script flag changes that.
@@ -37,5 +37,5 @@ end
 redis.call('HSET', meta, 'closed', '1', 'closer', closer, 'cstat', '1')
 redis.call('XADD', closed_key, '*', 'closed', '1')
 -- Safety TTL 0, since a closed Stream keeps its Retention.
-refresh(meta, log, producers, closed_key, now, 0, tombstone)
+refresh(meta, log, closed_key, now, 0, tombstone)
 return {'closed'}

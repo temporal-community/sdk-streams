@@ -323,14 +323,13 @@ struct ScriptCall {
 }
 
 impl ScriptCall {
-    /// A write script call, with the meta, the log and `:producers`.
+    /// A write script call, with the meta and the log.
     fn write(script: &'static Script, keys: &StreamKeys) -> Self {
         let mut cmd = redis::cmd("EVALSHA");
         cmd.arg(script.get_hash())
-            .arg(3)
+            .arg(2)
             .arg(keys.meta())
-            .arg(keys.log())
-            .arg(keys.producers());
+            .arg(keys.log());
         Self { script, cmd }
     }
 

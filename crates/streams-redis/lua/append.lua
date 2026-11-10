@@ -5,7 +5,7 @@
 -- encoded Producer, then one Record with no Producer per argument.
 --
 -- Returns {'ok' or 'resend', first id, last id}. A batch that wrote no entry gives '' for both ids.
-local meta, log, producers = KEYS[1], KEYS[2], KEYS[3]
+local meta, log = KEYS[1], KEYS[2]
 local version, kind, producer = tonumber(ARGV[1]), ARGV[2], ARGV[3]
 local epoch, sequence_text = ARGV[4], ARGV[5]
 local sequence = tonumber(sequence_text)
@@ -72,8 +72,6 @@ if refused then
   return refused
 end
 
--- `prune` reads `:producers` first, so a key of another type there fails before any write.
-prune(meta, producers, now)
 mark_log_gone(meta, log)
 local first_id, last_id = '', ''
 -- Only the batch's first Record keeps the Producer. Each later one keeps the seq of that first
@@ -94,6 +92,5 @@ redis.call('HSET', meta, field, producer_value(epoch, sequence, first_id, last_i
 if last_id ~= '' then
   redis.call('HSET', meta, 'newest', last_id)
 end
-redis.call('ZADD', producers, next_ms, kind .. '|' .. producer)
-refresh(meta, log, producers, nil, now, safety, tombstone)
+refresh(meta, log, nil, now, safety, tombstone)
 return {'ok', first_id, last_id}

@@ -12,9 +12,7 @@ use temporalio_common::protos::temporal::api::common::v1::Payload;
 use temporalio_streams::{
     Reason,
     digest::batch_digest,
-    epoch::ProducerKind,
     ids::{StreamKeys, client_producer_id},
-    offset::offset_of_entry_id,
     proto::{
         AppendRecord, ClientEpoch, ClientProducer, Producer, StreamData, StreamRecord, StreamRef,
         producer::Kind, stream_record::Item,
@@ -209,70 +207,6 @@ async fn the_documented_commands_run_every_call_of_each_role() {
         .await
         .unwrap();
 
-    // An append keeps the Records older than the Retention, which counts from the close, and
-    // prunes the Producers with no append for one Retention. The scripts read the server's `TIME`,
-    // so raw writes age an entry and a Producer, and the case doesn't wait.
-    let short = StreamRef {
-        id: "short".to_string(),
-        ..Default::default()
-    };
-    let retention = Duration::from_secs(60);
-    // An open Stream has the safety TTL, so it doesn't expire with the Retention.
-    producer
-        .create(
-            &namespace,
-            &short,
-            &Create {
-                retention: Some(retention),
-                ..Create::default()
-            },
-        )
-        .await
-        .unwrap();
-    let keys = StreamKeys::new(PREFIX, &namespace, "short");
-    let mut raw = admin(&url).await;
-    let (seconds, _): (u64, u64) = redis::cmd("TIME").query_async(&mut raw).await.unwrap();
-    let old_ms = (seconds - 2 * retention.as_secs()) * 1000;
-    let old = format!("{old_ms}-1");
-    let field = format!(
-        "p|{}|{}",
-        ProducerKind::Client as i32,
-        client_named("old").id
-    );
-    let _: () = redis::pipe()
-        .cmd("XADD")
-        .arg(keys.log())
-        .arg(&old)
-        .arg("x")
-        .arg("y")
-        .ignore()
-        .cmd("ZADD")
-        .arg(keys.producers())
-        .arg(old_ms)
-        .arg(&field[2..])
-        .ignore()
-        .cmd("HSET")
-        .arg(keys.meta())
-        .arg(&field)
-        .arg("x")
-        .ignore()
-        .query_async(&mut raw)
-        .await
-        .unwrap();
-    producer.append(&namespace, &short, &batch).await.unwrap();
-    let (state, entries) = reader.read(&namespace, "short", 0, 10).await.unwrap();
-    assert_eq!(
-        (state.trimmed, entries[0].offset, entries.len()),
-        (0, offset_of_entry_id(&old).unwrap(), 2)
-    );
-    let fenced: bool = redis::cmd("HEXISTS")
-        .arg(keys.meta())
-        .arg(&field)
-        .query_async(&mut raw)
-        .await
-        .unwrap();
-    assert!(!fenced);
-
     // With `+wait`, too few replicas is a Store failure, not a refusal.
     let mut options =
         RedisStoreOptions::new(user(&url, &producer_name, &namespace, role(&PRODUCER)).await)
@@ -377,7 +311,7 @@ struct Migration {
     slot: u16,
     source: String,
     target: String,
-    keys: [String; 4],
+    keys: [String; 3],
 }
 
 impl Drop for Migration {
@@ -506,7 +440,7 @@ async fn the_documented_commands_serve_a_cluster_while_a_slot_moves() {
         slot,
         source: source.url(),
         target: target.url(),
-        keys: [keys.meta(), keys.log(), keys.producers(), keys.closed()],
+        keys: [keys.meta(), keys.log(), keys.closed()],
     };
     target.run(&set_slot("IMPORTING", source)).await;
     source.run(&set_slot("MIGRATING", target)).await;
@@ -519,8 +453,7 @@ async fn the_documented_commands_serve_a_cluster_while_a_slot_moves() {
         .arg(5000)
         .arg("KEYS")
         .arg(keys.meta())
-        .arg(keys.log())
-        .arg(keys.producers());
+        .arg(keys.log());
     source.run(&migrate).await;
 
     let appended = producer.append(&namespace, &handle, &batch(2)).await;
