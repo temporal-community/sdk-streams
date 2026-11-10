@@ -74,7 +74,7 @@ end
 
 -- `prune` reads `:producers` first, so a key of another type there fails before any write.
 prune(meta, producers, now)
-trim(meta, log, now)
+mark_log_gone(meta, log)
 local first_id, last_id = '', ''
 -- Only the batch's first Record keeps the Producer. Each later one keeps the seq of that first
 -- entry, so a read that starts inside the batch finds the Producer with one lookup.

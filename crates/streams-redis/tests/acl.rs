@@ -209,9 +209,9 @@ async fn the_documented_commands_run_every_call_of_each_role() {
         .await
         .unwrap();
 
-    // An append trims the Records older than the Retention, and prunes the Producers with no
-    // append for one Retention. The scripts read the server's `TIME`, so raw writes age an entry
-    // and a Producer, and the case doesn't wait.
+    // An append keeps the Records older than the Retention, which counts from the close, and
+    // prunes the Producers with no append for one Retention. The scripts read the server's `TIME`,
+    // so raw writes age an entry and a Producer, and the case doesn't wait.
     let short = StreamRef {
         id: "short".to_string(),
         ..Default::default()
@@ -262,8 +262,8 @@ async fn the_documented_commands_run_every_call_of_each_role() {
     producer.append(&namespace, &short, &batch).await.unwrap();
     let (state, entries) = reader.read(&namespace, "short", 0, 10).await.unwrap();
     assert_eq!(
-        (state.trimmed, entries.len()),
-        (offset_of_entry_id(&old).unwrap(), 1)
+        (state.trimmed, entries[0].offset, entries.len()),
+        (0, offset_of_entry_id(&old).unwrap(), 2)
     );
     let fenced: bool = redis::cmd("HEXISTS")
         .arg(keys.meta())

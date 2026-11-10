@@ -110,9 +110,10 @@ impl TestBackend for RedisBackend {
                 .map_or(0, |wait| i32::try_from(wait.replicas.get()).unwrap()),
             wait_timeout: Some(seconds(WAIT_TIMEOUT)),
             response_timeout: Some(seconds(2 * WAIT_TIMEOUT)),
-            // The writer cases leave megabytes of Records, which a local server keeps for the
-            // Retention.
+            // The writer cases leave megabytes of Records, which a local server keeps until the
+            // Stream expires. An open Stream expires the safety TTL after its last write.
             retention: Some(seconds(Duration::from_secs(300))),
+            safety_ttl: Some(seconds(Duration::from_secs(300))),
             ..Default::default()
         };
         RedisStreamRuntime::from_config_bytes(&config.encode_to_vec(), None).unwrap()
@@ -181,5 +182,10 @@ impl RawKeys for Raw {
     async fn log_len(&self, namespace: &str, stream: &str) -> usize {
         let keys = StreamKeys::new(PREFIX, namespace, stream);
         self.query(redis::cmd("XLEN").arg(keys.log())).await
+    }
+
+    async fn drop_log(&self, namespace: &str, stream: &str) {
+        let keys = StreamKeys::new(PREFIX, namespace, stream);
+        self.query::<()>(redis::cmd("DEL").arg(keys.log())).await;
     }
 }

@@ -4,7 +4,7 @@
 # stack on the sdk-rust fork.
 set -euo pipefail
 
-ref=${SDK_RUST_REF:-moe/brook/review/streams-close-item}
+ref=${SDK_RUST_REF:-moe/streams-retention-from-close}
 mkdir -p .cargo
 cat >.cargo/config.toml <<TOML
 [patch.crates-io]

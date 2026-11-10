@@ -44,10 +44,8 @@ local function refresh(meta, log, producers, closed, now, safety, tombstone)
       redis.call('PEXPIREAT', key, exp)
     end
   end
-  -- A read hides every Record one Retention after the last write. `newest` keeps later ids above
-  -- the expired ones.
   if redis.call('EXISTS', log) == 1 then
-    redis.call('PEXPIREAT', log, math.min(exp, now + retention))
+    redis.call('PEXPIREAT', log, exp)
   end
 end
 
@@ -76,33 +74,22 @@ local function raise_trimmed(meta, id)
   end
 end
 
--- Drops the Records older than the Retention and keeps the newest dropped id, so a read can
--- tell expired Records from an empty Stream.
-local function trim(meta, log, now)
-  if redis.call('EXISTS', log) == 0 then
-    -- Every Record expired, so a read from an older offset must fail.
-    local newest = redis.call('HGET', meta, 'newest')
-    if newest then
-      raise_trimmed(meta, newest)
-    end
+-- Sets `trimmed` to `newest` when the log is gone, as after an eviction. The log took every Record
+-- with it, so a read from an older offset must fail.
+local function mark_log_gone(meta, log)
+  if redis.call('EXISTS', log) == 1 then
     return
   end
-  local min = now - tonumber(redis.call('HGET', meta, 'ret'))
-  if min <= 0 then
-    return
-  end
-  local old = redis.call('XREVRANGE', log, '(' .. min .. '-0', '-', 'COUNT', 1)
-  if #old > 0 then
-    raise_trimmed(meta, old[1][1])
-    redis.call('XTRIM', log, 'MINID', min)
+  local newest = redis.call('HGET', meta, 'newest')
+  if newest then
+    raise_trimmed(meta, newest)
   end
 end
 
 -- The most Producers that one append prunes, so that an append after a long gap stays short.
 local PRUNE_LIMIT = 64
 
--- Removes the field of each Producer whose last append is older than the Retention. Its Records
--- are older too, so the log has none of them.
+-- Removes the field of each Producer whose last append is older than the Retention.
 local function prune(meta, producers, now)
   local min = now - tonumber(redis.call('HGET', meta, 'ret'))
   local old = redis.call('ZRANGEBYSCORE', producers, '-inf', '(' .. min, 'LIMIT', 0, PRUNE_LIMIT)
@@ -118,7 +105,8 @@ end
 -- since `XADD *` on Redis 7.0 can cross a millisecond inside one script.
 local next_ms, next_seq = 0, 0
 
--- Starts the script's ids after the newest id the log had, which `newest` keeps after a trim.
+-- Starts the script's ids after the newest id the log had, which `newest` keeps after the log is
+-- gone.
 -- Refuses `count` entries whose ids would not fit an offset, which packs the sequence in 20 bits.
 local function check_ids_fit(meta, log, now, count)
   local newest = redis.call('HGET', meta, 'newest')

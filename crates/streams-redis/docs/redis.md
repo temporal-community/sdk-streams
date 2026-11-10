@@ -34,7 +34,7 @@ form, and the `testdata/` of `temporalio-streams` has its test vectors.
 | `closer` | The encoded Producer that closed the Stream, which a read builds the close item from |
 | `cstat` | The close status, `1` for CLOSED, which a Brook Store is the only one it sets |
 | `newest` | The entry id of the newest entry |
-| `trimmed` | The entry id of the newest entry that Retention or the log's expiry dropped |
+| `trimmed` | The entry id of `newest` when a write found the log gone |
 | `p\|<kind>\|<producer id>` | The Producer's fence and last batch, 88 bytes |
 
 `<kind>` is the `ProducerKind` number. The `p|` value has big-endian numbers in this order.
@@ -59,7 +59,8 @@ form, and the `testdata/` of `temporalio-streams` has its test vectors.
 `:producers` scores each `<kind>|<producer id>` with the ms of its last append. An append drops the
 `p|` field of up to 64 Producers with no append for one Retention. A resend of such a Producer's
 last batch then writes the batch again, and a lower epoch of the Producer is accepted. So the fence
-lasts one Retention after the last append.
+lasts one Retention after the last append. An open Stream keeps the first copy of such a batch, so
+a read then gets both copies.
 
 An append with sequence 0 takes the sequence after the last batch's when the fence is the batch's
 epoch key, and 1 otherwise. The script reads `p|` and writes the batch in one step, so two such
@@ -83,19 +84,19 @@ closed Stream (`stream_closed`). Then:
   each data Record of the batch when it reads them.
 - `b` is the seq of the batch's first entry, on each later data entry, so a read that starts inside
   a batch gets `p` with one lookup. An entry never has both `p` and `b`.
-- A batch's entries share one millisecond, and a trim drops whole milliseconds, so a batch keeps
-  its `p` entry for as long as it has any entry.
+- A batch's entries share one millisecond, and the log loses its entries only all at once, so a
+  batch keeps its `p` entry for as long as it has any entry.
 - An offset is the entry id `<ms>-<seq>`, packed as `ms << 20 | seq`.
 
 ## TTLs
 
 - Each write sets `exp` to now plus the safety TTL for an open Stream, and to now plus the Retention
-  for a closed one.
-- `:producers` expires at `exp`. The meta key expires 30 days after `exp`, as the Tombstone.
-- The log expires at `exp`, or one Retention after the write if that is earlier.
-- Each append drops the Records older than the Retention. A read hides them too.
-- A write that finds the log gone sets `trimmed` to `newest`. Before that write, a read at or below
-  `newest` that finds no entry fails with `stream_expired`.
+  for a closed one. So the Retention counts from the close.
+- The log and `:producers` expire at `exp`. The meta key expires 30 days after `exp`, as the
+  Tombstone.
+- An open Stream keeps all its Records. No append drops a Record by its age, and no read hides one.
+- A write that finds the log gone, as after an eviction, sets `trimmed` to `newest`. Before that
+  write, a read at or below `newest` that finds no entry fails with `stream_expired`.
 
 ## Access
 
@@ -103,8 +104,8 @@ Redis checks the ACL of the script call and of each command in the script. `test
 these lists on a standalone server and on a cluster.
 
 - A Producer creates, appends and closes. It needs the keys `~<prefix>:{<namespace>:*` and the
-  commands `+evalsha +script|load +time +hget +hset +hdel +exists +pexpireat +xadd +xtrim
-  +xrevrange +zadd +zrangebyscore +zrem`. With `wait_replicas`, it also needs `+wait`.
+  commands `+evalsha +script|load +time +hget +hset +hdel +exists +pexpireat +xadd +xrevrange
+  +zadd +zrangebyscore +zrem`. With `wait_replicas`, it also needs `+wait`.
 - A Reader reads and describes. It needs the keys `%R~<prefix>:{<namespace>:*` and the commands
   `+evalsha_ro +script|load +time +hmget +xrange`. A read that waits also needs `+xread`, and a
   read of the last Records needs `+xrevrange`.
@@ -144,8 +145,8 @@ these lists on a standalone server and on a cluster.
 
 ## Known limits
 
-- An open Stream stays until its safety TTL passes after its last write, even with a short
-  Retention. A closed Stream expires one Retention after the close.
+- An open Stream keeps all its Records until its safety TTL passes after its last write, even with
+  a short Retention. A closed Stream expires one Retention after the close.
 - Any Producer closes a Stream, since the Store doesn't track an owner.
 - A cluster with `cluster-preferred-endpoint-type unknown-endpoint` gives no hosts in
   `CLUSTER SLOTS` and in its redirects. A blocking read then finds a slot's node only through the
