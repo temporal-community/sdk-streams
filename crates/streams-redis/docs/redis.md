@@ -6,11 +6,12 @@ form, and the `testdata/` of `temporalio-streams` has its test vectors.
 ## Keys
 
 ```text
-<prefix>:{<namespace>:<stream id>}:meta
-<prefix>:{<namespace>:<stream id>}:log
-<prefix>:{<namespace>:<stream id>}:closed
+<prefix>:{<stream id>}:meta
+<prefix>:{<stream id>}:log
+<prefix>:{<stream id>}:closed
 ```
 
+- A key has no Temporal namespace, so a Stream id is unique in one Redis and key prefix.
 - Each part is percent-encoded. The hash tag puts the three keys in one cluster slot.
 - The prefix has only letters, digits, `-`, `.`, `_` and `~`, so a key pattern shows it as written.
 - A create writes `:meta`. An append writes `:meta` and `:log`.
@@ -101,11 +102,11 @@ closed Stream (`stream_closed`). Then:
 Redis checks the ACL of the script call and of each command in the script. `tests/acl.rs` checks
 these lists on a standalone server and on a cluster.
 
-- A Producer creates, appends and closes. It needs the keys `~<prefix>:{<namespace>:*` and the
-  commands `+evalsha +script|load +time +hget +hset +hdel +exists +pexpireat +persist +xadd
-  +xrevrange`. With `wait_replicas`, it also needs `+wait`.
-- A Reader reads and describes. It needs the keys `%R~<prefix>:{<namespace>:*` and the commands
-  `+evalsha_ro +script|load +time +hmget +xrange`. A read that waits also needs `+xread`.
+- A Producer creates, appends and closes. It needs the keys `~<prefix>:*` and the commands
+  `+evalsha +script|load +time +hget +hset +hdel +exists +pexpireat +persist +xadd +xrevrange`.
+  With `wait_replicas`, it also needs `+wait`.
+- A Reader reads and describes. It needs the keys `%R~<prefix>:*` and the commands `+evalsha_ro
+  +script|load +time +hmget +xrange`. A read that waits also needs `+xread`.
 - A user that lacks a command of its list can fail a script after its first write, and that write
   stays. `connect` checks `+wait`, since without it each write would fail its `WAIT` after the
   write happened.
@@ -114,6 +115,8 @@ these lists on a standalone server and on a cluster.
 - `+info` and `+config|get` are optional. Without `+info`, the Store skips the version check.
   Without `+config|get`, it warns that it can't read the eviction policy.
 - A user with write access can write as any Producer.
+- A key pattern gives a user every Stream of a prefix, since a key has no namespace. Users that
+  must not share Streams need prefixes of their own.
 - The ACLs don't limit CPU or memory, since `+script|load` lets a user run any Lua. A Reader with no
   `+script|load` needs an admin to load the read script on each primary, after each restart,
   failover or `SCRIPT FLUSH`. A script's SHA is of its exact bytes, so load it with this command.

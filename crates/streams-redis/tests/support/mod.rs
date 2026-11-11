@@ -158,38 +158,38 @@ impl Raw {
 
 #[async_trait::async_trait]
 impl RawKeys for Raw {
-    async fn set_meta(&self, namespace: &str, stream: &str, field: &[u8], value: &[u8]) {
-        let keys = StreamKeys::new(PREFIX, namespace, stream);
+    async fn set_meta(&self, stream: &str, field: &[u8], value: &[u8]) {
+        let keys = StreamKeys::new(PREFIX, stream);
         self.query::<()>(redis::cmd("HSET").arg(keys.meta()).arg(field).arg(value))
             .await;
     }
 
-    async fn meta(&self, namespace: &str, stream: &str, field: &[u8]) -> Option<Vec<u8>> {
-        let keys = StreamKeys::new(PREFIX, namespace, stream);
+    async fn meta(&self, stream: &str, field: &[u8]) -> Option<Vec<u8>> {
+        let keys = StreamKeys::new(PREFIX, stream);
         self.query(redis::cmd("HGET").arg(keys.meta()).arg(field))
             .await
     }
 
-    async fn ttls(&self, namespace: &str, stream: &str) -> (i64, i64) {
-        let keys = StreamKeys::new(PREFIX, namespace, stream);
+    async fn ttls(&self, stream: &str) -> (i64, i64) {
+        let keys = StreamKeys::new(PREFIX, stream);
         let log = self.query(redis::cmd("PTTL").arg(keys.log())).await;
         let meta = self.query(redis::cmd("PTTL").arg(keys.meta())).await;
         (log, meta)
     }
 
-    async fn add_raw_entry(&self, namespace: &str, stream: &str, id: &str) {
-        let keys = StreamKeys::new(PREFIX, namespace, stream);
+    async fn add_raw_entry(&self, stream: &str, id: &str) {
+        let keys = StreamKeys::new(PREFIX, stream);
         self.query::<String>(redis::cmd("XADD").arg(keys.log()).arg(id).arg("x").arg("y"))
             .await;
     }
 
-    async fn log_len(&self, namespace: &str, stream: &str) -> usize {
-        let keys = StreamKeys::new(PREFIX, namespace, stream);
+    async fn log_len(&self, stream: &str) -> usize {
+        let keys = StreamKeys::new(PREFIX, stream);
         self.query(redis::cmd("XLEN").arg(keys.log())).await
     }
 
-    async fn drop_log(&self, namespace: &str, stream: &str) {
-        let keys = StreamKeys::new(PREFIX, namespace, stream);
+    async fn drop_log(&self, stream: &str) {
+        let keys = StreamKeys::new(PREFIX, stream);
         self.query::<()>(redis::cmd("DEL").arg(keys.log())).await;
     }
 }

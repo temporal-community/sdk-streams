@@ -19,3 +19,5 @@
   close. A Producer needs `+persist`.
 - The Store reads no newest-N page, so `read_back` and its script are gone, and a Reader no longer
   needs `+xrevrange`. `Store::read` and `Store::wait_after` take a `StreamRef`.
+- The keys hold no Temporal namespace, so a Stream id is unique in one Redis and key prefix, and an
+  ACL key pattern gives a user one prefix. The Store calls take no namespace.

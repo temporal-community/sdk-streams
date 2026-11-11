@@ -93,7 +93,7 @@ async fn run(mut options: RedisStoreOptions) {
         if tasks.len() == IN_FLIGHT {
             failures.extend(tasks.join_next().await.unwrap().unwrap());
         }
-        let seed = Seed::new(seed, format!("ns-{run}-{seed}"), redis.clone(), raw.clone());
+        let seed = Seed::new(seed, format!("{run}-{seed}"), redis.clone(), raw.clone());
         tasks.spawn(seed.run());
     }
     while let Some(failure) = tasks.join_next().await {
@@ -188,10 +188,11 @@ fn task(started: i64) -> WorkflowTaskEpoch {
     }
 }
 
-/// The ref of each Stream.
-fn stream_ref(stream: usize) -> StreamRef {
+/// The ref of each Stream of the seed `run`. A key holds no namespace, so the seeds that share a
+/// server take Stream ids of their own.
+fn stream_ref(run: &str, stream: usize) -> StreamRef {
     StreamRef {
-        id: STREAMS[stream].to_string(),
+        id: format!("{run}-{}", STREAMS[stream]),
         ..Default::default()
     }
 }
@@ -286,7 +287,8 @@ struct Side {
 struct Seed {
     seed: u64,
     rng: Rng,
-    namespace: String,
+    /// The part of each Stream id that is the seed's own.
+    run: String,
     producers: Vec<Producer>,
     memory: Side,
     redis: Side,
@@ -300,12 +302,12 @@ struct Seed {
 }
 
 impl Seed {
-    fn new(seed: u64, namespace: String, redis: Arc<RedisStore>, raw: Raw) -> Self {
+    fn new(seed: u64, run: String, redis: Arc<RedisStore>, raw: Raw) -> Self {
         Self {
             seed,
             // Zero is a fixed point of xorshift.
             rng: Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1),
-            namespace,
+            run,
             producers: producers(),
             memory: Side {
                 store: Arc::new(MemoryStore::new(RETENTION, Some(RETENTION))),
@@ -328,7 +330,7 @@ impl Seed {
             let call = self.next_call();
             self.calls.push(format!("{step}: {call:?}"));
             self.errors.clear();
-            let keys = StreamKeys::new(PREFIX, &self.namespace, STREAMS[call.stream()]);
+            let keys = StreamKeys::new(PREFIX, &stream_ref(&self.run, call.stream()).id);
             let before = match call.writes() {
                 true => Some(self.raw.snapshot(&keys).await),
                 false => None,
@@ -442,7 +444,7 @@ impl Seed {
     }
 
     async fn answer(&mut self, which: Which, call: &Call) -> Answer {
-        let namespace = self.namespace.clone();
+        let run = self.run.clone();
         let side = match which {
             Which::Memory => &mut self.memory,
             Which::Redis => &mut self.redis,
@@ -466,10 +468,7 @@ impl Seed {
                     conflict: *conflict,
                     request_id,
                 };
-                let created = side
-                    .store
-                    .create(&namespace, &stream_ref(stream), &create)
-                    .await;
+                let created = side.store.create(&stream_ref(&run, stream), &create).await;
                 created.map(|created| Answer::Created {
                     outcome: created.outcome,
                     retention: created.retention,
@@ -486,8 +485,7 @@ impl Seed {
                 let appended = side
                     .store
                     .append(
-                        &namespace,
-                        &stream_ref(stream),
+                        &stream_ref(&run, stream),
                         &Batch {
                             producer,
                             sequence: *sequence,
@@ -496,7 +494,7 @@ impl Seed {
                         },
                     )
                     .await;
-                let logs = listing(side.store.as_ref(), &namespace, &stream_ref(stream)).await;
+                let logs = listing(side.store.as_ref(), &stream_ref(&run, stream)).await;
                 side.logs[stream] = logs;
                 appended.map(|appended| Answer::Appended {
                     places: appended.offsets.map(|(first, last)| {
@@ -507,10 +505,7 @@ impl Seed {
             }
             Call::Close { producer, .. } => {
                 let producer = &self.producers[*producer];
-                let closed = side
-                    .store
-                    .close(&namespace, &stream_ref(stream), producer)
-                    .await;
+                let closed = side.store.close(&stream_ref(&run, stream), producer).await;
                 closed.map(|closed| Answer::Closed {
                     already: closed.already,
                 })
@@ -519,7 +514,7 @@ impl Seed {
                 let from = from.map_or(0, |from| offset_at(&side.logs, from));
                 let read = side
                     .store
-                    .read(&namespace, &stream_ref(stream), from, *count)
+                    .read(&stream_ref(&run, stream), from, *count)
                     .await;
                 read.map(|(state, entries)| Answer::Read {
                     exists: state.exists,
@@ -546,8 +541,8 @@ enum Which {
 }
 
 /// The offsets of a Stream's whole log.
-async fn listing(store: &dyn Store, namespace: &str, stream: &StreamRef) -> Vec<i64> {
-    let read: StreamResult<_> = store.read(namespace, stream, 0, 100_000).await;
+async fn listing(store: &dyn Store, stream: &StreamRef) -> Vec<i64> {
+    let read: StreamResult<_> = store.read(stream, 0, 100_000).await;
     read.map_or_else(
         |_| Vec::new(),
         |(_, entries)| entries.iter().map(|entry| entry.offset).collect(),

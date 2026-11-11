@@ -89,8 +89,8 @@ impl RedisStore {
         })
     }
 
-    fn keys(&self, namespace: &str, stream_id: &str) -> StreamKeys {
-        StreamKeys::new(self.prefix.as_str(), namespace, stream_id)
+    fn keys(&self, stream_id: &str) -> StreamKeys {
+        StreamKeys::new(self.prefix.as_str(), stream_id)
     }
 
     /// The last-write TTL as the write scripts take it, in ms, and empty for none.
@@ -169,13 +169,8 @@ impl Store for RedisStore {
     }
 
     /// Creates a Stream, or finds it.
-    async fn create(
-        &self,
-        namespace: &str,
-        stream_ref: &StreamRef,
-        create: &Create<'_>,
-    ) -> StreamResult<Created> {
-        let keys = self.keys(namespace, &stream_ref.id);
+    async fn create(&self, stream_ref: &StreamRef, create: &Create<'_>) -> StreamResult<Created> {
+        let keys = self.keys(&stream_ref.id);
         let retention = create.retention.filter(|r| !r.is_zero());
         let retention = retention.unwrap_or(self.retention);
         let mut call = ScriptCall::write(&scripts::CREATE_SCRIPT, &keys);
@@ -191,13 +186,8 @@ impl Store for RedisStore {
         Ok(created)
     }
 
-    async fn append(
-        &self,
-        namespace: &str,
-        stream_ref: &StreamRef,
-        batch: &Batch<'_>,
-    ) -> StreamResult<Appended> {
-        let keys = self.keys(namespace, &stream_ref.id);
+    async fn append(&self, stream_ref: &StreamRef, batch: &Batch<'_>) -> StreamResult<Appended> {
+        let keys = self.keys(&stream_ref.id);
         let producer = batch.producer;
         let kind = ProducerKind::try_from(producer)?;
         let mut call = ScriptCall::write(&scripts::APPEND_SCRIPT, &keys);
@@ -221,13 +211,8 @@ impl Store for RedisStore {
 
     /// Closes a Stream. The close writes no entry, so it adds one to the `:closed` key, which wakes
     /// the blocked reads.
-    async fn close(
-        &self,
-        namespace: &str,
-        stream_ref: &StreamRef,
-        producer: &Producer,
-    ) -> StreamResult<Closed> {
-        let keys = self.keys(namespace, &stream_ref.id);
+    async fn close(&self, stream_ref: &StreamRef, producer: &Producer) -> StreamResult<Closed> {
+        let keys = self.keys(&stream_ref.id);
         let mut call = ScriptCall::write(&scripts::CLOSE_SCRIPT, &keys);
         // An argument and not a key. `close.lua` says why.
         call.cmd
@@ -248,12 +233,11 @@ impl Store for RedisStore {
     /// from the start of the log.
     async fn read(
         &self,
-        namespace: &str,
         stream_ref: &StreamRef,
         from: i64,
         count: usize,
     ) -> StreamResult<(StreamState, Vec<Entry>)> {
-        let keys = self.keys(namespace, &stream_ref.id);
+        let keys = self.keys(&stream_ref.id);
         let start = if from > 0 {
             entry_id_of_offset(from)
         } else {
@@ -276,12 +260,11 @@ impl Store for RedisStore {
     /// The wait uses a dedicated connection, so it doesn't block the short calls.
     async fn wait_after(
         &self,
-        namespace: &str,
         stream_ref: &StreamRef,
         after: i64,
         deadline: Instant,
     ) -> StreamResult<bool> {
-        let keys = self.keys(namespace, &stream_ref.id);
+        let keys = self.keys(&stream_ref.id);
         let after = if after > 0 {
             entry_id_of_offset(after)
         } else {
@@ -577,16 +560,12 @@ mod tests {
             .await
             .unwrap();
         let without = RedisStore::connect(options(None)).await.unwrap();
-        let namespace = format!("ns-ttl-{}", std::process::id());
         let handle = StreamRef {
-            id: "ttl".to_string(),
+            id: format!("ttl-{}", std::process::id()),
             ..Default::default()
         };
-        with_ttl
-            .create(&namespace, &handle, &Create::default())
-            .await
-            .unwrap();
-        let (state, _) = with_ttl.read(&namespace, &handle, 0, 0).await.unwrap();
+        with_ttl.create(&handle, &Create::default()).await.unwrap();
+        let (state, _) = with_ttl.read(&handle, 0, 0).await.unwrap();
         assert!(state.expires_ms > 0);
         let producer = Producer {
             id: "client:ttl".to_string(),
@@ -600,10 +579,10 @@ mod tests {
             records: &[],
             digest: [0; 16],
         };
-        without.append(&namespace, &handle, &batch).await.unwrap();
-        let (state, _) = without.read(&namespace, &handle, 0, 0).await.unwrap();
+        without.append(&handle, &batch).await.unwrap();
+        let (state, _) = without.read(&handle, 0, 0).await.unwrap();
         assert!(!state.expired() && state.expires_ms == 0);
-        let keys = StreamKeys::new("streams-unit", &namespace, "ttl");
+        let keys = StreamKeys::new("streams-unit", &handle.id);
         let mut conn = redis::Client::open(url.as_str())
             .unwrap()
             .get_multiplexed_async_connection()
@@ -633,17 +612,12 @@ mod tests {
         let mut options = RedisStoreOptions::new(crate::testing::standalone_url()).unwrap();
         options.key_prefix = "streams-unit".parse().unwrap();
         let store = RedisStore::connect(options).await.unwrap();
-        let (namespace, handle) = (
-            format!("ns-{}", std::process::id()),
-            StreamRef {
-                id: "batch".to_string(),
-                ..Default::default()
-            },
-        );
-        store
-            .create(&namespace, &handle, &Create::default())
-            .await
-            .unwrap();
+        // A key holds no namespace, so each run takes a Stream id of its own.
+        let handle = StreamRef {
+            id: format!("batch-{}", std::process::id()),
+            ..Default::default()
+        };
+        store.create(&handle, &Create::default()).await.unwrap();
         let producer = Producer {
             id: "client:unit".to_string(),
             kind: Some(Kind::Client(ClientProducer {
@@ -666,12 +640,12 @@ mod tests {
             digest: [0; 16],
         };
         let (first, _) = store
-            .append(&namespace, &handle, &batch)
+            .append(&handle, &batch)
             .await
             .unwrap()
             .offsets
             .unwrap();
-        let (_, forward) = store.read(&namespace, &handle, first + 2, 2).await.unwrap();
+        let (_, forward) = store.read(&handle, first + 2, 2).await.unwrap();
         for entry in &forward {
             assert_eq!(entry.record.as_deref(), Some(record.as_slice()));
         }
