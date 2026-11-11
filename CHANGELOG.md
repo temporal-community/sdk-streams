@@ -29,3 +29,5 @@
   its item as field 1, so Records that an earlier build stored don't decode.
 - A batch with a Record that has no body, a Workflow Producer's epoch with no started event, and a
   read offset over 8 bytes fail with `stream_invalid` before they reach Redis.
+- A writer is an object that the bridge holds, and dropping it releases it. The writers of one
+  Producer epoch share one order of batches. A write on a closed writer fails with `stream_closed`.
