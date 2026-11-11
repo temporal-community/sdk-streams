@@ -31,3 +31,5 @@
   read offset over 8 bytes fail with `stream_invalid` before they reach Redis.
 - A writer is an object that the bridge holds, and dropping it releases it. The writers of one
   Producer epoch share one order of batches. A write on a closed writer fails with `stream_closed`.
+- The API dropped the unknown writer reason, so the reason numbers of `stream_unsupported`,
+  `stream_already_exists` and `stream_storage_corrupt` are one lower.
