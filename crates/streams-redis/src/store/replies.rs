@@ -93,7 +93,8 @@ impl FromRedisValue for ReadReply {
         let earlier = earlier(&producer)?;
         let now_ms = seconds * 1000 + micros / 1000;
         let (version, closed, newest, trimmed, retention, expires, closer, cstat) = meta;
-        // A create sets `v`, `ret` and `exp` together, so a Stream with no `v` doesn't exist.
+        // A create sets `v` and `ret` together, so a Stream with no `v` doesn't exist. An open
+        // Stream with no last-write TTL has no `exp`.
         let Some(version) = version else {
             let texts = [&closed, &newest, &trimmed];
             if texts.iter().any(|text| text.is_some())
@@ -124,31 +125,13 @@ impl FromRedisValue for ReadReply {
             newest: offset_or_zero(newest)?,
             trimmed: offset_or_zero(trimmed)?,
             retention: Duration::from_millis(retention.ok_or("a Stream has no Retention")?),
-            expires_ms: expires.ok_or("a Stream has no expiry")?,
+            expires_ms: expires.unwrap_or(0),
             now_ms,
         };
         Ok(Self {
             state,
             entries,
             earlier,
-        })
-    }
-}
-
-/// The answer of `read_back.lua`, `[entries, Producer]`, with the entries newest first. The
-/// Producer is the one of the oldest entry's batch, when that batch starts before that entry, and
-/// `''` otherwise.
-pub(super) struct ReadBackReply {
-    pub(super) entries: Vec<LogEntry>,
-    pub(super) earlier: Option<Producer>,
-}
-
-impl FromRedisValue for ReadBackReply {
-    fn from_redis_value(value: Value) -> Result<Self, ParsingError> {
-        let (entries, producer): (_, Vec<u8>) = FromRedisValue::from_redis_value(value)?;
-        Ok(Self {
-            entries,
-            earlier: earlier(&producer)?,
         })
     }
 }

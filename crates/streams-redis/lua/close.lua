@@ -36,6 +36,6 @@ end
 -- closes with CLOSED, which is STREAM_CLOSE_STATUS_CLOSED = 1.
 redis.call('HSET', meta, 'closed', '1', 'closer', closer, 'cstat', '1')
 redis.call('XADD', closed_key, '*', 'closed', '1')
--- Safety TTL 0, since a closed Stream keeps its Retention.
-refresh(meta, log, closed_key, now, 0, tombstone)
+-- No last-write TTL, since a closed Stream keeps its Retention.
+refresh(meta, log, closed_key, now, nil, tombstone)
 return {'closed'}

@@ -20,8 +20,8 @@ lists the main config fields. `RedisStoreOptions` has the same ones, except that
 | `urls` | | One `redis://` or `rediss://` URL, or the seeds of a cluster |
 | `cluster` | `false` | Set for a Redis Cluster |
 | `key_prefix` | `temporal-streams` | The prefix of every key |
-| `retention` | 7 days | A Stream's Retention when its create sets none. It counts from the close. |
-| `safety_ttl` | 90 days | How long an open Workflow-owned Stream stays after its last write |
+| `retention` | 7 days | The Retention of each Stream. It counts from the close. |
+| `last_write_ttl` | none | How long an open Stream stays after its last write. None keeps it open |
 | `wait_replicas` | 0 | The replicas that must have each write, with `WAIT` |
 | `wait_timeout` | 1 s | How long a write waits for its replicas |
 

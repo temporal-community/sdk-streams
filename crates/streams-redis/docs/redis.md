@@ -27,7 +27,7 @@ form, and the `testdata/` of `temporalio-streams` has its test vectors.
 |---|---|
 | `v` | The format version, 1 |
 | `ret` | The Retention, in ms |
-| `exp` | When the Stream stops taking writes, in ms since 1970 |
+| `exp` | When the Stream stops taking writes, in ms since 1970, absent when it has no expiry |
 | `rid` | The request id of the create that made the Stream, absent when it gave none |
 | `closed` | Set by the close |
 | `closer` | The encoded Producer that closed the Stream, which a read builds the close item from |
@@ -87,8 +87,10 @@ closed Stream (`stream_closed`). Then:
 
 ## TTLs
 
-- Each write sets `exp` to now plus the safety TTL for an open Stream, and to now plus the Retention
-  for a closed one. So the Retention counts from the close.
+- Each write sets `exp` to now plus the last-write TTL for an open Stream, and to now plus the
+  Retention for a closed one. So the Retention counts from the close.
+- With no `last_write_ttl` in the config, a write to an open Stream removes `exp` and the expiry of
+  the meta and the log, so the open Stream stays until its close.
 - The log expires at `exp`. The meta key expires 30 days after `exp`, as the Tombstone.
 - An open Stream keeps all its Records. No append drops a Record by its age, and no read hides one.
 - A write that finds the log gone, as after an eviction, sets `trimmed` to `newest`. Before that
@@ -100,11 +102,10 @@ Redis checks the ACL of the script call and of each command in the script. `test
 these lists on a standalone server and on a cluster.
 
 - A Producer creates, appends and closes. It needs the keys `~<prefix>:{<namespace>:*` and the
-  commands `+evalsha +script|load +time +hget +hset +exists +pexpireat +xadd +xrevrange`. With
-  `wait_replicas`, it also needs `+wait`.
+  commands `+evalsha +script|load +time +hget +hset +hdel +exists +pexpireat +persist +xadd
+  +xrevrange`. With `wait_replicas`, it also needs `+wait`.
 - A Reader reads and describes. It needs the keys `%R~<prefix>:{<namespace>:*` and the commands
-  `+evalsha_ro +script|load +time +hmget +xrange`. A read that waits also needs `+xread`, and a
-  read of the last Records needs `+xrevrange`.
+  `+evalsha_ro +script|load +time +hmget +xrange`. A read that waits also needs `+xread`.
 - A user that lacks a command of its list can fail a script after its first write, and that write
   stays. `connect` checks `+wait`, since without it each write would fail its `WAIT` after the
   write happened.
@@ -114,11 +115,11 @@ these lists on a standalone server and on a cluster.
   Without `+config|get`, it warns that it can't read the eviction policy.
 - A user with write access can write as any Producer.
 - The ACLs don't limit CPU or memory, since `+script|load` lets a user run any Lua. A Reader with no
-  `+script|load` needs an admin to load the two read scripts on each primary, after each restart,
-  failover or `SCRIPT FLUSH`. A script's SHA is of its exact bytes, so load them with this command.
+  `+script|load` needs an admin to load the read script on each primary, after each restart,
+  failover or `SCRIPT FLUSH`. A script's SHA is of its exact bytes, so load it with this command.
 
   ```sh
-  for script in read read_back; do
+  for script in read; do
     { printf '#!lua flags=no-writes\n'; cat lua/batch.lua "lua/$script.lua"; } |
       redis-cli -x SCRIPT LOAD
   done
@@ -141,8 +142,8 @@ these lists on a standalone server and on a cluster.
 
 ## Known limits
 
-- An open Stream keeps all its Records until its safety TTL passes after its last write, even with
-  a short Retention. A closed Stream expires one Retention after the close.
+- An open Stream keeps all its Records until its close, or until its last-write TTL passes after
+  its last write when the config sets one. A closed Stream expires one Retention after the close.
 - The meta hash keeps one 88-byte `p|` field for each Producer that wrote to the Stream, so a
   Stream with many Producers has a large meta hash.
 - Any Producer closes a Stream, since the Store doesn't track an owner.

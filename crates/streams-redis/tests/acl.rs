@@ -167,21 +167,13 @@ async fn the_documented_commands_run_every_call_of_each_role() {
     let (first, _) = appended.offsets.unwrap();
 
     let reader = store(user(&url, &reader_name, &namespace, role(&READER)).await).await;
-    let (state, entries) = reader.read(&namespace, "s", 0, 10).await.unwrap();
+    let (state, entries) = reader.read(&namespace, &handle, 0, 10).await.unwrap();
     assert_eq!((state.newest, entries.len()), (first, 1));
-    assert_eq!(
-        reader
-            .read_back(&namespace, "s", first, 10)
-            .await
-            .unwrap()
-            .len(),
-        1
-    );
     // The log has an entry after 0, so the Reader's blocking read wakes at once.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     assert!(
         reader
-            .wait_after(&namespace, "s", 0, deadline)
+            .wait_after(&namespace, &handle, 0, deadline)
             .await
             .unwrap()
     );
@@ -457,10 +449,9 @@ async fn the_documented_commands_serve_a_cluster_while_a_slot_moves() {
     source.run(&migrate).await;
 
     let appended = producer.append(&namespace, &handle, &batch(2)).await;
-    let read = reader.read(&namespace, &handle.id, 0, 10).await;
-    let read_back = reader.read_back(&namespace, &handle.id, i64::MAX, 10).await;
+    let read = reader.read(&namespace, &handle, 0, 10).await;
     let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
-    let waited = reader.wait_after(&namespace, &handle.id, 0, deadline).await;
+    let waited = reader.wait_after(&namespace, &handle, 0, deadline).await;
     let closed = producer.close(&namespace, &handle, &me).await.map(|_| ());
 
     drop(migration);
@@ -475,7 +466,6 @@ async fn the_documented_commands_serve_a_cluster_while_a_slot_moves() {
     let appended = appended.unwrap().offsets.unwrap();
     let (state, entries) = read.unwrap();
     assert_eq!((state.newest, entries.len()), (appended.1, 2));
-    assert_eq!(read_back.unwrap().len(), 2);
     // A blocking read ends with no wake while the slot migrates, and the service reads again.
     assert!(!waited.unwrap());
     closed.unwrap();
@@ -524,9 +514,9 @@ async fn a_standalone_store_at_a_cluster_node_fails_with_a_config_error() {
         .unwrap();
     let store = store(login(&nodes[0].url(), &name)).await;
     let created = store.create(&namespace, &handle, &Create::default()).await;
-    let read = store.read(&namespace, &handle.id, 0, 10).await;
+    let read = store.read(&namespace, &handle, 0, 10).await;
     let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
-    let waited = store.wait_after(&namespace, &handle.id, 0, deadline).await;
+    let waited = store.wait_after(&namespace, &handle, 0, deadline).await;
     let _: () = redis::cmd("ACL")
         .arg("DELUSER")
         .arg(&name)

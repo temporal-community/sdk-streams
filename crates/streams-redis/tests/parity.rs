@@ -71,7 +71,7 @@ async fn the_redis_store_answers_as_the_memory_store_on_a_redis_cluster() {
 async fn run(mut options: RedisStoreOptions) {
     options.key_prefix = PREFIX.parse().unwrap();
     options.retention = RETENTION;
-    options.safety_ttl = RETENTION;
+    options.last_write_ttl = Some(RETENTION);
     let raw = Raw::open(&options.topology).await;
     let redis = Arc::new(RedisStore::connect(options).await.unwrap());
     let seeds: Vec<u64> = match std::env::var("STREAMS_PARITY_SEED") {
@@ -129,7 +129,7 @@ fn producers() -> Vec<Producer> {
     };
     let activity = |run: &str, attempt| Producer {
         id: activity_producer_id(run, "a", "s"),
-        kind: Some(Kind::Activity(ActivityProducer {
+        kind: Some(Kind::WorkflowActivity(ActivityProducer {
             run_id: run.to_string(),
             epoch: Some(ActivityEpoch {
                 attempt_scheduled_time: Some(prost_types::Timestamp {
@@ -221,12 +221,6 @@ enum Call {
         from: Option<usize>,
         count: usize,
     },
-    /// A reverse read from the entry at `before`, or from the newest for none.
-    ReadBack {
-        stream: usize,
-        before: Option<usize>,
-        count: usize,
-    },
 }
 
 impl Call {
@@ -235,8 +229,7 @@ impl Call {
             Call::Create { stream, .. }
             | Call::Append { stream, .. }
             | Call::Close { stream, .. }
-            | Call::Read { stream, .. }
-            | Call::ReadBack { stream, .. } => *stream,
+            | Call::Read { stream, .. } => *stream,
         }
     }
 
@@ -281,7 +274,6 @@ enum Answer {
         retention: Duration,
         entries: Vec<Item>,
     },
-    ReadBack(Vec<Item>),
     Refused(Reason),
 }
 
@@ -316,7 +308,7 @@ impl Seed {
             namespace,
             producers: producers(),
             memory: Side {
-                store: Arc::new(MemoryStore::new(RETENTION, RETENTION)),
+                store: Arc::new(MemoryStore::new(RETENTION, Some(RETENTION))),
                 logs: Default::default(),
             },
             redis: Side {
@@ -397,14 +389,6 @@ impl Seed {
                     count: self.rng.pick(&[0, 1, 2, 5, 100]),
                 }
             }
-            7 | 8 => {
-                let before = self.rng.below(len + 1);
-                Call::ReadBack {
-                    stream,
-                    before: self.rng.pick(&[None, Some(before)]),
-                    count: self.rng.pick(&[0, 1, 2, 5, 100]),
-                }
-            }
             _ => {
                 let producer = self.rng.below(self.producers.len());
                 let (last, last_texts) = self
@@ -464,7 +448,6 @@ impl Seed {
             Which::Redis => &mut self.redis,
         };
         let stream = call.stream();
-        let id = STREAMS[stream];
         let offset_at = |logs: &[Vec<i64>; 2], place: usize| {
             let log = &logs[stream];
             log.get(place)
@@ -513,7 +496,7 @@ impl Seed {
                         },
                     )
                     .await;
-                let logs = listing(side.store.as_ref(), &namespace, id).await;
+                let logs = listing(side.store.as_ref(), &namespace, &stream_ref(stream)).await;
                 side.logs[stream] = logs;
                 appended.map(|appended| Answer::Appended {
                     places: appended.offsets.map(|(first, last)| {
@@ -534,7 +517,10 @@ impl Seed {
             }
             Call::Read { from, count, .. } => {
                 let from = from.map_or(0, |from| offset_at(&side.logs, from));
-                let read = side.store.read(&namespace, id, from, *count).await;
+                let read = side
+                    .store
+                    .read(&namespace, &stream_ref(stream), from, *count)
+                    .await;
                 read.map(|(state, entries)| Answer::Read {
                     exists: state.exists,
                     version: state.version,
@@ -544,11 +530,6 @@ impl Seed {
                     retention: state.retention,
                     entries: items(side, stream, entries),
                 })
-            }
-            Call::ReadBack { before, count, .. } => {
-                let before = before.map_or(i64::MAX, |before| offset_at(&side.logs, before));
-                let read = side.store.read_back(&namespace, id, before, *count).await;
-                read.map(|entries| Answer::ReadBack(items(side, stream, entries)))
             }
         };
         answer.unwrap_or_else(|error| {
@@ -565,8 +546,8 @@ enum Which {
 }
 
 /// The offsets of a Stream's whole log.
-async fn listing(store: &dyn Store, namespace: &str, id: &str) -> Vec<i64> {
-    let read: StreamResult<_> = store.read(namespace, id, 0, 100_000).await;
+async fn listing(store: &dyn Store, namespace: &str, stream: &StreamRef) -> Vec<i64> {
+    let read: StreamResult<_> = store.read(namespace, stream, 0, 100_000).await;
     read.map_or_else(
         |_| Vec::new(),
         |(_, entries)| entries.iter().map(|entry| entry.offset).collect(),

@@ -7,7 +7,7 @@ use temporalio_streams::{
     StreamRuntime,
     ids::StreamKeys,
     store::Store,
-    testing::{Needs, RawKeys, TestBackend},
+    testing::{Needs, RawKeys, RuntimeConfig, TestBackend},
 };
 use temporalio_streams_redis::{
     RedisStore, RedisStoreOptions, RedisStreamRuntime, Topology, Url, WaitOptions,
@@ -95,25 +95,29 @@ impl TestBackend for RedisBackend {
     }
 
     // Through the config bytes, as a bridge builds it.
-    fn runtime(&self, backend: &str) -> Arc<StreamRuntime> {
+    fn runtime(&self, runtime: &RuntimeConfig) -> Arc<StreamRuntime> {
         let seconds = |duration: Duration| prost_types::Duration {
             seconds: i64::try_from(duration.as_secs()).unwrap(),
-            nanos: 0,
+            nanos: i32::try_from(duration.subsec_nanos()).unwrap(),
         };
         let config = RedisStreamConfig {
             urls: self.topology.servers().map(|url| url.to_string()).collect(),
             cluster: matches!(self.topology, Topology::Cluster { .. }),
             key_prefix: PREFIX.to_string(),
-            backend: backend.to_string(),
+            backend: runtime.backend.clone(),
             wait_replicas: self
                 .wait
                 .map_or(0, |wait| i32::try_from(wait.replicas.get()).unwrap()),
             wait_timeout: Some(seconds(WAIT_TIMEOUT)),
             response_timeout: Some(seconds(2 * WAIT_TIMEOUT)),
             // The writer cases leave megabytes of Records, which a local server keeps until the
-            // Stream expires. An open Stream expires the safety TTL after its last write.
-            retention: Some(seconds(Duration::from_secs(300))),
-            safety_ttl: Some(seconds(Duration::from_secs(300))),
+            // Stream expires. So a case that sets no TTL still gets ones that end.
+            retention: Some(seconds(
+                runtime.retention.unwrap_or(Duration::from_secs(300)),
+            )),
+            last_write_ttl: Some(seconds(
+                runtime.last_write_ttl.unwrap_or(Duration::from_secs(300)),
+            )),
             ..Default::default()
         };
         RedisStreamRuntime::from_config_bytes(&config.encode_to_vec(), None).unwrap()

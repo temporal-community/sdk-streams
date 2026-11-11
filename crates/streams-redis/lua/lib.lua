@@ -28,15 +28,23 @@ local function check_live(meta, version, now)
   return nil
 end
 
--- Sets the expiry after this write. An open Stream keeps the safety TTL after its last write, and a
--- closed one keeps the Retention. The meta key expires 30 days later, as the Tombstone. Only a
--- close gives the `closed` key, since a closed Stream takes no other write.
-local function refresh(meta, log, closed, now, safety, tombstone)
-  local retention = tonumber(redis.call('HGET', meta, 'ret'))
-  local exp = now + retention
-  if not redis.call('HGET', meta, 'closed') then
-    exp = now + safety
+-- Sets the expiry after this write. An open Stream keeps the last-write TTL after its last write,
+-- and with none it stays until its close. A closed one keeps the Retention. The meta key expires 30
+-- days later, as the Tombstone. Only a close gives the `closed` key, since a closed Stream takes no
+-- other write.
+local function refresh(meta, log, closed, now, last_write_ttl, tombstone)
+  local ttl = last_write_ttl
+  if redis.call('HGET', meta, 'closed') then
+    ttl = tonumber(redis.call('HGET', meta, 'ret'))
   end
+  if not ttl then
+    -- The backend config may have dropped its last-write TTL since an earlier write.
+    redis.call('HDEL', meta, 'exp')
+    redis.call('PERSIST', meta)
+    redis.call('PERSIST', log)
+    return
+  end
+  local exp = now + ttl
   redis.call('HSET', meta, 'exp', exp)
   redis.call('PEXPIREAT', meta, exp + tombstone)
   if closed and redis.call('EXISTS', closed) == 1 then

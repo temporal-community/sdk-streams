@@ -4,7 +4,7 @@ use crate::{RedisStoreError, RedisStoreResult};
 use std::{num::NonZeroUsize, str::FromStr, time::Duration};
 use temporalio_streams::{
     ids::{DEFAULT_KEY_PREFIX, encode_part},
-    store::{DEFAULT_RETENTION, DEFAULT_SAFETY_TTL},
+    store::DEFAULT_RETENTION,
 };
 use url::Url;
 
@@ -73,8 +73,9 @@ pub struct RedisStoreOptions {
     pub key_prefix: KeyPrefix,
     /// The Retention of a Stream whose create sets none.
     pub retention: Duration,
-    /// How long an open Workflow-owned Stream stays after its last write.
-    pub safety_ttl: Duration,
+    /// How long an open Stream stays after its last write. `None` keeps an open Stream until its
+    /// close.
+    pub last_write_ttl: Option<Duration>,
     /// How many blocking reads may wait on one node at once. Each has a connection of its own.
     pub blocking_reads_per_node: NonZeroUsize,
     /// How long a short call waits for its answer.
@@ -109,7 +110,7 @@ impl From<Topology<Url>> for RedisStoreOptions {
             topology,
             key_prefix: KeyPrefix::default(),
             retention: DEFAULT_RETENTION,
-            safety_ttl: DEFAULT_SAFETY_TTL,
+            last_write_ttl: None,
             blocking_reads_per_node: DEFAULT_BLOCKING_READS_PER_NODE,
             response_timeout: Duration::from_secs(5),
             wait: None,
