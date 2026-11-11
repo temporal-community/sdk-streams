@@ -23,3 +23,7 @@
   ACL key pattern gives a user one prefix. The Store calls take no namespace.
 - A read has no `create_wait`, so a read of a Stream that nobody created fails at once with
   `stream_not_found`. Once the Stream exists, a read waits for Records as before.
+- An append, a close and a writer's open carry the Producer directly, since the API has no
+  `StreamWriter`. Each read item carries its own offset. A write whose Producer lacks a field that
+  the API requires fails with `stream_invalid` before it reaches Redis. A stored Record now encodes
+  its item as field 1, so Records that an earlier build stored don't decode.

@@ -117,8 +117,8 @@ fn one_record() -> (Vec<Vec<u8>>, [u8; 16]) {
         item: Some(Item::Data(StreamData {
             producer: Some(client()),
             body: records[0].body.clone(),
+            ..Default::default()
         })),
-        ..Default::default()
     };
     (vec![stored.encode_to_vec()], batch_digest(&records))
 }

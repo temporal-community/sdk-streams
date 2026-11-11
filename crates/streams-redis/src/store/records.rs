@@ -163,7 +163,6 @@ mod tests {
                 producer,
                 ..Default::default()
             })),
-            ..Default::default()
         }
         .encode_to_vec()
     }

@@ -579,8 +579,8 @@ fn batch(producer: &Producer, texts: &[&str]) -> (Vec<Vec<u8>>, [u8; 16]) {
                 item: Some(stream_record::Item::Data(StreamData {
                     producer: Some(producer.clone()),
                     body: Some(body.clone()),
+                    ..Default::default()
                 })),
-                ..Default::default()
             }
             .encode_to_vec()
         })

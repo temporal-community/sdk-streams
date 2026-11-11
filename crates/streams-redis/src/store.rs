@@ -629,7 +629,6 @@ mod tests {
                 producer: Some(producer.clone()),
                 ..Default::default()
             })),
-            ..Default::default()
         }
         .encode_to_vec();
         let records = vec![record.clone(); 5];

@@ -76,8 +76,9 @@ closed Stream (`stream_closed`). Then:
 
 ## Log entries
 
-- `r` is the encoded `StreamRecord`, with no offset. A data Record has no Producer in it. An
-  append refuses a Record that isn't an encoded `StreamRecord`, since each read decodes it.
+- `r` is the encoded `StreamRecord`. Its item has no offset, since a read sets the entry's own.
+  A data Record has no Producer in it. An append refuses a Record that isn't an encoded
+  `StreamRecord`, since each read decodes it.
 - `p` is the encoded `Producer` of the batch, on the batch's first data entry. The Store sets it on
   each data Record of the batch when it reads them.
 - `b` is the seq of the batch's first entry, on each later data entry, so a read that starts inside
