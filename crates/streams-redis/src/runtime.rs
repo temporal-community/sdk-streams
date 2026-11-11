@@ -7,7 +7,10 @@ use crate::{
 use prost::Message;
 use std::{num::NonZeroUsize, sync::Arc, time::Duration};
 use temporalio_common::telemetry::metrics::TemporalMeter;
-use temporalio_streams::{StoreFactory, StreamResult, StreamRuntime, store::Store};
+use temporalio_streams::{
+    StreamRuntime,
+    store::{Capabilities, LazyStore},
+};
 
 /// The name that [StreamRuntime::name] gives for a Redis runtime.
 pub const REDIS_RUNTIME_NAME: &str = "temporalio-streams-redis";
@@ -101,16 +104,6 @@ fn count(field: &str, value: i32) -> RedisStoreResult<Option<NonZeroUsize>> {
     Ok(NonZeroUsize::new(count))
 }
 
-/// Connects to Redis on the runtime's first call that needs Redis.
-struct Connect(RedisStoreOptions);
-
-#[async_trait::async_trait]
-impl StoreFactory for Connect {
-    async fn connect(&self) -> StreamResult<Arc<dyn Store>> {
-        Ok(Arc::new(RedisStore::connect(self.0.clone()).await?))
-    }
-}
-
 /// Builds the Stream runtime on Redis. It connects on the first call that needs Redis, so a bridge
 /// can build it with no async runtime, and a Workflow that never publishes needs no Redis.
 #[derive(Debug)]
@@ -119,12 +112,11 @@ pub struct RedisStreamRuntime;
 impl RedisStreamRuntime {
     /// Builds the runtime on Redis. It records metrics on `meter`, lang's runtime meter, if set.
     pub fn create(options: RuntimeOptions, meter: Option<TemporalMeter>) -> Arc<StreamRuntime> {
-        StreamRuntime::new(
-            REDIS_RUNTIME_NAME,
-            options.backend,
-            Arc::new(Connect(options.store)),
-            meter,
-        )
+        let store = options.store;
+        let lazy = LazyStore::new(Capabilities::ALL, move || {
+            RedisStore::connect(store.clone())
+        });
+        StreamRuntime::new(REDIS_RUNTIME_NAME, options.backend, Arc::new(lazy), meter)
     }
 
     /// Builds the runtime from an encoded [RedisStreamConfig].

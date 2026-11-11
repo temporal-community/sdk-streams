@@ -27,3 +27,5 @@
   `StreamWriter`. Each read item carries its own offset. A write whose Producer lacks a field that
   the API requires fails with `stream_invalid` before it reaches Redis. A stored Record now encodes
   its item as field 1, so Records that an earlier build stored don't decode.
+- A batch with a Record that has no body, a Workflow Producer's epoch with no started event, and a
+  read offset over 8 bytes fail with `stream_invalid` before they reach Redis.
