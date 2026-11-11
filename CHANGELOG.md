@@ -21,3 +21,5 @@
   needs `+xrevrange`. `Store::read` and `Store::wait_after` take a `StreamRef`.
 - The keys hold no Temporal namespace, so a Stream id is unique in one Redis and key prefix, and an
   ACL key pattern gives a user one prefix. The Store calls take no namespace.
+- A read has no `create_wait`, so a read of a Stream that nobody created fails at once with
+  `stream_not_found`. Once the Stream exists, a read waits for Records as before.
