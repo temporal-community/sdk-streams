@@ -32,7 +32,7 @@ if stored and bytes_below(epoch, stored.fence) then
   return refuse('FENCED', 'the epoch is lower than the newest one of the Producer')
 end
 
--- The closer and the status let a read build the final StreamClose item. A Brook Store only
+-- The closer and the status let a read build the final StreamClose item. An SDK Store only
 -- closes with CLOSED, which is STREAM_CLOSE_STATUS_CLOSED = 1.
 redis.call('HSET', meta, 'closed', '1', 'closer', closer, 'cstat', '1')
 redis.call('XADD', closed_key, '*', 'closed', '1')

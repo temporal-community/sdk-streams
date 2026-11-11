@@ -32,7 +32,7 @@ form, and the `testdata/` of `temporalio-streams` has its test vectors.
 | `rid` | The request id of the create that made the Stream, absent when it gave none |
 | `closed` | Set by the close |
 | `closer` | The encoded Producer that closed the Stream, which a read builds the close item from |
-| `cstat` | The close status, `1` for CLOSED, which a Brook Store is the only one it sets |
+| `cstat` | The close status, `1` for CLOSED, the only status that an SDK Store sets |
 | `newest` | The entry id of the newest entry |
 | `trimmed` | The entry id of `newest` when a write found the log gone |
 | `p\|<kind>\|<producer id>` | The Producer's fence and last batch, 88 bytes |
@@ -151,6 +151,10 @@ these lists on a standalone server and on a cluster.
 - The meta hash keeps one 88-byte `p|` field for each Producer that wrote to the Stream, so a
   Stream with many Producers has a large meta hash.
 - Any Producer closes a Stream, since the Store doesn't track an owner.
+- The writers of one Producer epoch keep their batches in order inside one runtime. Two runtimes
+  in one process share the `sequence` counter but not that order, so when both write one Producer
+  epoch to one Redis at once, a batch can reach Redis after a higher `sequence` and fail with
+  `stream_sequence_too_low`.
 - A cluster with `cluster-preferred-endpoint-type unknown-endpoint` gives no hosts in
   `CLUSTER SLOTS` and in its redirects. A blocking read then finds a slot's node only through the
   seeds and `MOVED`. redis-rs doesn't follow an `ASK` with no host, so a call fails with

@@ -4,7 +4,9 @@ Experimental.
 
 `temporalio-streams-redis` is the Redis Store of the Temporal Stream runtime. The runtime itself,
 `temporalio-streams`, is in [sdk-rust](https://github.com/temporalio/sdk-rust). A lang bridge builds
-the runtime with `RedisStreamRuntime`, which connects on its first call that needs Redis.
+the runtime with `RedisStreamRuntime`, which connects on its first call that needs Redis. The open
+of a writer that sends no batch, such as a client's, needs no Redis. So with Redis down, that open
+succeeds, and its first write fails with `stream_storage_unavailable` after its retries.
 
 ## Connecting
 

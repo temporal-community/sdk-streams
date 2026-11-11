@@ -33,3 +33,6 @@
   Producer epoch share one order of batches. A write on a closed writer fails with `stream_closed`.
 - The API dropped the unknown writer reason, so the reason numbers of `stream_unsupported`,
   `stream_already_exists` and `stream_storage_corrupt` are one lower.
+- The open of a writer that sends no batch, such as a client's, no longer connects to Redis. With
+  Redis down, that open succeeds, and its first write fails with `stream_storage_unavailable` after
+  its retries.
