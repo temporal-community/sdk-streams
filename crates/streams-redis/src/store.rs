@@ -222,9 +222,7 @@ impl Store for RedisStore {
             .arg(&producer.id)
             .arg(&epoch_key(producer.kind.as_ref())[..])
             .arg(TOMBSTONE.as_millis())
-            .arg(self.wait.is_some())
-            // The closer, which a read builds the final StreamClose item from.
-            .arg(producer.encode_to_vec());
+            .arg(self.wait.is_some());
         let CloseReply(closed) = self.write(&call).await?;
         Ok(closed)
     }
@@ -605,10 +603,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs Redis"]
     async fn a_read_inside_a_batch_gets_the_producer_of_the_batch() {
-        use temporalio_streams::proto::{
-            ClientEpoch, ClientProducer, StreamData, StreamRecord, producer::Kind,
-            stream_record::Item,
-        };
+        use temporalio_streams::proto::{ClientProducer, StreamRecord, producer::Kind};
         let mut options = RedisStoreOptions::new(crate::testing::standalone_url()).unwrap();
         options.key_prefix = "streams-unit".parse().unwrap();
         let store = RedisStore::connect(options).await.unwrap();
@@ -620,15 +615,11 @@ mod tests {
         store.create(&handle, &Create::default()).await.unwrap();
         let producer = Producer {
             id: "client:unit".to_string(),
-            kind: Some(Kind::Client(ClientProducer {
-                epoch: Some(ClientEpoch { attempt: 1 }),
-            })),
+            kind: Some(Kind::Client(ClientProducer {})),
         };
         let record = StreamRecord {
-            item: Some(Item::Data(StreamData {
-                producer: Some(producer.clone()),
-                ..Default::default()
-            })),
+            producer: Some(producer.clone()),
+            ..Default::default()
         }
         .encode_to_vec();
         let records = vec![record.clone(); 5];

@@ -24,9 +24,11 @@
 - A read has no `create_wait`, so a read of a Stream that nobody created fails at once with
   `stream_not_found`. Once the Stream exists, a read waits for Records as before.
 - An append, a close and a writer's open carry the Producer directly, since the API has no
-  `StreamWriter`. Each read item carries its own offset. A write whose Producer lacks a field that
-  the API requires fails with `stream_invalid` before it reaches Redis. A stored Record now encodes
-  its item as field 1, so Records that an earlier build stored don't decode.
+  `StreamWriter`. Each read Record carries its own offset. A write whose Producer lacks a field that
+  the API requires fails with `stream_invalid` before it reaches Redis. A stored Record is now a
+  plain `StreamRecord`, so Records that an earlier build stored don't decode.
+- A read gives only Records, and a close shows as `done`. So the meta hash has no `closer` and
+  `cstat`, and the close script takes no Producer to store.
 - A batch with a Record that has no body, a Workflow Producer's epoch with no started event, and a
   read offset over 8 bytes fail with `stream_invalid` before they reach Redis.
 - A writer is an object that the bridge holds, and dropping it releases it. The writers of one

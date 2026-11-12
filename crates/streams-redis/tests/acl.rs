@@ -13,10 +13,7 @@ use temporalio_streams::{
     Reason,
     digest::batch_digest,
     ids::{StreamKeys, client_producer_id},
-    proto::{
-        AppendRecord, ClientEpoch, ClientProducer, Producer, StreamData, StreamRecord, StreamRef,
-        producer::Kind, stream_record::Item,
-    },
+    proto::{AppendRecord, ClientProducer, Producer, StreamRecord, StreamRef, producer::Kind},
     store::{Batch, Create, Store},
 };
 use temporalio_streams_redis::{
@@ -114,11 +111,9 @@ fn one_record() -> (Vec<Vec<u8>>, [u8; 16]) {
         }),
     }];
     let stored = StreamRecord {
-        item: Some(Item::Data(StreamData {
-            producer: Some(client()),
-            body: records[0].body.clone(),
-            ..Default::default()
-        })),
+        producer: Some(client()),
+        body: records[0].body.clone(),
+        ..Default::default()
     };
     (vec![stored.encode_to_vec()], batch_digest(&records))
 }
@@ -126,9 +121,7 @@ fn one_record() -> (Vec<Vec<u8>>, [u8; 16]) {
 fn client_named(process: &str) -> Producer {
     Producer {
         id: client_producer_id("me", process),
-        kind: Some(Kind::Client(ClientProducer {
-            epoch: Some(ClientEpoch { attempt: 1 }),
-        })),
+        kind: Some(Kind::Client(ClientProducer {})),
     }
 }
 

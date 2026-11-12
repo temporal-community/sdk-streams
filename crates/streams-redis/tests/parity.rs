@@ -19,13 +19,13 @@ use temporalio_streams::{
     digest::batch_digest,
     ids::{
         StreamKeys, activity_producer_id, client_producer_id, local_activity_producer_id,
-        named_client_producer_id, workflow_producer_id,
+        workflow_producer_id,
     },
     memory::MemoryStore,
     proto::{
-        ActivityEpoch, ActivityProducer, AppendRecord, ClientEpoch, ClientProducer,
-        LocalActivityEpoch, LocalActivityProducer, Producer, StreamData, StreamRecord, StreamRef,
-        WorkflowProducer, WorkflowTaskEpoch, producer::Kind, stream_record,
+        ActivityEpoch, ActivityProducer, AppendRecord, ClientProducer, LocalActivityEpoch,
+        LocalActivityProducer, Producer, StreamRecord, StreamRef, WorkflowProducer,
+        WorkflowTaskEpoch, producer::Kind,
     },
     store::{Batch, ConflictPolicy, Create, CreateOutcome, Entry, Store},
 };
@@ -121,11 +121,9 @@ impl Rng {
 /// The Producers of the calls. Some share an id with another epoch, so that the fence of a newer
 /// epoch runs. The run `r1`'s Local Activities come from three Workflow Tasks.
 fn producers() -> Vec<Producer> {
-    let client = |id: String, attempt| Producer {
+    let client = |id: String| Producer {
         id,
-        kind: Some(Kind::Client(ClientProducer {
-            epoch: Some(ClientEpoch { attempt }),
-        })),
+        kind: Some(Kind::Client(ClientProducer {})),
     };
     let activity = |run: &str, attempt| Producer {
         id: activity_producer_id(run, "a", "s"),
@@ -157,13 +155,9 @@ fn producers() -> Vec<Producer> {
             epoch: Some(WorkflowTaskEpoch::default()),
         })),
     };
-    let me = || client_producer_id("me", "p1");
     vec![
-        client(me(), 1),
-        client(me(), 2),
-        client(me(), 3),
-        client(named_client_producer_id("other"), 1),
-        client(named_client_producer_id("other"), 2),
+        client(client_producer_id("me", "p1")),
+        client(client_producer_id("other", "p2")),
         activity("r1", 1),
         activity("r1", 2),
         activity("r0", 1),
@@ -272,7 +266,6 @@ enum Answer {
         closed: bool,
         newest: Option<Place>,
         trimmed: Option<Place>,
-        retention: Duration,
         entries: Vec<Item>,
     },
     Refused(Reason),
@@ -522,7 +515,6 @@ impl Seed {
                     closed: state.closed,
                     newest: (state.newest != 0).then(|| place(side, stream, state.newest)),
                     trimmed: (state.trimmed != 0).then(|| place(side, stream, state.trimmed)),
-                    retention: state.retention,
                     entries: items(side, stream, entries),
                 })
             }
@@ -576,11 +568,9 @@ fn batch(producer: &Producer, texts: &[&str]) -> (Vec<Vec<u8>>, [u8; 16]) {
         .iter()
         .map(|body| {
             StreamRecord {
-                item: Some(stream_record::Item::Data(StreamData {
-                    producer: Some(producer.clone()),
-                    body: Some(body.clone()),
-                    ..Default::default()
-                })),
+                producer: Some(producer.clone()),
+                body: Some(body.clone()),
+                ..Default::default()
             }
             .encode_to_vec()
         })

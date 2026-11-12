@@ -8,7 +8,7 @@ use redis::{FromRedisValue, ParsingError, Value};
 use std::{collections::HashMap, fmt, str::FromStr};
 use temporalio_streams::{
     offset::offset_of_entry_id,
-    proto::{Producer, StreamRecord, stream_record::Item},
+    proto::{Producer, StreamRecord},
     store::Entry,
 };
 
@@ -17,12 +17,11 @@ pub(super) fn without_producer(record: &[u8], producer: &Producer) -> RedisStore
     let mut stored = StreamRecord::decode(record).map_err(|error| {
         RedisStoreError::invalid(format!("A Record isn't an encoded StreamRecord: {error}"))
     })?;
-    match &mut stored.item {
-        Some(Item::Data(data)) if data.producer.as_ref() == Some(producer) => {
-            data.producer = None;
-            Ok(stored.encode_to_vec())
-        }
-        _ => Ok(record.to_vec()),
+    if stored.producer.as_ref() == Some(producer) {
+        stored.producer = None;
+        Ok(stored.encode_to_vec())
+    } else {
+        Ok(record.to_vec())
     }
 }
 
@@ -135,10 +134,8 @@ pub(super) fn with_producers(
 fn restored(record: &[u8], producer: &Producer) -> RedisStoreResult<Vec<u8>> {
     let mut stored =
         StreamRecord::decode(record).map_err(|error| corrupt("A stored Record", error))?;
-    if let Some(Item::Data(data)) = &mut stored.item
-        && data.producer.is_none()
-    {
-        data.producer = Some(producer.clone());
+    if stored.producer.is_none() {
+        stored.producer = Some(producer.clone());
     }
     Ok(stored.encode_to_vec())
 }
@@ -146,23 +143,19 @@ fn restored(record: &[u8], producer: &Producer) -> RedisStoreResult<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use temporalio_streams::proto::{ClientEpoch, ClientProducer, StreamData, producer::Kind};
+    use temporalio_streams::proto::{ClientProducer, producer::Kind};
 
     fn producer(id: &str) -> Producer {
         Producer {
             id: id.to_string(),
-            kind: Some(Kind::Client(ClientProducer {
-                epoch: Some(ClientEpoch { attempt: 1 }),
-            })),
+            kind: Some(Kind::Client(ClientProducer {})),
         }
     }
 
     fn data(producer: Option<Producer>) -> Vec<u8> {
         StreamRecord {
-            item: Some(Item::Data(StreamData {
-                producer,
-                ..Default::default()
-            })),
+            producer,
+            ..Default::default()
         }
         .encode_to_vec()
     }

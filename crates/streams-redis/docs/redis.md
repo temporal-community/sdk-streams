@@ -31,8 +31,6 @@ form, and the `testdata/` of `temporalio-streams` has its test vectors.
 | `exp` | When the Stream stops taking writes, in ms since 1970, absent when it has no expiry |
 | `rid` | The request id of the create that made the Stream, absent when it gave none |
 | `closed` | Set by the close |
-| `closer` | The encoded Producer that closed the Stream, which a read builds the close item from |
-| `cstat` | The close status, `1` for CLOSED, the only status that an SDK Store sets |
 | `newest` | The entry id of the newest entry |
 | `trimmed` | The entry id of `newest` when a write found the log gone |
 | `p\|<kind>\|<producer id>` | The Producer's fence and last batch, 88 bytes |
@@ -76,7 +74,7 @@ closed Stream (`stream_closed`). Then:
 
 ## Log entries
 
-- `r` is the encoded `StreamRecord`. Its item has no offset, since a read sets the entry's own.
+- `r` is the encoded `StreamRecord`. It has no offset, since a read sets the entry's own.
   A data Record has no Producer in it. An append refuses a Record that isn't an encoded
   `StreamRecord`, since each read decodes it.
 - `p` is the encoded `Producer` of the batch, on the batch's first data entry. The Store sets it on
