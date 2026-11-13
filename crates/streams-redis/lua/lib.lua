@@ -38,7 +38,7 @@ local function refresh(meta, log, closed, now, last_write_ttl, tombstone)
     ttl = tonumber(redis.call('HGET', meta, 'ret'))
   end
   if not ttl then
-    -- The backend config may have dropped its last-write TTL since an earlier write.
+    -- The Store config may have dropped its last-write TTL since an earlier write.
     redis.call('HDEL', meta, 'exp')
     redis.call('PERSIST', meta)
     redis.call('PERSIST', log)

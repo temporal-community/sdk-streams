@@ -12,7 +12,7 @@ use temporalio_common::protos::temporal::api::common::v1::Payload;
 use temporalio_streams::{
     Reason,
     digest::batch_digest,
-    ids::{StreamKeys, client_producer_id},
+    ids::StreamKeys,
     proto::{AppendRecord, ClientProducer, Producer, StreamRecord, StreamRef, producer::Kind},
     store::{Batch, Create, Store},
 };
@@ -120,7 +120,7 @@ fn one_record() -> (Vec<Vec<u8>>, [u8; 16]) {
 
 fn client_named(process: &str) -> Producer {
     Producer {
-        id: client_producer_id("me", process),
+        id: format!("client:me:{process}"),
         kind: Some(Kind::Client(ClientProducer {})),
     }
 }

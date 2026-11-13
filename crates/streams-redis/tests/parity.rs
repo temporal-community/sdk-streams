@@ -17,10 +17,7 @@ use temporalio_common::protos::temporal::api::common::v1::Payload;
 use temporalio_streams::{
     Reason, StreamResult,
     digest::batch_digest,
-    ids::{
-        StreamKeys, activity_producer_id, client_producer_id, local_activity_producer_id,
-        workflow_producer_id,
-    },
+    ids::StreamKeys,
     memory::MemoryStore,
     proto::{
         ActivityEpoch, ActivityProducer, AppendRecord, ClientProducer, LocalActivityEpoch,
@@ -126,7 +123,7 @@ fn producers() -> Vec<Producer> {
         kind: Some(Kind::Client(ClientProducer {})),
     };
     let activity = |run: &str, attempt| Producer {
-        id: activity_producer_id(run, "a", "s"),
+        id: format!("act:{run}:a:s"),
         kind: Some(Kind::WorkflowActivity(ActivityProducer {
             run_id: run.to_string(),
             epoch: Some(ActivityEpoch {
@@ -139,7 +136,7 @@ fn producers() -> Vec<Producer> {
         })),
     };
     let local_activity = |run: &str, started: i64, attempt| Producer {
-        id: local_activity_producer_id(run, &format!("call-{started}")),
+        id: format!("la:{run}:call-{started}"),
         kind: Some(Kind::LocalActivity(LocalActivityProducer {
             run_id: run.to_string(),
             epoch: Some(LocalActivityEpoch {
@@ -149,15 +146,15 @@ fn producers() -> Vec<Producer> {
         })),
     };
     let workflow = Producer {
-        id: workflow_producer_id("r1"),
+        id: "wf:r1".to_string(),
         kind: Some(Kind::Workflow(WorkflowProducer {
             run_id: "r1".to_string(),
             epoch: Some(WorkflowTaskEpoch::default()),
         })),
     };
     vec![
-        client(client_producer_id("me", "p1")),
-        client(client_producer_id("other", "p2")),
+        client("client:me:p1".to_string()),
+        client("client:other:p2".to_string()),
         activity("r1", 1),
         activity("r1", 2),
         activity("r0", 1),

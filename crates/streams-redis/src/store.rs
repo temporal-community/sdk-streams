@@ -159,7 +159,7 @@ impl RedisStore {
     }
 }
 
-// The trait returns Stream errors, so the runtime and lang get the same reasons on every backend.
+// The trait returns Stream errors, so the runtime and lang get the same reasons on every Store.
 // A Redis error converts through the crate's error, since this crate can't add that `From`.
 #[async_trait::async_trait]
 impl Store for RedisStore {
@@ -542,7 +542,7 @@ mod tests {
         }
     }
 
-    // A backend config can drop its last-write TTL while a Stream is open, and the next write
+    // A Store config can drop its last-write TTL while a Stream is open, and the next write
     // must clear the expiry that an earlier write set.
     #[tokio::test]
     #[ignore = "needs Redis"]

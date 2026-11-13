@@ -12,20 +12,17 @@ use temporalio_streams::{
     store::{Capabilities, LazyStore},
 };
 
-/// The name that [StreamRuntime::name] gives for a Redis runtime.
-pub const REDIS_RUNTIME_NAME: &str = "temporalio-streams-redis";
-
 /// The options of a Stream runtime on Redis.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct RuntimeOptions {
     /// How to connect to Redis.
     pub store: RedisStoreOptions,
-    /// The backend name that lang registered the runtime under, for the handles it builds.
-    pub backend: String,
+    /// The Store name that lang registered the runtime under, for the refs it builds.
+    pub store_name: String,
 }
 
-/// The options from the backend's config message. An unset or zero field keeps its default.
+/// The options from the Store's config message. An unset or zero field keeps its default.
 impl TryFrom<RedisStreamConfig> for RuntimeOptions {
     type Error = RedisStoreError;
 
@@ -33,7 +30,7 @@ impl TryFrom<RedisStreamConfig> for RuntimeOptions {
         let mut urls = config.urls.into_iter();
         let first = urls
             .next()
-            .ok_or_else(|| RedisStoreError::invalid("The Redis Stream backend needs a URL"))?;
+            .ok_or_else(|| RedisStoreError::invalid("The Redis Stream Store needs a URL"))?;
         let first = crate::options::parse_url(&first)?;
         let topology = match (config.cluster, urls.len()) {
             (true, _) => Topology::Cluster {
@@ -79,7 +76,7 @@ impl TryFrom<RedisStreamConfig> for RuntimeOptions {
         crate::store::check(&store)?;
         Ok(Self {
             store,
-            backend: config.backend,
+            store_name: config.store_name,
         })
     }
 }
@@ -105,7 +102,7 @@ fn count(field: &str, value: i32) -> RedisStoreResult<Option<NonZeroUsize>> {
 }
 
 /// Builds the Stream runtime on Redis. It connects on the first call that needs Redis, so a bridge
-/// can build it with no async runtime, and a Workflow that never publishes needs no Redis.
+/// can build it with no async runtime.
 #[derive(Debug)]
 pub struct RedisStreamRuntime;
 
@@ -116,7 +113,7 @@ impl RedisStreamRuntime {
         let lazy = LazyStore::new(Capabilities::ALL, move || {
             RedisStore::connect(store.clone())
         });
-        StreamRuntime::new(REDIS_RUNTIME_NAME, options.backend, Arc::new(lazy), meter)
+        StreamRuntime::new(options.store_name, Arc::new(lazy), meter)
     }
 
     /// Builds the runtime from an encoded [RedisStreamConfig].
