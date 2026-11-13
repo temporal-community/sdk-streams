@@ -4,37 +4,15 @@
 
 ### Added
 
-- The `temporalio-streams-redis` crate, the Redis Store of the Temporal Stream runtime. It serves
-  the Stream service of `temporalio-streams` on Redis, standalone or a cluster.
-
-### Changed
-
-- A Stream's Retention counts from its close, as a namespace's Retention does. An open Stream keeps
-  all its Records until the safety TTL passes after its last write, and an append no longer drops a
-  Record by its age. A Producer no longer needs `+xtrim`.
-- A Producer's dedupe and fence state stays for as long as its Stream exists. An append no longer
-  drops the state of a Producer with no append for one Retention, and the Store no longer writes the
-  `:producers` key. A Producer no longer needs `+zadd`, `+zrangebyscore` and `+zrem`.
-- `safety_ttl` is `last_write_ttl`, with no default. With none, an open Stream stays until its
-  close. A Producer needs `+persist`.
-- The Store reads no newest-N page, so `read_back` and its script are gone, and a Reader no longer
-  needs `+xrevrange`. `Store::read` and `Store::wait_after` take a `StreamRef`.
-- The keys hold no Temporal namespace, so a Stream id is unique in one Redis and key prefix, and an
-  ACL key pattern gives a user one prefix. The Store calls take no namespace.
-- A read has no `create_wait`, so a read of a Stream that nobody created fails at once with
-  `stream_not_found`. Once the Stream exists, a read waits for Records as before.
-- An append, a close and a writer's open carry the Producer directly, since the API has no
-  `StreamWriter`. Each read Record carries its own offset. A write whose Producer lacks a field that
-  the API requires fails with `stream_invalid` before it reaches Redis. A stored Record is now a
-  plain `StreamRecord`, so Records that an earlier build stored don't decode.
-- A read gives only Records, and a close shows as `done`. So the meta hash has no `closer` and
-  `cstat`, and the close script takes no Producer to store.
-- A batch with a Record that has no body, a Workflow Producer's epoch with no started event, and a
-  read offset over 8 bytes fail with `stream_invalid` before they reach Redis.
-- A writer is an object that the bridge holds, and dropping it releases it. The writers of one
-  Producer epoch share one order of batches. A write on a closed writer fails with `stream_closed`.
-- The API dropped the unknown writer reason, so the reason numbers of `stream_unsupported`,
-  `stream_already_exists` and `stream_storage_corrupt` are one lower.
-- The open of a writer that sends no batch, such as a client's, no longer connects to Redis. With
-  Redis down, that open succeeds, and its first write fails with `stream_storage_unavailable` after
-  its retries.
+- The `temporalio-streams-redis` crate, the Redis Store of the Temporal Stream runtime. It answers
+  the five operations of the Stream service of `temporalio-streams` on Redis, standalone or a
+  cluster. A lang bridge builds `RedisStreamRuntime` from an encoded `RedisStreamConfig` and calls
+  `StreamRuntime::call` with an operation name and the encoded request. The config names the Store
+  with `store_name`, and the runtime sets that name on each ref it builds.
+- A Stream's Retention counts from its close. An open Stream keeps all its Records until its
+  last-write TTL passes after its last write. With no `last_write_ttl`, an open Stream stays until
+  its close.
+- A Producer id is opaque. The Store takes any non-empty id of at most 4096 bytes, and it keeps the
+  dedupe and fence state of each Producer for as long as its Stream exists.
+- A read gives only Records, and a close shows as `done`. A read of a Stream that nobody created
+  fails at once with `stream_not_found`.

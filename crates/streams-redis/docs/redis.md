@@ -35,7 +35,9 @@ form, and the `testdata/` of `temporalio-streams` has its test vectors.
 | `trimmed` | The entry id of `newest` when a write found the log gone |
 | `p\|<kind>\|<producer id>` | The Producer's fence and last batch, 88 bytes |
 
-`<kind>` is the `ProducerKind` number. The `p|` value has big-endian numbers in this order.
+`<kind>` is the `ProducerKind` number. The Producer id is opaque. It is any non-empty text of at
+most 4096 bytes, so the field name takes its bytes, also a `|` in them. The `p|` value has
+big-endian numbers in this order.
 
 | Bytes | Field |
 |---|---|
@@ -134,8 +136,8 @@ these lists on a standalone server and on a cluster.
 - A failover can lose a write that Redis acknowledged. With `wait_replicas`, each write waits for
   that many replicas with `WAIT`. A write that they don't have after `wait_timeout` fails with
   `stream_storage_unavailable`, and its retry with the same sequence writes it once.
-- `WAIT` protects only the writer's answer. A Reader can see a write before its `WAIT` ends, and
-  a failover can then lose that write.
+- `WAIT` protects only the answer of the write. A Reader can see a write before its `WAIT` ends,
+  and a failover can then lose that write.
 - On a cluster, the client sends a write again after it loses the reply. A batch with sequence 0
   then gets two copies.
 - With `WAIT`, a call that finds its write done, such as a resend, writes `v` again. Then its
@@ -149,10 +151,6 @@ these lists on a standalone server and on a cluster.
 - The meta hash keeps one 88-byte `p|` field for each Producer that wrote to the Stream, so a
   Stream with many Producers has a large meta hash.
 - Any Producer closes a Stream, since the Store doesn't track an owner.
-- The writers of one Producer epoch keep their batches in order inside one runtime. Two runtimes
-  in one process share the `sequence` counter but not that order, so when both write one Producer
-  epoch to one Redis at once, a batch can reach Redis after a higher `sequence` and fail with
-  `stream_sequence_too_low`.
 - A cluster with `cluster-preferred-endpoint-type unknown-endpoint` gives no hosts in
   `CLUSTER SLOTS` and in its redirects. A blocking read then finds a slot's node only through the
   seeds and `MOVED`. redis-rs doesn't follow an `ASK` with no host, so a call fails with

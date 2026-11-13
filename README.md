@@ -4,9 +4,9 @@ Experimental.
 
 `temporalio-streams-redis` is the Redis Store of the Temporal Stream runtime. The runtime itself,
 `temporalio-streams`, is in [sdk-rust](https://github.com/temporalio/sdk-rust). A lang bridge builds
-the runtime with `RedisStreamRuntime`, which connects on its first call that needs Redis. The open
-of a writer that sends no batch, such as a client's, needs no Redis. So with Redis down, that open
-succeeds, and its first write fails with `stream_storage_unavailable` after its retries.
+the runtime with `RedisStreamRuntime`, which connects on its first call that needs Redis. Then the
+bridge calls `StreamRuntime::call` with the name of one of the five Stream operations and the
+encoded request, and it gets the encoded response.
 
 ## Connecting
 
@@ -22,6 +22,7 @@ lists the main config fields. `RedisStoreOptions` has the same ones, except that
 | `urls` | | One `redis://` or `rediss://` URL, or the seeds of a cluster |
 | `cluster` | `false` | Set for a Redis Cluster |
 | `key_prefix` | `temporal-streams` | The prefix of every key |
+| `store_name` | empty | The name that lang registered the Store under. It goes on each ref |
 | `retention` | 7 days | The Retention of each Stream. It counts from the close. |
 | `last_write_ttl` | none | How long an open Stream stays after its last write. None keeps it open |
 | `wait_replicas` | 0 | The replicas that must have each write, with `WAIT` |
