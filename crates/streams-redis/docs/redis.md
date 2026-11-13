@@ -36,8 +36,9 @@ form, and the `testdata/` of `temporalio-streams` has its test vectors.
 | `p\|<kind>\|<producer id>` | The Producer's fence and last batch, 88 bytes |
 
 `<kind>` is the `ProducerKind` number. The Producer id is opaque. It is any non-empty text of at
-most 4096 bytes, so the field name takes its bytes, also a `|` in them. The `p|` value has
-big-endian numbers in this order.
+most 4096 bytes, so the field name takes its bytes, also a `|` in them. Neither the field nor an
+epoch key has a run id, so the id of a run-based kind must hold its run id, or two runs share one
+fence. The `p|` value has big-endian numbers in this order.
 
 | Bytes | Field |
 |---|---|

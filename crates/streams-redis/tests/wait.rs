@@ -164,19 +164,19 @@ async fn a_write_that_too_few_replicas_have_fails_on_a_redis_cluster() {
 
 async fn too_few_replicas(topology: Topology<Url>) {
     // A key holds no namespace, so each run takes Stream ids of its own.
-    let handle = StreamRef {
+    let stream_ref = StreamRef {
         id: unique("s"),
         ..Default::default()
     };
     let create = |store: &RedisStore| {
-        let (store, handle) = (store.clone(), handle.clone());
+        let (store, stream_ref) = (store.clone(), stream_ref.clone());
         async move {
             // Each create is a retry of the first one, so it gets the Stream as created.
             let create = Create {
                 request_id: "too-few",
                 ..Create::default()
             };
-            store.create(&handle, &create).await
+            store.create(&stream_ref, &create).await
         }
     };
     // No test server has this many replicas.
@@ -228,11 +228,11 @@ async fn a_cluster_write_waits_for_the_replica_of_its_own_primary() {
         "the cluster at STREAMS_REDIS_CLUSTER_URL needs replicas"
     );
     let create = |store: RedisStore, id: &'static str| async move {
-        let handle = StreamRef {
+        let stream_ref = StreamRef {
             id: unique(id),
             ..Default::default()
         };
-        store.create(&handle, &Create::default()).await
+        store.create(&stream_ref, &Create::default()).await
     };
     let short = store(&cluster_at(&url), wait_for(1, SHORT)).await;
     let paused = pause(&replicas).await;
@@ -254,7 +254,7 @@ async fn a_call_that_finds_its_write_waits_for_the_replicas() {
         !replicas.is_empty(),
         "the server at STREAMS_REDIS_URL needs a replica"
     );
-    let handle = StreamRef {
+    let stream_ref = StreamRef {
         id: unique("s"),
         ..Default::default()
     };
@@ -277,12 +277,12 @@ async fn a_call_that_finds_its_write_waits_for_the_replicas() {
         id: unique("other"),
         ..Default::default()
     };
-    plain.create(&handle, &Create::default()).await.unwrap();
+    plain.create(&stream_ref, &Create::default()).await.unwrap();
     let paused = pause(&replicas).await;
-    plain.append(&handle, &batch).await.unwrap();
-    let resent = waits[0].append(&handle, &batch).await.map(|_| ());
-    plain.close(&handle, &producer).await.unwrap();
-    let closed = waits[1].close(&handle, &producer).await.map(|_| ());
+    plain.append(&stream_ref, &batch).await.unwrap();
+    let resent = waits[0].append(&stream_ref, &batch).await.map(|_| ());
+    plain.close(&stream_ref, &producer).await.unwrap();
+    let closed = waits[1].close(&stream_ref, &producer).await.map(|_| ());
     // The second create is a retry of the first, so it finds its write done.
     let retry_of_other = Create {
         request_id: "other",
@@ -295,9 +295,9 @@ async fn a_call_that_finds_its_write_waits_for_the_replicas() {
         assert_eq!(result.unwrap_err().reason, Reason::StorageUnavailable);
     }
     let enough = store(&standalone, wait_for(replicas.len(), LONG)).await;
-    let resent = enough.append(&handle, &batch).await.unwrap();
+    let resent = enough.append(&stream_ref, &batch).await.unwrap();
     assert!(resent.resend);
-    let closed = enough.close(&handle, &producer).await.unwrap();
+    let closed = enough.close(&stream_ref, &producer).await.unwrap();
     assert!(closed.already);
 }
 
@@ -334,11 +334,11 @@ async fn writes_wait_for_their_replicas_at_once() {
     for i in 0..4 {
         let (waits, run) = (waits.clone(), run.clone());
         writes.spawn(async move {
-            let handle = StreamRef {
+            let stream_ref = StreamRef {
                 id: format!("s{i}-{run}"),
                 ..Default::default()
             };
-            waits.create(&handle, &Create::default()).await
+            waits.create(&stream_ref, &Create::default()).await
         });
     }
     // Writes that share a connection would run their `WAIT`s one after the other, so the server

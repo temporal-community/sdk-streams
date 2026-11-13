@@ -558,12 +558,15 @@ mod tests {
             .await
             .unwrap();
         let without = RedisStore::connect(options(None)).await.unwrap();
-        let handle = StreamRef {
+        let stream_ref = StreamRef {
             id: format!("ttl-{}", std::process::id()),
             ..Default::default()
         };
-        with_ttl.create(&handle, &Create::default()).await.unwrap();
-        let (state, _) = with_ttl.read(&handle, 0, 0).await.unwrap();
+        with_ttl
+            .create(&stream_ref, &Create::default())
+            .await
+            .unwrap();
+        let (state, _) = with_ttl.read(&stream_ref, 0, 0).await.unwrap();
         assert!(state.expires_ms > 0);
         let producer = Producer {
             id: "client:ttl".to_string(),
@@ -577,10 +580,10 @@ mod tests {
             records: &[],
             digest: [0; 16],
         };
-        without.append(&handle, &batch).await.unwrap();
-        let (state, _) = without.read(&handle, 0, 0).await.unwrap();
+        without.append(&stream_ref, &batch).await.unwrap();
+        let (state, _) = without.read(&stream_ref, 0, 0).await.unwrap();
         assert!(!state.expired() && state.expires_ms == 0);
-        let keys = StreamKeys::new("streams-unit", &handle.id);
+        let keys = StreamKeys::new("streams-unit", &stream_ref.id);
         let mut conn = redis::Client::open(url.as_str())
             .unwrap()
             .get_multiplexed_async_connection()
@@ -608,11 +611,11 @@ mod tests {
         options.key_prefix = "streams-unit".parse().unwrap();
         let store = RedisStore::connect(options).await.unwrap();
         // A key holds no namespace, so each run takes a Stream id of its own.
-        let handle = StreamRef {
+        let stream_ref = StreamRef {
             id: format!("batch-{}", std::process::id()),
             ..Default::default()
         };
-        store.create(&handle, &Create::default()).await.unwrap();
+        store.create(&stream_ref, &Create::default()).await.unwrap();
         let producer = Producer {
             id: "client:unit".to_string(),
             kind: Some(Kind::Client(ClientProducer {})),
@@ -630,12 +633,12 @@ mod tests {
             digest: [0; 16],
         };
         let (first, _) = store
-            .append(&handle, &batch)
+            .append(&stream_ref, &batch)
             .await
             .unwrap()
             .offsets
             .unwrap();
-        let (_, forward) = store.read(&handle, first + 2, 2).await.unwrap();
+        let (_, forward) = store.read(&stream_ref, first + 2, 2).await.unwrap();
         for entry in &forward {
             assert_eq!(entry.record.as_deref(), Some(record.as_slice()));
         }

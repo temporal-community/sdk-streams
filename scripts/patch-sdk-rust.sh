@@ -4,7 +4,7 @@
 # fork, so a build doesn't move when a branch does.
 set -euo pipefail
 
-rev=${SDK_RUST_REV:-42614ce4d9d4dfafe8c25afd34b46e6077efeebc}
+rev=${SDK_RUST_REV:-4bb74a0d9a181017f2a8dfb056e21d480cd4bfa3}
 mkdir -p .cargo
 cat >.cargo/config.toml <<TOML
 [patch.crates-io]

@@ -133,7 +133,7 @@ async fn the_documented_commands_run_every_call_of_each_role() {
     let (producer_name, reader_name) = (format!("prod-{unique}"), format!("read-{unique}"));
     let read_only_name = format!("ro-{unique}");
     // A key holds no namespace, so each run takes Stream ids of its own.
-    let handle = StreamRef {
+    let stream_ref = StreamRef {
         id: format!("s-{unique}"),
         ..Default::default()
     };
@@ -145,7 +145,10 @@ async fn the_documented_commands_run_every_call_of_each_role() {
         .unwrap();
 
     let producer = store(user(&url, &producer_name, role(&PRODUCER)).await).await;
-    producer.create(&handle, &Create::default()).await.unwrap();
+    producer
+        .create(&stream_ref, &Create::default())
+        .await
+        .unwrap();
     let (stored, digest) = one_record();
     let batch = Batch {
         producer: &client(),
@@ -153,21 +156,21 @@ async fn the_documented_commands_run_every_call_of_each_role() {
         records: &stored,
         digest,
     };
-    let appended = producer.append(&handle, &batch).await.unwrap();
+    let appended = producer.append(&stream_ref, &batch).await.unwrap();
     let (first, _) = appended.offsets.unwrap();
 
     let reader = store(user(&url, &reader_name, role(&READER)).await).await;
-    let (state, entries) = reader.read(&handle, 0, 10).await.unwrap();
+    let (state, entries) = reader.read(&stream_ref, 0, 10).await.unwrap();
     assert_eq!((state.newest, entries.len()), (first, 1));
     // The log has an entry after 0, so the Reader's blocking read wakes at once.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    assert!(reader.wait_after(&handle, 0, deadline).await.unwrap());
+    assert!(reader.wait_after(&stream_ref, 0, deadline).await.unwrap());
     // A user with read access to the keys can't write them, even with the Producer's commands.
     let read_only = (READER.0, PRODUCER.1.as_str());
     let read_only = store(user(&url, &read_only_name, read_only).await).await;
     let refused = read_only
         .append(
-            &handle,
+            &stream_ref,
             &Batch {
                 sequence: 2,
                 ..batch.clone()
@@ -178,7 +181,7 @@ async fn the_documented_commands_run_every_call_of_each_role() {
     assert_eq!(refused.reason, Reason::Invalid, "{refused}");
     assert!(!refused.message.contains("evalsha"), "{refused}");
 
-    producer.close(&handle, &client()).await.unwrap();
+    producer.close(&stream_ref, &client()).await.unwrap();
 
     // With `+wait`, too few replicas is a Store failure, not a refusal.
     let mut options =
@@ -359,7 +362,7 @@ async fn the_documented_commands_serve_a_cluster_while_a_slot_moves() {
         unreachable!()
     };
     let keys = StreamKeys::new(PREFIX, &stream);
-    let handle = StreamRef {
+    let stream_ref = StreamRef {
         id: stream,
         ..Default::default()
     };
@@ -390,8 +393,11 @@ async fn the_documented_commands_serve_a_cluster_while_a_slot_moves() {
         records: &stored,
         digest,
     };
-    producer.create(&handle, &Create::default()).await.unwrap();
-    producer.append(&handle, &batch(1)).await.unwrap();
+    producer
+        .create(&stream_ref, &Create::default())
+        .await
+        .unwrap();
+    producer.append(&stream_ref, &batch(1)).await.unwrap();
 
     // The migration that `redis-cli --cluster reshard` runs, stopped after the Stream's keys moved.
     let set_slot = |state: &str, other: &Primary| {
@@ -419,11 +425,11 @@ async fn the_documented_commands_serve_a_cluster_while_a_slot_moves() {
         .arg(keys.log());
     source.run(&migrate).await;
 
-    let appended = producer.append(&handle, &batch(2)).await;
-    let read = reader.read(&handle, 0, 10).await;
+    let appended = producer.append(&stream_ref, &batch(2)).await;
+    let read = reader.read(&stream_ref, 0, 10).await;
     let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
-    let waited = reader.wait_after(&handle, 0, deadline).await;
-    let closed = producer.close(&handle, &me).await.map(|_| ());
+    let waited = reader.wait_after(&stream_ref, 0, deadline).await;
+    let closed = producer.close(&stream_ref, &me).await.map(|_| ());
 
     drop(migration);
     for name in [&producer_name, &reader_name] {
@@ -471,7 +477,7 @@ async fn a_standalone_store_at_a_cluster_node_fails_with_a_config_error() {
             break;
         }
     }
-    let handle = StreamRef {
+    let stream_ref = StreamRef {
         id: stream.unwrap(),
         ..Default::default()
     };
@@ -483,10 +489,10 @@ async fn a_standalone_store_at_a_cluster_node_fails_with_a_config_error() {
         .await
         .unwrap();
     let store = store(login(&nodes[0].url(), &name)).await;
-    let created = store.create(&handle, &Create::default()).await;
-    let read = store.read(&handle, 0, 10).await;
+    let created = store.create(&stream_ref, &Create::default()).await;
+    let read = store.read(&stream_ref, 0, 10).await;
     let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
-    let waited = store.wait_after(&handle, 0, deadline).await;
+    let waited = store.wait_after(&stream_ref, 0, deadline).await;
     let _: () = redis::cmd("ACL")
         .arg("DELUSER")
         .arg(&name)
