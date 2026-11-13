@@ -17,15 +17,12 @@ use temporalio_common::protos::temporal::api::common::v1::Payload;
 use temporalio_streams::{
     Reason, StreamResult,
     digest::batch_digest,
-    ids::{
-        StreamKeys, activity_producer_id, client_producer_id, local_activity_producer_id,
-        named_client_producer_id, workflow_producer_id,
-    },
+    ids::StreamKeys,
     memory::MemoryStore,
     proto::{
-        ActivityEpoch, ActivityProducer, AppendRecord, ClientEpoch, ClientProducer,
-        LocalActivityEpoch, LocalActivityProducer, Producer, StreamData, StreamRecord, StreamRef,
-        WorkflowProducer, WorkflowTaskEpoch, producer::Kind, stream_record,
+        ActivityEpoch, ActivityProducer, AppendRecord, ClientProducer, LocalActivityEpoch,
+        LocalActivityProducer, Producer, StreamRecord, StreamRef, WorkflowProducer,
+        WorkflowTaskEpoch, producer::Kind,
     },
     store::{Batch, ConflictPolicy, Create, CreateOutcome, Entry, Store},
 };
@@ -71,7 +68,7 @@ async fn the_redis_store_answers_as_the_memory_store_on_a_redis_cluster() {
 async fn run(mut options: RedisStoreOptions) {
     options.key_prefix = PREFIX.parse().unwrap();
     options.retention = RETENTION;
-    options.safety_ttl = RETENTION;
+    options.last_write_ttl = Some(RETENTION);
     let raw = Raw::open(&options.topology).await;
     let redis = Arc::new(RedisStore::connect(options).await.unwrap());
     let seeds: Vec<u64> = match std::env::var("STREAMS_PARITY_SEED") {
@@ -93,7 +90,7 @@ async fn run(mut options: RedisStoreOptions) {
         if tasks.len() == IN_FLIGHT {
             failures.extend(tasks.join_next().await.unwrap().unwrap());
         }
-        let seed = Seed::new(seed, format!("ns-{run}-{seed}"), redis.clone(), raw.clone());
+        let seed = Seed::new(seed, format!("{run}-{seed}"), redis.clone(), raw.clone());
         tasks.spawn(seed.run());
     }
     while let Some(failure) = tasks.join_next().await {
@@ -121,15 +118,13 @@ impl Rng {
 /// The Producers of the calls. Some share an id with another epoch, so that the fence of a newer
 /// epoch runs. The run `r1`'s Local Activities come from three Workflow Tasks.
 fn producers() -> Vec<Producer> {
-    let client = |id: String, attempt| Producer {
+    let client = |id: String| Producer {
         id,
-        kind: Some(Kind::Client(ClientProducer {
-            epoch: Some(ClientEpoch { attempt }),
-        })),
+        kind: Some(Kind::Client(ClientProducer {})),
     };
     let activity = |run: &str, attempt| Producer {
-        id: activity_producer_id(run, "a", "s"),
-        kind: Some(Kind::Activity(ActivityProducer {
+        id: format!("act:{run}:a:s"),
+        kind: Some(Kind::WorkflowActivity(ActivityProducer {
             run_id: run.to_string(),
             epoch: Some(ActivityEpoch {
                 attempt_scheduled_time: Some(prost_types::Timestamp {
@@ -141,7 +136,7 @@ fn producers() -> Vec<Producer> {
         })),
     };
     let local_activity = |run: &str, started: i64, attempt| Producer {
-        id: local_activity_producer_id(run, &format!("call-{started}")),
+        id: format!("la:{run}:call-{started}"),
         kind: Some(Kind::LocalActivity(LocalActivityProducer {
             run_id: run.to_string(),
             epoch: Some(LocalActivityEpoch {
@@ -151,19 +146,15 @@ fn producers() -> Vec<Producer> {
         })),
     };
     let workflow = Producer {
-        id: workflow_producer_id("r1"),
+        id: "wf:r1".to_string(),
         kind: Some(Kind::Workflow(WorkflowProducer {
             run_id: "r1".to_string(),
             epoch: Some(WorkflowTaskEpoch::default()),
         })),
     };
-    let me = || client_producer_id("me", "p1");
     vec![
-        client(me(), 1),
-        client(me(), 2),
-        client(me(), 3),
-        client(named_client_producer_id("other"), 1),
-        client(named_client_producer_id("other"), 2),
+        client("client:me:p1".to_string()),
+        client("client:other:p2".to_string()),
         activity("r1", 1),
         activity("r1", 2),
         activity("r0", 1),
@@ -188,10 +179,11 @@ fn task(started: i64) -> WorkflowTaskEpoch {
     }
 }
 
-/// The ref of each Stream.
-fn stream_ref(stream: usize) -> StreamRef {
+/// The ref of each Stream of the seed `run`. A key holds no namespace, so the seeds that share a
+/// server take Stream ids of their own.
+fn stream_ref(run: &str, stream: usize) -> StreamRef {
     StreamRef {
-        id: STREAMS[stream].to_string(),
+        id: format!("{run}-{}", STREAMS[stream]),
         ..Default::default()
     }
 }
@@ -221,12 +213,6 @@ enum Call {
         from: Option<usize>,
         count: usize,
     },
-    /// A reverse read from the entry at `before`, or from the newest for none.
-    ReadBack {
-        stream: usize,
-        before: Option<usize>,
-        count: usize,
-    },
 }
 
 impl Call {
@@ -235,8 +221,7 @@ impl Call {
             Call::Create { stream, .. }
             | Call::Append { stream, .. }
             | Call::Close { stream, .. }
-            | Call::Read { stream, .. }
-            | Call::ReadBack { stream, .. } => *stream,
+            | Call::Read { stream, .. } => *stream,
         }
     }
 
@@ -278,10 +263,8 @@ enum Answer {
         closed: bool,
         newest: Option<Place>,
         trimmed: Option<Place>,
-        retention: Duration,
         entries: Vec<Item>,
     },
-    ReadBack(Vec<Item>),
     Refused(Reason),
 }
 
@@ -294,7 +277,8 @@ struct Side {
 struct Seed {
     seed: u64,
     rng: Rng,
-    namespace: String,
+    /// The part of each Stream id that is the seed's own.
+    run: String,
     producers: Vec<Producer>,
     memory: Side,
     redis: Side,
@@ -308,15 +292,15 @@ struct Seed {
 }
 
 impl Seed {
-    fn new(seed: u64, namespace: String, redis: Arc<RedisStore>, raw: Raw) -> Self {
+    fn new(seed: u64, run: String, redis: Arc<RedisStore>, raw: Raw) -> Self {
         Self {
             seed,
             // Zero is a fixed point of xorshift.
             rng: Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1),
-            namespace,
+            run,
             producers: producers(),
             memory: Side {
-                store: Arc::new(MemoryStore::new(RETENTION, RETENTION)),
+                store: Arc::new(MemoryStore::new(RETENTION, Some(RETENTION))),
                 logs: Default::default(),
             },
             redis: Side {
@@ -336,7 +320,7 @@ impl Seed {
             let call = self.next_call();
             self.calls.push(format!("{step}: {call:?}"));
             self.errors.clear();
-            let keys = StreamKeys::new(PREFIX, &self.namespace, STREAMS[call.stream()]);
+            let keys = StreamKeys::new(PREFIX, &stream_ref(&self.run, call.stream()).id);
             let before = match call.writes() {
                 true => Some(self.raw.snapshot(&keys).await),
                 false => None,
@@ -397,14 +381,6 @@ impl Seed {
                     count: self.rng.pick(&[0, 1, 2, 5, 100]),
                 }
             }
-            7 | 8 => {
-                let before = self.rng.below(len + 1);
-                Call::ReadBack {
-                    stream,
-                    before: self.rng.pick(&[None, Some(before)]),
-                    count: self.rng.pick(&[0, 1, 2, 5, 100]),
-                }
-            }
             _ => {
                 let producer = self.rng.below(self.producers.len());
                 let (last, last_texts) = self
@@ -458,13 +434,12 @@ impl Seed {
     }
 
     async fn answer(&mut self, which: Which, call: &Call) -> Answer {
-        let namespace = self.namespace.clone();
+        let run = self.run.clone();
         let side = match which {
             Which::Memory => &mut self.memory,
             Which::Redis => &mut self.redis,
         };
         let stream = call.stream();
-        let id = STREAMS[stream];
         let offset_at = |logs: &[Vec<i64>; 2], place: usize| {
             let log = &logs[stream];
             log.get(place)
@@ -483,10 +458,7 @@ impl Seed {
                     conflict: *conflict,
                     request_id,
                 };
-                let created = side
-                    .store
-                    .create(&namespace, &stream_ref(stream), &create)
-                    .await;
+                let created = side.store.create(&stream_ref(&run, stream), &create).await;
                 created.map(|created| Answer::Created {
                     outcome: created.outcome,
                     retention: created.retention,
@@ -503,8 +475,7 @@ impl Seed {
                 let appended = side
                     .store
                     .append(
-                        &namespace,
-                        &stream_ref(stream),
+                        &stream_ref(&run, stream),
                         &Batch {
                             producer,
                             sequence: *sequence,
@@ -513,7 +484,7 @@ impl Seed {
                         },
                     )
                     .await;
-                let logs = listing(side.store.as_ref(), &namespace, id).await;
+                let logs = listing(side.store.as_ref(), &stream_ref(&run, stream)).await;
                 side.logs[stream] = logs;
                 appended.map(|appended| Answer::Appended {
                     places: appended.offsets.map(|(first, last)| {
@@ -524,31 +495,25 @@ impl Seed {
             }
             Call::Close { producer, .. } => {
                 let producer = &self.producers[*producer];
-                let closed = side
-                    .store
-                    .close(&namespace, &stream_ref(stream), producer)
-                    .await;
+                let closed = side.store.close(&stream_ref(&run, stream), producer).await;
                 closed.map(|closed| Answer::Closed {
                     already: closed.already,
                 })
             }
             Call::Read { from, count, .. } => {
                 let from = from.map_or(0, |from| offset_at(&side.logs, from));
-                let read = side.store.read(&namespace, id, from, *count).await;
+                let read = side
+                    .store
+                    .read(&stream_ref(&run, stream), from, *count)
+                    .await;
                 read.map(|(state, entries)| Answer::Read {
                     exists: state.exists,
                     version: state.version,
                     closed: state.closed,
                     newest: (state.newest != 0).then(|| place(side, stream, state.newest)),
                     trimmed: (state.trimmed != 0).then(|| place(side, stream, state.trimmed)),
-                    retention: state.retention,
                     entries: items(side, stream, entries),
                 })
-            }
-            Call::ReadBack { before, count, .. } => {
-                let before = before.map_or(i64::MAX, |before| offset_at(&side.logs, before));
-                let read = side.store.read_back(&namespace, id, before, *count).await;
-                read.map(|entries| Answer::ReadBack(items(side, stream, entries)))
             }
         };
         answer.unwrap_or_else(|error| {
@@ -565,8 +530,8 @@ enum Which {
 }
 
 /// The offsets of a Stream's whole log.
-async fn listing(store: &dyn Store, namespace: &str, id: &str) -> Vec<i64> {
-    let read: StreamResult<_> = store.read(namespace, id, 0, 100_000).await;
+async fn listing(store: &dyn Store, stream: &StreamRef) -> Vec<i64> {
+    let read: StreamResult<_> = store.read(stream, 0, 100_000).await;
     read.map_or_else(
         |_| Vec::new(),
         |(_, entries)| entries.iter().map(|entry| entry.offset).collect(),
@@ -600,10 +565,8 @@ fn batch(producer: &Producer, texts: &[&str]) -> (Vec<Vec<u8>>, [u8; 16]) {
         .iter()
         .map(|body| {
             StreamRecord {
-                item: Some(stream_record::Item::Data(StreamData {
-                    producer: Some(producer.clone()),
-                    body: Some(body.clone()),
-                })),
+                producer: Some(producer.clone()),
+                body: Some(body.clone()),
                 ..Default::default()
             }
             .encode_to_vec()
@@ -621,7 +584,7 @@ fn batch(producer: &Producer, texts: &[&str]) -> (Vec<Vec<u8>>, [u8; 16]) {
 #[derive(Debug, PartialEq)]
 struct Snapshot {
     meta: BTreeMap<Vec<u8>, Vec<u8>>,
-    /// The expiry of each key, and the `DUMP` of the log, `:producers` and `:closed`.
+    /// The expiry of each key, and the `DUMP` of the log and `:closed`.
     rest: Vec<redis::Value>,
 }
 
@@ -653,7 +616,7 @@ impl Raw {
         let mut pipe = redis::pipe();
         pipe.cmd("HGETALL").arg(keys.meta());
         pipe.cmd("PEXPIRETIME").arg(keys.meta());
-        for key in [keys.log(), keys.producers(), keys.closed()] {
+        for key in [keys.log(), keys.closed()] {
             pipe.cmd("DUMP").arg(&key).cmd("PEXPIRETIME").arg(&key);
         }
         let (meta, rest): (BTreeMap<Vec<u8>, Vec<u8>>, Vec<redis::Value>) = {

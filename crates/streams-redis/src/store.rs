@@ -14,7 +14,7 @@ use redis::{
     Cmd, ErrorKind, FromRedisValue, InfoDict, Pipeline, RedisError, RedisResult, Script,
     ServerErrorKind, Value,
 };
-use replies::{AppendReply, CloseReply, CreateReply, ReadBackReply, ReadReply};
+use replies::{AppendReply, CloseReply, CreateReply, ReadReply};
 use std::{collections::HashMap, num::NonZeroUsize, sync::Arc, time::Duration};
 use temporalio_streams::{
     StreamResult,
@@ -44,7 +44,7 @@ pub struct RedisStore {
     blocking: Arc<BlockingPool>,
     prefix: KeyPrefix,
     retention: Duration,
-    safety_ttl: Duration,
+    last_write_ttl: Option<Duration>,
 }
 
 impl std::fmt::Debug for RedisStore {
@@ -52,7 +52,7 @@ impl std::fmt::Debug for RedisStore {
         f.debug_struct("RedisStore")
             .field("prefix", &self.prefix)
             .field("retention", &self.retention)
-            .field("safety_ttl", &self.safety_ttl)
+            .field("last_write_ttl", &self.last_write_ttl)
             .finish_non_exhaustive()
     }
 }
@@ -85,12 +85,18 @@ impl RedisStore {
             blocking: Arc::new(blocking),
             prefix: options.key_prefix,
             retention: options.retention,
-            safety_ttl: options.safety_ttl,
+            last_write_ttl: options.last_write_ttl,
         })
     }
 
-    fn keys(&self, namespace: &str, stream_id: &str) -> StreamKeys {
-        StreamKeys::new(self.prefix.as_str(), namespace, stream_id)
+    fn keys(&self, stream_id: &str) -> StreamKeys {
+        StreamKeys::new(self.prefix.as_str(), stream_id)
+    }
+
+    /// The last-write TTL as the write scripts take it, in ms, and empty for none.
+    fn last_write_ttl_arg(&self) -> String {
+        self.last_write_ttl
+            .map_or_else(String::new, |ttl| ttl.as_millis().to_string())
     }
 
     /// Runs a write script, and then `WAIT` when the options set replicas. Both are in one
@@ -153,7 +159,7 @@ impl RedisStore {
     }
 }
 
-// The trait returns Stream errors, so the runtime and lang get the same reasons on every backend.
+// The trait returns Stream errors, so the runtime and lang get the same reasons on every Store.
 // A Redis error converts through the crate's error, since this crate can't add that `From`.
 #[async_trait::async_trait]
 impl Store for RedisStore {
@@ -163,20 +169,15 @@ impl Store for RedisStore {
     }
 
     /// Creates a Stream, or finds it.
-    async fn create(
-        &self,
-        namespace: &str,
-        stream_ref: &StreamRef,
-        create: &Create<'_>,
-    ) -> StreamResult<Created> {
-        let keys = self.keys(namespace, &stream_ref.id);
+    async fn create(&self, stream_ref: &StreamRef, create: &Create<'_>) -> StreamResult<Created> {
+        let keys = self.keys(&stream_ref.id);
         let retention = create.retention.filter(|r| !r.is_zero());
         let retention = retention.unwrap_or(self.retention);
         let mut call = ScriptCall::write(&scripts::CREATE_SCRIPT, &keys);
         call.cmd
             .arg(FORMAT_VERSION)
             .arg(retention.as_millis())
-            .arg(self.safety_ttl.as_millis())
+            .arg(self.last_write_ttl_arg())
             .arg(TOMBSTONE.as_millis())
             .arg(create.request_id)
             .arg(create.conflict == ConflictPolicy::UseExisting)
@@ -185,13 +186,8 @@ impl Store for RedisStore {
         Ok(created)
     }
 
-    async fn append(
-        &self,
-        namespace: &str,
-        stream_ref: &StreamRef,
-        batch: &Batch<'_>,
-    ) -> StreamResult<Appended> {
-        let keys = self.keys(namespace, &stream_ref.id);
+    async fn append(&self, stream_ref: &StreamRef, batch: &Batch<'_>) -> StreamResult<Appended> {
+        let keys = self.keys(&stream_ref.id);
         let producer = batch.producer;
         let kind = ProducerKind::try_from(producer)?;
         let mut call = ScriptCall::write(&scripts::APPEND_SCRIPT, &keys);
@@ -201,7 +197,7 @@ impl Store for RedisStore {
             .arg(&producer.id)
             .arg(&epoch_key(producer.kind.as_ref())[..])
             .arg(batch.sequence)
-            .arg(self.safety_ttl.as_millis())
+            .arg(self.last_write_ttl_arg())
             .arg(TOMBSTONE.as_millis())
             .arg(&batch.digest[..])
             .arg(self.wait.is_some())
@@ -215,13 +211,8 @@ impl Store for RedisStore {
 
     /// Closes a Stream. The close writes no entry, so it adds one to the `:closed` key, which wakes
     /// the blocked reads.
-    async fn close(
-        &self,
-        namespace: &str,
-        stream_ref: &StreamRef,
-        producer: &Producer,
-    ) -> StreamResult<Closed> {
-        let keys = self.keys(namespace, &stream_ref.id);
+    async fn close(&self, stream_ref: &StreamRef, producer: &Producer) -> StreamResult<Closed> {
+        let keys = self.keys(&stream_ref.id);
         let mut call = ScriptCall::write(&scripts::CLOSE_SCRIPT, &keys);
         // An argument and not a key. `close.lua` says why.
         call.cmd
@@ -231,9 +222,7 @@ impl Store for RedisStore {
             .arg(&producer.id)
             .arg(&epoch_key(producer.kind.as_ref())[..])
             .arg(TOMBSTONE.as_millis())
-            .arg(self.wait.is_some())
-            // The closer, which a read builds the final StreamClose item from.
-            .arg(producer.encode_to_vec());
+            .arg(self.wait.is_some());
         let CloseReply(closed) = self.write(&call).await?;
         Ok(closed)
     }
@@ -242,12 +231,11 @@ impl Store for RedisStore {
     /// from the start of the log.
     async fn read(
         &self,
-        namespace: &str,
-        stream_id: &str,
+        stream_ref: &StreamRef,
         from: i64,
         count: usize,
     ) -> StreamResult<(StreamState, Vec<Entry>)> {
-        let keys = self.keys(namespace, stream_id);
+        let keys = self.keys(&stream_ref.id);
         let start = if from > 0 {
             entry_id_of_offset(from)
         } else {
@@ -267,41 +255,14 @@ impl Store for RedisStore {
         Ok((state, with_producers(entries, earlier)?))
     }
 
-    /// Reads up to `count` entries at or before `before`, newest first. One script reads the
-    /// page and the Producer of its oldest entry's batch, so the log can't expire between them.
-    async fn read_back(
-        &self,
-        namespace: &str,
-        stream_id: &str,
-        before: i64,
-        count: usize,
-    ) -> StreamResult<Vec<Entry>> {
-        let keys = self.keys(namespace, stream_id);
-        let mut call = ScriptCall::read_back(&keys);
-        call.cmd.arg(entry_id_of_offset(before)).arg(count);
-        let reply = call
-            .run(&mut self.shared.clone())
-            .await
-            .map_err(RedisStoreError::from)?;
-        let ReadBackReply {
-            mut entries,
-            earlier,
-        } = redis::from_redis_value(reply).map_err(|error| corrupt("The log", error))?;
-        entries.reverse();
-        let mut entries = with_producers(entries, earlier)?;
-        entries.reverse();
-        Ok(entries)
-    }
-
     /// The wait uses a dedicated connection, so it doesn't block the short calls.
     async fn wait_after(
         &self,
-        namespace: &str,
-        stream_id: &str,
+        stream_ref: &StreamRef,
         after: i64,
         deadline: Instant,
     ) -> StreamResult<bool> {
-        let keys = self.keys(namespace, stream_id);
+        let keys = self.keys(&stream_ref.id);
         let after = if after > 0 {
             entry_id_of_offset(after)
         } else {
@@ -323,14 +284,13 @@ struct ScriptCall {
 }
 
 impl ScriptCall {
-    /// A write script call, with the meta, the log and `:producers`.
+    /// A write script call, with the meta and the log.
     fn write(script: &'static Script, keys: &StreamKeys) -> Self {
         let mut cmd = redis::cmd("EVALSHA");
         cmd.arg(script.get_hash())
-            .arg(3)
+            .arg(2)
             .arg(keys.meta())
-            .arg(keys.log())
-            .arg(keys.producers());
+            .arg(keys.log());
         Self { script, cmd }
     }
 
@@ -343,14 +303,6 @@ impl ScriptCall {
             .arg(2)
             .arg(keys.meta())
             .arg(keys.log());
-        Self { script, cmd }
-    }
-
-    /// The reverse read script call, also with `EVALSHA_RO`. It needs only the log.
-    fn read_back(keys: &StreamKeys) -> Self {
-        let script = &*scripts::READ_BACK_SCRIPT;
-        let mut cmd = redis::cmd("EVALSHA_RO");
-        cmd.arg(script.get_hash()).arg(1).arg(keys.log());
         Self { script, cmd }
     }
 
@@ -407,13 +359,14 @@ pub(crate) fn check(options: &RedisStoreOptions) -> RedisStoreResult<Endpoint> {
 
 fn check_options(options: &RedisStoreOptions) -> RedisStoreResult<()> {
     // The scripts take whole milliseconds, so a shorter TTL would be zero there.
-    let ttls = [options.retention, options.safety_ttl];
+    let ttls = [Some(options.retention), options.last_write_ttl];
     if ttls
         .iter()
+        .flatten()
         .any(|ttl| ttl.as_millis() == 0 || *ttl > MAX_TTL)
     {
         return Err(RedisStoreError::invalid(format!(
-            "The Retention and the safety TTL must be at least 1 ms and at most {} s",
+            "The Retention and the last-write TTL must be at least 1 ms and at most {} s",
             MAX_TTL.as_secs()
         )));
     }
@@ -581,7 +534,7 @@ mod tests {
         };
         let changes: [fn(&mut RedisStoreOptions); 3] = [
             |options| options.retention = Duration::from_micros(500),
-            |options| options.safety_ttl = Duration::from_micros(500),
+            |options| options.last_write_ttl = Some(Duration::from_micros(500)),
             |options| options.response_timeout = Duration::ZERO,
         ];
         for change in changes {
@@ -589,38 +542,86 @@ mod tests {
         }
     }
 
+    // A Store config can drop its last-write TTL while a Stream is open, and the next write
+    // must clear the expiry that an earlier write set.
+    #[tokio::test]
+    #[ignore = "needs Redis"]
+    async fn a_write_with_no_last_write_ttl_clears_the_expiry_of_an_open_stream() {
+        let url = crate::testing::standalone_url();
+        let options = |last_write_ttl| {
+            let mut options = RedisStoreOptions::new(&url).unwrap();
+            options.key_prefix = "streams-unit".parse().unwrap();
+            options.last_write_ttl = last_write_ttl;
+            options
+        };
+        let with_ttl = RedisStore::connect(options(Some(Duration::from_secs(60))))
+            .await
+            .unwrap();
+        let without = RedisStore::connect(options(None)).await.unwrap();
+        let stream_ref = StreamRef {
+            id: format!("ttl-{}", std::process::id()),
+            ..Default::default()
+        };
+        with_ttl
+            .create(&stream_ref, &Create::default())
+            .await
+            .unwrap();
+        let (state, _) = with_ttl.read(&stream_ref, 0, 0).await.unwrap();
+        assert!(state.expires_ms > 0);
+        let producer = Producer {
+            id: "client:ttl".to_string(),
+            kind: Some(temporalio_streams::proto::producer::Kind::Client(
+                temporalio_streams::proto::ClientProducer::default(),
+            )),
+        };
+        let batch = Batch {
+            producer: &producer,
+            sequence: 1,
+            records: &[],
+            digest: [0; 16],
+        };
+        without.append(&stream_ref, &batch).await.unwrap();
+        let (state, _) = without.read(&stream_ref, 0, 0).await.unwrap();
+        assert!(!state.expired() && state.expires_ms == 0);
+        let keys = StreamKeys::new("streams-unit", &stream_ref.id);
+        let mut conn = redis::Client::open(url.as_str())
+            .unwrap()
+            .get_multiplexed_async_connection()
+            .await
+            .unwrap();
+        let ttl: i64 = redis::cmd("PTTL")
+            .arg(keys.meta())
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(ttl, -1);
+        // With no expiry, the key would stay on the test server.
+        let _: () = redis::cmd("DEL")
+            .arg(keys.meta())
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     #[ignore = "needs Redis"]
     async fn a_read_inside_a_batch_gets_the_producer_of_the_batch() {
-        use temporalio_streams::proto::{
-            ClientEpoch, ClientProducer, StreamData, StreamRecord, producer::Kind,
-            stream_record::Item,
-        };
+        use temporalio_streams::proto::{ClientProducer, StreamRecord, producer::Kind};
         let mut options = RedisStoreOptions::new(crate::testing::standalone_url()).unwrap();
         options.key_prefix = "streams-unit".parse().unwrap();
         let store = RedisStore::connect(options).await.unwrap();
-        let (namespace, handle) = (
-            format!("ns-{}", std::process::id()),
-            StreamRef {
-                id: "batch".to_string(),
-                ..Default::default()
-            },
-        );
-        store
-            .create(&namespace, &handle, &Create::default())
-            .await
-            .unwrap();
+        // A key holds no namespace, so each run takes a Stream id of its own.
+        let stream_ref = StreamRef {
+            id: format!("batch-{}", std::process::id()),
+            ..Default::default()
+        };
+        store.create(&stream_ref, &Create::default()).await.unwrap();
         let producer = Producer {
             id: "client:unit".to_string(),
-            kind: Some(Kind::Client(ClientProducer {
-                epoch: Some(ClientEpoch { attempt: 1 }),
-            })),
+            kind: Some(Kind::Client(ClientProducer {})),
         };
         let record = StreamRecord {
-            item: Some(Item::Data(StreamData {
-                producer: Some(producer.clone()),
-                ..Default::default()
-            })),
+            producer: Some(producer.clone()),
             ..Default::default()
         }
         .encode_to_vec();
@@ -631,20 +632,16 @@ mod tests {
             records: &records,
             digest: [0; 16],
         };
-        let (first, last) = store
-            .append(&namespace, &handle, &batch)
+        let (first, _) = store
+            .append(&stream_ref, &batch)
             .await
             .unwrap()
             .offsets
             .unwrap();
-        let (_, forward) = store.read(&namespace, "batch", first + 2, 2).await.unwrap();
-        let back = store
-            .read_back(&namespace, "batch", last - 1, 2)
-            .await
-            .unwrap();
-        for entry in forward.iter().chain(&back) {
+        let (_, forward) = store.read(&stream_ref, first + 2, 2).await.unwrap();
+        for entry in &forward {
             assert_eq!(entry.record.as_deref(), Some(record.as_slice()));
         }
-        assert_eq!((forward.len(), back.len()), (2, 2));
+        assert_eq!(forward.len(), 2);
     }
 }

@@ -1,6 +1,6 @@
--- The prelude of the write scripts. KEYS[1] is the Stream's meta hash, KEYS[2] its log, and KEYS[3]
--- the sorted set of its Producers' last appends. Each script checks everything that can refuse the
--- call before its first write, since Redis doesn't roll a script back.
+-- The prelude of the write scripts. KEYS[1] is the Stream's meta hash and KEYS[2] its log. Each
+-- script checks everything that can refuse the call before its first write, since Redis doesn't
+-- roll a script back.
 
 local function now_ms()
   local time = redis.call('TIME')
@@ -28,26 +28,30 @@ local function check_live(meta, version, now)
   return nil
 end
 
--- Sets the expiry after this write. An open Stream keeps the safety TTL after its last write, and a
--- closed one keeps the Retention. The meta key expires 30 days later, as the Tombstone. Only a
--- close gives the `closed` key, since a closed Stream takes no other write.
-local function refresh(meta, log, producers, closed, now, safety, tombstone)
-  local retention = tonumber(redis.call('HGET', meta, 'ret'))
-  local exp = now + retention
-  if not redis.call('HGET', meta, 'closed') then
-    exp = now + safety
+-- Sets the expiry after this write. An open Stream keeps the last-write TTL after its last write,
+-- and with none it stays until its close. A closed one keeps the Retention. The meta key expires 30
+-- days later, as the Tombstone. Only a close gives the `closed` key, since a closed Stream takes no
+-- other write.
+local function refresh(meta, log, closed, now, last_write_ttl, tombstone)
+  local ttl = last_write_ttl
+  if redis.call('HGET', meta, 'closed') then
+    ttl = tonumber(redis.call('HGET', meta, 'ret'))
   end
+  if not ttl then
+    -- The Store config may have dropped its last-write TTL since an earlier write.
+    redis.call('HDEL', meta, 'exp')
+    redis.call('PERSIST', meta)
+    redis.call('PERSIST', log)
+    return
+  end
+  local exp = now + ttl
   redis.call('HSET', meta, 'exp', exp)
   redis.call('PEXPIREAT', meta, exp + tombstone)
-  for _, key in ipairs({producers, closed}) do
-    if redis.call('EXISTS', key) == 1 then
-      redis.call('PEXPIREAT', key, exp)
-    end
+  if closed and redis.call('EXISTS', closed) == 1 then
+    redis.call('PEXPIREAT', closed, exp)
   end
-  -- A read hides every Record one Retention after the last write. `newest` keeps later ids above
-  -- the expired ones.
   if redis.call('EXISTS', log) == 1 then
-    redis.call('PEXPIREAT', log, math.min(exp, now + retention))
+    redis.call('PEXPIREAT', log, exp)
   end
 end
 
@@ -76,41 +80,15 @@ local function raise_trimmed(meta, id)
   end
 end
 
--- Drops the Records older than the Retention and keeps the newest dropped id, so a read can
--- tell expired Records from an empty Stream.
-local function trim(meta, log, now)
-  if redis.call('EXISTS', log) == 0 then
-    -- Every Record expired, so a read from an older offset must fail.
-    local newest = redis.call('HGET', meta, 'newest')
-    if newest then
-      raise_trimmed(meta, newest)
-    end
+-- Sets `trimmed` to `newest` when the log is gone, as after an eviction. The log took every Record
+-- with it, so a read from an older offset must fail.
+local function mark_log_gone(meta, log)
+  if redis.call('EXISTS', log) == 1 then
     return
   end
-  local min = now - tonumber(redis.call('HGET', meta, 'ret'))
-  if min <= 0 then
-    return
-  end
-  local old = redis.call('XREVRANGE', log, '(' .. min .. '-0', '-', 'COUNT', 1)
-  if #old > 0 then
-    raise_trimmed(meta, old[1][1])
-    redis.call('XTRIM', log, 'MINID', min)
-  end
-end
-
--- The most Producers that one append prunes, so that an append after a long gap stays short.
-local PRUNE_LIMIT = 64
-
--- Removes the field of each Producer whose last append is older than the Retention. Its Records
--- are older too, so the log has none of them.
-local function prune(meta, producers, now)
-  local min = now - tonumber(redis.call('HGET', meta, 'ret'))
-  local old = redis.call('ZRANGEBYSCORE', producers, '-inf', '(' .. min, 'LIMIT', 0, PRUNE_LIMIT)
-  for _, producer in ipairs(old) do
-    redis.call('HDEL', meta, 'p|' .. producer)
-  end
-  if #old > 0 then
-    redis.call('ZREM', producers, unpack(old))
+  local newest = redis.call('HGET', meta, 'newest')
+  if newest then
+    raise_trimmed(meta, newest)
   end
 end
 
@@ -118,7 +96,8 @@ end
 -- since `XADD *` on Redis 7.0 can cross a millisecond inside one script.
 local next_ms, next_seq = 0, 0
 
--- Starts the script's ids after the newest id the log had, which `newest` keeps after a trim.
+-- Starts the script's ids after the newest id the log had, which `newest` keeps after the log is
+-- gone.
 -- Refuses `count` entries whose ids would not fit an offset, which packs the sequence in 20 bits.
 local function check_ids_fit(meta, log, now, count)
   local newest = redis.call('HGET', meta, 'newest')

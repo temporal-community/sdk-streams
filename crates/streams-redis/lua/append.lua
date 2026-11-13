@@ -1,15 +1,15 @@
 -- Appends one batch of one Producer.
 --
 -- ARGV: format version, kind, Producer id, the 40-byte epoch key, sequence (0 takes the next one),
--- safety TTL ms, Tombstone ms, the 16-byte batch digest, `1` when a `WAIT` runs after it, the
--- encoded Producer, then one Record with no Producer per argument.
+-- last-write TTL ms (empty for none), Tombstone ms, the 16-byte batch digest, `1` when a `WAIT`
+-- runs after it, the encoded Producer, then one Record with no Producer per argument.
 --
 -- Returns {'ok' or 'resend', first id, last id}. A batch that wrote no entry gives '' for both ids.
-local meta, log, producers = KEYS[1], KEYS[2], KEYS[3]
+local meta, log = KEYS[1], KEYS[2]
 local version, kind, producer = tonumber(ARGV[1]), ARGV[2], ARGV[3]
 local epoch, sequence_text = ARGV[4], ARGV[5]
 local sequence = tonumber(sequence_text)
-local safety, tombstone = tonumber(ARGV[6]), tonumber(ARGV[7])
+local last_write_ttl, tombstone = tonumber(ARGV[6]), tonumber(ARGV[7])
 local digest, wait, encoded_producer = ARGV[8], ARGV[9], ARGV[10]
 local records = #ARGV - 10
 local field = 'p|' .. kind .. '|' .. producer
@@ -72,9 +72,7 @@ if refused then
   return refused
 end
 
--- `prune` reads `:producers` first, so a key of another type there fails before any write.
-prune(meta, producers, now)
-trim(meta, log, now)
+mark_log_gone(meta, log)
 local first_id, last_id = '', ''
 -- Only the batch's first Record keeps the Producer. Each later one keeps the seq of that first
 -- entry, so a read that starts inside the batch finds the Producer with one lookup.
@@ -94,6 +92,5 @@ redis.call('HSET', meta, field, producer_value(epoch, sequence, first_id, last_i
 if last_id ~= '' then
   redis.call('HSET', meta, 'newest', last_id)
 end
-redis.call('ZADD', producers, next_ms, kind .. '|' .. producer)
-refresh(meta, log, producers, nil, now, safety, tombstone)
+refresh(meta, log, nil, now, last_write_ttl, tombstone)
 return {'ok', first_id, last_id}

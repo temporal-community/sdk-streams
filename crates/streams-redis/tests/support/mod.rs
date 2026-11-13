@@ -1,4 +1,4 @@
-//! The Redis backends of the shared suites, on a standalone server and on a cluster. The
+//! The Redis Stores of the shared suites, on a standalone server and on a cluster. The
 //! standalone server's replica also runs them with `WAIT`.
 
 use prost::Message;
@@ -7,7 +7,7 @@ use temporalio_streams::{
     StreamRuntime,
     ids::StreamKeys,
     store::Store,
-    testing::{Needs, RawKeys, TestBackend},
+    testing::{Needs, RawKeys, RuntimeConfig, TestStore},
 };
 use temporalio_streams_redis::{
     RedisStore, RedisStoreOptions, RedisStreamRuntime, Topology, Url, WaitOptions,
@@ -18,34 +18,34 @@ use temporalio_streams_redis::{
 /// The key prefix of the tests, so that they never touch other data on the server.
 const PREFIX: &str = "streams-test";
 
-/// The backends of the standalone server, with `WAIT` and with none.
-pub(crate) fn standalone() -> Vec<Arc<dyn TestBackend>> {
+/// The Stores of the standalone server, with `WAIT` and with none.
+pub(crate) fn standalone() -> Vec<Arc<dyn TestStore>> {
     let url = standalone_url();
     assert!(
         has_replica(&url),
         "the server at STREAMS_REDIS_URL needs a replica"
     );
-    backends(Topology::Standalone(url.parse().unwrap()))
+    test_stores(Topology::Standalone(url.parse().unwrap()))
 }
 
-/// The backends of the cluster, with `WAIT` on each primary's replica and with none.
-pub(crate) fn cluster() -> Vec<Arc<dyn TestBackend>> {
-    backends(Topology::Cluster {
+/// The Stores of the cluster, with `WAIT` on each primary's replica and with none.
+pub(crate) fn cluster() -> Vec<Arc<dyn TestStore>> {
+    test_stores(Topology::Cluster {
         first: cluster_url().parse().unwrap(),
         rest: Vec::new(),
     })
 }
 
-// Each write of the first backend goes through the `WAIT` pipeline, refusals too.
-fn backends(topology: Topology<Url>) -> Vec<Arc<dyn TestBackend>> {
-    let waits = RedisBackend {
+// Each write of the first Store goes through the `WAIT` pipeline, refusals too.
+fn test_stores(topology: Topology<Url>) -> Vec<Arc<dyn TestStore>> {
+    let waits = RedisTestStore {
         topology: topology.clone(),
         wait: Some(WaitOptions {
             replicas: NonZeroUsize::MIN,
             timeout: WAIT_TIMEOUT,
         }),
     };
-    let plain = RedisBackend {
+    let plain = RedisTestStore {
         topology,
         wait: None,
     };
@@ -63,8 +63,8 @@ pub(crate) fn has_replica(url: &str) -> bool {
         .is_some_and(|count| count > 0)
 }
 
-/// The Redis of a backend, and its `WAIT`, if any.
-pub(crate) struct RedisBackend {
+/// The Redis of a Store under test, and its `WAIT`, if any.
+pub(crate) struct RedisTestStore {
     topology: Topology<Url>,
     wait: Option<WaitOptions>,
 }
@@ -72,7 +72,7 @@ pub(crate) struct RedisBackend {
 /// Long enough for a replica on a busy test host. The response timeout is twice this.
 const WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 
-impl RedisBackend {
+impl RedisTestStore {
     fn options(&self) -> RedisStoreOptions {
         let mut options = RedisStoreOptions::from(self.topology.clone());
         options.key_prefix = PREFIX.parse().unwrap();
@@ -83,7 +83,7 @@ impl RedisBackend {
 }
 
 #[async_trait::async_trait]
-impl TestBackend for RedisBackend {
+impl TestStore for RedisTestStore {
     fn gives(&self) -> Needs {
         Needs::ALL
     }
@@ -95,24 +95,29 @@ impl TestBackend for RedisBackend {
     }
 
     // Through the config bytes, as a bridge builds it.
-    fn runtime(&self, backend: &str) -> Arc<StreamRuntime> {
+    fn runtime(&self, runtime: &RuntimeConfig) -> Arc<StreamRuntime> {
         let seconds = |duration: Duration| prost_types::Duration {
             seconds: i64::try_from(duration.as_secs()).unwrap(),
-            nanos: 0,
+            nanos: i32::try_from(duration.subsec_nanos()).unwrap(),
         };
         let config = RedisStreamConfig {
             urls: self.topology.servers().map(|url| url.to_string()).collect(),
             cluster: matches!(self.topology, Topology::Cluster { .. }),
             key_prefix: PREFIX.to_string(),
-            backend: backend.to_string(),
+            store_name: runtime.store_name.clone(),
             wait_replicas: self
                 .wait
                 .map_or(0, |wait| i32::try_from(wait.replicas.get()).unwrap()),
             wait_timeout: Some(seconds(WAIT_TIMEOUT)),
             response_timeout: Some(seconds(2 * WAIT_TIMEOUT)),
-            // The writer cases leave megabytes of Records, which a local server keeps for the
-            // Retention.
-            retention: Some(seconds(Duration::from_secs(300))),
+            // A case that sets no TTL still gets ones that end, so a local server doesn't keep its
+            // Streams for good.
+            retention: Some(seconds(
+                runtime.retention.unwrap_or(Duration::from_secs(300)),
+            )),
+            last_write_ttl: Some(seconds(
+                runtime.last_write_ttl.unwrap_or(Duration::from_secs(300)),
+            )),
             ..Default::default()
         };
         RedisStreamRuntime::from_config_bytes(&config.encode_to_vec(), None).unwrap()
@@ -153,33 +158,38 @@ impl Raw {
 
 #[async_trait::async_trait]
 impl RawKeys for Raw {
-    async fn set_meta(&self, namespace: &str, stream: &str, field: &[u8], value: &[u8]) {
-        let keys = StreamKeys::new(PREFIX, namespace, stream);
+    async fn set_meta(&self, stream: &str, field: &[u8], value: &[u8]) {
+        let keys = StreamKeys::new(PREFIX, stream);
         self.query::<()>(redis::cmd("HSET").arg(keys.meta()).arg(field).arg(value))
             .await;
     }
 
-    async fn meta(&self, namespace: &str, stream: &str, field: &[u8]) -> Option<Vec<u8>> {
-        let keys = StreamKeys::new(PREFIX, namespace, stream);
+    async fn meta(&self, stream: &str, field: &[u8]) -> Option<Vec<u8>> {
+        let keys = StreamKeys::new(PREFIX, stream);
         self.query(redis::cmd("HGET").arg(keys.meta()).arg(field))
             .await
     }
 
-    async fn ttls(&self, namespace: &str, stream: &str) -> (i64, i64) {
-        let keys = StreamKeys::new(PREFIX, namespace, stream);
+    async fn ttls(&self, stream: &str) -> (i64, i64) {
+        let keys = StreamKeys::new(PREFIX, stream);
         let log = self.query(redis::cmd("PTTL").arg(keys.log())).await;
         let meta = self.query(redis::cmd("PTTL").arg(keys.meta())).await;
         (log, meta)
     }
 
-    async fn add_raw_entry(&self, namespace: &str, stream: &str, id: &str) {
-        let keys = StreamKeys::new(PREFIX, namespace, stream);
+    async fn add_raw_entry(&self, stream: &str, id: &str) {
+        let keys = StreamKeys::new(PREFIX, stream);
         self.query::<String>(redis::cmd("XADD").arg(keys.log()).arg(id).arg("x").arg("y"))
             .await;
     }
 
-    async fn log_len(&self, namespace: &str, stream: &str) -> usize {
-        let keys = StreamKeys::new(PREFIX, namespace, stream);
+    async fn log_len(&self, stream: &str) -> usize {
+        let keys = StreamKeys::new(PREFIX, stream);
         self.query(redis::cmd("XLEN").arg(keys.log())).await
+    }
+
+    async fn drop_log(&self, stream: &str) {
+        let keys = StreamKeys::new(PREFIX, stream);
+        self.query::<()>(redis::cmd("DEL").arg(keys.log())).await;
     }
 }

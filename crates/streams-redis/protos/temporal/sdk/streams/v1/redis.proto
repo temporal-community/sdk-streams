@@ -1,14 +1,12 @@
 syntax = "proto3";
 
-// The config of the Redis Stream runtime. It's the Redis Store's own config, so it isn't in
-// sdk-core's `coresdk.streams` package. Its shared fields have the numbers and types of
-// `coresdk.streams.MemoryStreamConfig`, so a backend can pass either config. Every SDK uses these
-// field numbers.
+// The config of the Redis Stream runtime. It's the Redis Store's own config, so sdk-core has no
+// copy of it. Every SDK uses these field numbers.
 package temporal.sdk.streams.v1;
 
 import "google/protobuf/duration.proto";
 
-// The settings of the Redis Stream runtime. Lang builds it from the backend options.
+// The settings of the Redis Stream runtime. Lang builds it from the Store options.
 message RedisStreamConfig {
     // One URL, or the seed URLs of a cluster. Credentials and TLS come from the URL.
     repeated string urls = 1;
@@ -17,15 +15,16 @@ message RedisStreamConfig {
     string key_prefix = 3;
     // The default Retention of a new Stream. Empty is 7 days.
     google.protobuf.Duration retention = 4;
-    // How long an open Workflow-owned Stream stays after its last write. Empty is 90 days.
-    google.protobuf.Duration safety_ttl = 5;
+    // How long an open Stream stays after its last write. Empty keeps an open Stream until its
+    // close.
+    google.protobuf.Duration last_write_ttl = 5;
     // Zero is 256.
     int32 blocking_reads_per_node = 8;
     // Empty is 5 s.
     google.protobuf.Duration response_timeout = 9;
-    // The backend name that lang registered this runtime under. The crate sets it on each
-    // StreamRef that it builds, such as the one in a create response.
-    string backend = 10;
+    // The Store name that lang registered this runtime under. The crate sets it as the `store` of
+    // each StreamRef that it builds, such as the one in a create response.
+    string store_name = 10;
     // How many replicas must have each write before it answers. Zero sends no WAIT.
     int32 wait_replicas = 11;
     // How long a write waits for its replicas, at most half of response_timeout. Empty is 1 s.

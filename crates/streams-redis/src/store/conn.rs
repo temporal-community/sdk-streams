@@ -933,19 +933,16 @@ mod tests {
                 .collect()
         };
         for round in 0..2_000 {
-            let (namespace, stream) = (text(round % 7), text(round % 13 + 1));
-            let keys = StreamKeys::new("streams", &namespace, &stream);
-            let slots = [keys.meta(), keys.log(), keys.producers(), keys.closed()].map(|key| {
+            let stream = text(round % 13 + 1);
+            let keys = StreamKeys::new("streams", &stream);
+            let slots = [keys.meta(), keys.log(), keys.closed()].map(|key| {
                 let tag = key
                     .split_once('{')
                     .and_then(|(_, rest)| rest.split_once('}'));
                 assert!(tag.is_some_and(|(tag, _)| !tag.is_empty()), "{key}");
                 slot(&key)
             });
-            assert!(
-                slots.iter().all(|s| *s == slots[0]),
-                "{namespace:?} {stream:?}"
-            );
+            assert!(slots.iter().all(|s| *s == slots[0]), "{stream:?}");
         }
     }
 

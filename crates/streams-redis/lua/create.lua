@@ -2,14 +2,15 @@
 -- expired or closed, in that order. Then a retry of the create that made the Stream gets `created`
 -- again. Any other create fails with `ALREADY_EXISTS`, unless it uses the existing Stream.
 --
--- ARGV: format version, Retention ms, safety TTL ms, Tombstone ms, the request id (empty for none),
--- `1` when the create uses an existing Stream, `1` when a `WAIT` runs after it.
+-- ARGV: format version, Retention ms, last-write TTL ms (empty for none), Tombstone ms, the request
+-- id (empty for none), `1` when the create uses an existing Stream, `1` when a `WAIT` runs after
+-- it.
 --
 -- Returns {outcome, stored Retention ms}. The outcome is `created` or `exists`. A Stream that
 -- exists keeps its own Retention.
-local meta, log, producers = KEYS[1], KEYS[2], KEYS[3]
+local meta, log = KEYS[1], KEYS[2]
 local version, retention = tonumber(ARGV[1]), ARGV[2]
-local safety, tombstone = tonumber(ARGV[3]), tonumber(ARGV[4])
+local last_write_ttl, tombstone = tonumber(ARGV[3]), tonumber(ARGV[4])
 local request_id, use_existing, wait = ARGV[5], ARGV[6], ARGV[7]
 
 local now = now_ms()
@@ -19,7 +20,7 @@ if not stored then
   if request_id ~= '' then
     redis.call('HSET', meta, 'rid', request_id)
   end
-  refresh(meta, log, producers, nil, now, safety, tombstone)
+  refresh(meta, log, nil, now, last_write_ttl, tombstone)
   return {'created', retention}
 end
 local refused = check_live(meta, version, now)
