@@ -24,7 +24,7 @@ lists the main config fields. `RedisStoreOptions` has the same ones, except that
 | `key_prefix` | `temporal-streams` | The prefix of every key |
 | `store_name` | empty | The name that lang registered the Store under. It goes on each ref |
 | `retention` | 7 days | The Retention of each Stream. It counts from the close. |
-| `last_write_ttl` | none | How long an open Stream stays after its last write. None keeps it open |
+| `producer_idle_ttl` | none | How long an open Stream stays after the last write of any Producer. None keeps it open |
 | `wait_replicas` | 0 | The replicas that must have each write, with `WAIT` |
 | `wait_timeout` | 1 s | How long a write waits for its replicas |
 

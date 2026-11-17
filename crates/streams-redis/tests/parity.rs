@@ -68,7 +68,7 @@ async fn the_redis_store_answers_as_the_memory_store_on_a_redis_cluster() {
 async fn run(mut options: RedisStoreOptions) {
     options.key_prefix = PREFIX.parse().unwrap();
     options.retention = RETENTION;
-    options.last_write_ttl = Some(RETENTION);
+    options.producer_idle_ttl = Some(RETENTION);
     let raw = Raw::open(&options.topology).await;
     let redis = Arc::new(RedisStore::connect(options).await.unwrap());
     let seeds: Vec<u64> = match std::env::var("STREAMS_PARITY_SEED") {

@@ -28,17 +28,17 @@ local function check_live(meta, version, now)
   return nil
 end
 
--- Sets the expiry after this write. An open Stream keeps the last-write TTL after its last write,
--- and with none it stays until its close. A closed one keeps the Retention. The meta key expires 30
--- days later, as the Tombstone. Only a close gives the `closed` key, since a closed Stream takes no
--- other write.
-local function refresh(meta, log, closed, now, last_write_ttl, tombstone)
-  local ttl = last_write_ttl
+-- Sets the expiry after this write. An open Stream keeps the Producer idle TTL after the last write
+-- of any Producer, and with none it stays until its close. A closed one keeps the Retention. The
+-- meta key expires 30 days later, as the Tombstone. Only a close gives the `closed` key, since a
+-- closed Stream takes no other write.
+local function refresh(meta, log, closed, now, producer_idle_ttl, tombstone)
+  local ttl = producer_idle_ttl
   if redis.call('HGET', meta, 'closed') then
     ttl = tonumber(redis.call('HGET', meta, 'ret'))
   end
   if not ttl then
-    -- The Store config may have dropped its last-write TTL since an earlier write.
+    -- The Store config may have dropped its Producer idle TTL since an earlier write.
     redis.call('HDEL', meta, 'exp')
     redis.call('PERSIST', meta)
     redis.call('PERSIST', log)

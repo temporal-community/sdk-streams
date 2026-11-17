@@ -44,7 +44,7 @@ pub struct RedisStore {
     blocking: Arc<BlockingPool>,
     prefix: KeyPrefix,
     retention: Duration,
-    last_write_ttl: Option<Duration>,
+    producer_idle_ttl: Option<Duration>,
 }
 
 impl std::fmt::Debug for RedisStore {
@@ -52,7 +52,7 @@ impl std::fmt::Debug for RedisStore {
         f.debug_struct("RedisStore")
             .field("prefix", &self.prefix)
             .field("retention", &self.retention)
-            .field("last_write_ttl", &self.last_write_ttl)
+            .field("producer_idle_ttl", &self.producer_idle_ttl)
             .finish_non_exhaustive()
     }
 }
@@ -85,7 +85,7 @@ impl RedisStore {
             blocking: Arc::new(blocking),
             prefix: options.key_prefix,
             retention: options.retention,
-            last_write_ttl: options.last_write_ttl,
+            producer_idle_ttl: options.producer_idle_ttl,
         })
     }
 
@@ -93,9 +93,9 @@ impl RedisStore {
         StreamKeys::new(self.prefix.as_str(), stream_id)
     }
 
-    /// The last-write TTL as the write scripts take it, in ms, and empty for none.
-    fn last_write_ttl_arg(&self) -> String {
-        self.last_write_ttl
+    /// The Producer idle TTL as the write scripts take it, in ms, and empty for none.
+    fn producer_idle_ttl_arg(&self) -> String {
+        self.producer_idle_ttl
             .map_or_else(String::new, |ttl| ttl.as_millis().to_string())
     }
 
@@ -177,7 +177,7 @@ impl Store for RedisStore {
         call.cmd
             .arg(FORMAT_VERSION)
             .arg(retention.as_millis())
-            .arg(self.last_write_ttl_arg())
+            .arg(self.producer_idle_ttl_arg())
             .arg(TOMBSTONE.as_millis())
             .arg(create.request_id)
             .arg(create.conflict == ConflictPolicy::UseExisting)
@@ -197,7 +197,7 @@ impl Store for RedisStore {
             .arg(&producer.id)
             .arg(&epoch_key(producer.kind.as_ref())[..])
             .arg(batch.sequence)
-            .arg(self.last_write_ttl_arg())
+            .arg(self.producer_idle_ttl_arg())
             .arg(TOMBSTONE.as_millis())
             .arg(&batch.digest[..])
             .arg(self.wait.is_some())
@@ -359,14 +359,14 @@ pub(crate) fn check(options: &RedisStoreOptions) -> RedisStoreResult<Endpoint> {
 
 fn check_options(options: &RedisStoreOptions) -> RedisStoreResult<()> {
     // The scripts take whole milliseconds, so a shorter TTL would be zero there.
-    let ttls = [Some(options.retention), options.last_write_ttl];
+    let ttls = [Some(options.retention), options.producer_idle_ttl];
     if ttls
         .iter()
         .flatten()
         .any(|ttl| ttl.as_millis() == 0 || *ttl > MAX_TTL)
     {
         return Err(RedisStoreError::invalid(format!(
-            "The Retention and the last-write TTL must be at least 1 ms and at most {} s",
+            "The Retention and the Producer idle TTL must be at least 1 ms and at most {} s",
             MAX_TTL.as_secs()
         )));
     }
@@ -534,7 +534,7 @@ mod tests {
         };
         let changes: [fn(&mut RedisStoreOptions); 3] = [
             |options| options.retention = Duration::from_micros(500),
-            |options| options.last_write_ttl = Some(Duration::from_micros(500)),
+            |options| options.producer_idle_ttl = Some(Duration::from_micros(500)),
             |options| options.response_timeout = Duration::ZERO,
         ];
         for change in changes {
@@ -542,16 +542,16 @@ mod tests {
         }
     }
 
-    // A Store config can drop its last-write TTL while a Stream is open, and the next write
+    // A Store config can drop its Producer idle TTL while a Stream is open, and the next write
     // must clear the expiry that an earlier write set.
     #[tokio::test]
     #[ignore = "needs Redis"]
-    async fn a_write_with_no_last_write_ttl_clears_the_expiry_of_an_open_stream() {
+    async fn a_write_with_no_producer_idle_ttl_clears_the_expiry_of_an_open_stream() {
         let url = crate::testing::standalone_url();
-        let options = |last_write_ttl| {
+        let options = |producer_idle_ttl| {
             let mut options = RedisStoreOptions::new(&url).unwrap();
             options.key_prefix = "streams-unit".parse().unwrap();
-            options.last_write_ttl = last_write_ttl;
+            options.producer_idle_ttl = producer_idle_ttl;
             options
         };
         let with_ttl = RedisStore::connect(options(Some(Duration::from_secs(60))))

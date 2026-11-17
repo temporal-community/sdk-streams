@@ -10,8 +10,8 @@
   `StreamRuntime::call` with an operation name and the encoded request. The config names the Store
   with `store_name`, and the runtime sets that name on each ref it builds.
 - A Stream's Retention counts from its close. An open Stream keeps all its Records until its
-  last-write TTL passes after its last write. With no `last_write_ttl`, an open Stream stays until
-  its close.
+  Producer idle TTL passes after the last write of any Producer. With no `producer_idle_ttl`, an
+  open Stream stays until its close.
 - A Producer id is opaque. The Store takes any non-empty id of at most 4096 bytes, and it keeps the
   dedupe and fence state of each Producer for as long as its Stream exists.
 - A read gives only Records, and a close shows as `done`. A read of a Stream that nobody created

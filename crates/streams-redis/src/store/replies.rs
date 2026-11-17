@@ -90,7 +90,7 @@ impl FromRedisValue for ReadReply {
         let earlier = earlier(&producer)?;
         let now_ms = seconds * 1000 + micros / 1000;
         let (version, closed, newest, trimmed, expires) = meta;
-        // An open Stream with no last-write TTL has no `exp`.
+        // An open Stream with no Producer idle TTL has no `exp`.
         let Some(version) = version else {
             let texts = [&closed, &newest, &trimmed];
             if texts.iter().any(|text| text.is_some()) || expires.is_some() {

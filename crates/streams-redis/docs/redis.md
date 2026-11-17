@@ -90,10 +90,10 @@ closed Stream (`stream_closed`). Then:
 
 ## TTLs
 
-- Each write sets `exp` to now plus the last-write TTL for an open Stream, and to now plus the
+- Each write sets `exp` to now plus the Producer idle TTL for an open Stream, and to now plus the
   Retention for a closed one. So the Retention counts from the close.
-- With no `last_write_ttl` in the config, a write to an open Stream removes `exp` and the expiry of
-  the meta and the log, so the open Stream stays until its close.
+- With no `producer_idle_ttl` in the config, a write to an open Stream removes `exp` and the
+  expiry of the meta and the log, so the open Stream stays until its close.
 - The log expires at `exp`. The meta key expires 30 days after `exp`, as the Tombstone.
 - An open Stream keeps all its Records. No append drops a Record by its age, and no read hides one.
 - A write that finds the log gone, as after an eviction, sets `trimmed` to `newest`. Before that
@@ -147,8 +147,9 @@ these lists on a standalone server and on a cluster.
 
 ## Known limits
 
-- An open Stream keeps all its Records until its close, or until its last-write TTL passes after
-  its last write when the config sets one. A closed Stream expires one Retention after the close.
+- An open Stream keeps all its Records until its close, or until its Producer idle TTL passes after
+  the last write of any Producer when the config sets one. A closed Stream expires one Retention
+  after the close.
 - The meta hash keeps one 88-byte `p|` field for each Producer that wrote to the Stream, so a
   Stream with many Producers has a large meta hash.
 - Any Producer closes a Stream, since the Store doesn't track an owner.

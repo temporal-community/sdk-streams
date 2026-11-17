@@ -115,8 +115,10 @@ impl TestStore for RedisTestStore {
             retention: Some(seconds(
                 runtime.retention.unwrap_or(Duration::from_secs(300)),
             )),
-            last_write_ttl: Some(seconds(
-                runtime.last_write_ttl.unwrap_or(Duration::from_secs(300)),
+            producer_idle_ttl: Some(seconds(
+                runtime
+                    .producer_idle_ttl
+                    .unwrap_or(Duration::from_secs(300)),
             )),
             ..Default::default()
         };

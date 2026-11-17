@@ -34,6 +34,6 @@ end
 
 redis.call('HSET', meta, 'closed', '1')
 redis.call('XADD', closed_key, '*', 'closed', '1')
--- No last-write TTL, since a closed Stream keeps its Retention.
+-- No Producer idle TTL, since a closed Stream keeps its Retention.
 refresh(meta, log, closed_key, now, nil, tombstone)
 return {'closed'}

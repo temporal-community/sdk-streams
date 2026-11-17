@@ -73,9 +73,9 @@ pub struct RedisStoreOptions {
     pub key_prefix: KeyPrefix,
     /// The Retention of a Stream whose create sets none.
     pub retention: Duration,
-    /// How long an open Stream stays after its last write. `None` keeps an open Stream until its
-    /// close.
-    pub last_write_ttl: Option<Duration>,
+    /// How long an open Stream stays after the last write of any Producer. `None` keeps an open
+    /// Stream until its close.
+    pub producer_idle_ttl: Option<Duration>,
     /// How many blocking reads may wait on one node at once. Each has a connection of its own.
     pub blocking_reads_per_node: NonZeroUsize,
     /// How long a short call waits for its answer.
@@ -110,7 +110,7 @@ impl From<Topology<Url>> for RedisStoreOptions {
             topology,
             key_prefix: KeyPrefix::default(),
             retention: DEFAULT_RETENTION,
-            last_write_ttl: None,
+            producer_idle_ttl: None,
             blocking_reads_per_node: DEFAULT_BLOCKING_READS_PER_NODE,
             response_timeout: Duration::from_secs(5),
             wait: None,

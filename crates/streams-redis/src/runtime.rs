@@ -61,7 +61,7 @@ impl TryFrom<RedisStreamConfig> for RuntimeOptions {
         let store = RedisStoreOptions {
             key_prefix,
             retention: duration("retention", config.retention)?.unwrap_or(defaults.retention),
-            last_write_ttl: duration("last_write_ttl", config.last_write_ttl)?,
+            producer_idle_ttl: duration("producer_idle_ttl", config.producer_idle_ttl)?,
             blocking_reads_per_node: count(
                 "blocking_reads_per_node",
                 config.blocking_reads_per_node,
