@@ -15,7 +15,7 @@ use redis::{
     ServerErrorKind, Value,
 };
 use replies::{AppendReply, CloseReply, CreateReply, ReadReply};
-use std::{collections::HashMap, num::NonZeroUsize, sync::Arc, time::Duration};
+use std::{num::NonZeroUsize, sync::Arc, time::Duration};
 use temporalio_streams::{
     StreamResult,
     epoch::{ProducerKind, epoch_key},
@@ -404,7 +404,7 @@ async fn check_wait(shared: &SharedConnection) -> RedisStoreResult<()> {
     }
 }
 
-/// Refuses a server older than Redis 7.0, and warns about one that may evict Stream keys.
+/// Refuses a server older than Redis 7.0.
 async fn check_server(shared: &SharedConnection) -> RedisStoreResult<()> {
     let mut info = redis::cmd("INFO");
     info.arg("server");
@@ -423,36 +423,6 @@ async fn check_server(shared: &SharedConnection) -> RedisStoreResult<()> {
     }
     if let SharedConnection::Single(_) = shared {
         check_not_cluster(shared).await?;
-    }
-    let mut policy = redis::cmd("CONFIG");
-    policy.arg("GET").arg("maxmemory-policy");
-    let policies = shared
-        .on_each_primary::<HashMap<String, String>>(policy)
-        .await;
-    let could_not_read = |why: &dyn std::fmt::Display| {
-        tracing::warn!(
-            "Could not read maxmemory-policy: {why}. The Streams need noeviction, since eviction \
-             loses Records and their fence."
-        )
-    };
-    match policies {
-        Ok(policies) => {
-            for (origin, mut config) in policies {
-                match config.remove("maxmemory-policy").as_deref() {
-                    Some("noeviction") => {}
-                    Some(policy) => tracing::warn!(
-                        node = %origin,
-                        policy,
-                        "Redis may evict Stream keys under memory pressure, which loses Records \
-                         and their fence. Use maxmemory-policy noeviction for Streams."
-                    ),
-                    None => could_not_read(&format!("{origin} gave no value")),
-                }
-            }
-        }
-        // Managed services often refuse CONFIG, and some default to a `volatile-*` policy.
-        Err(error) if error.code().is_some() => could_not_read(&error),
-        Err(error) => return Err(error.into()),
     }
     Ok(())
 }

@@ -114,8 +114,7 @@ these lists on a standalone server and on a cluster.
   write happened.
 - On a cluster, each role also needs `+cluster|slots +asking +ping`, on each node.
 - A process with both roles needs both sets.
-- `+info` and `+config|get` are optional. Without `+info`, the Store skips the version check.
-  Without `+config|get`, it warns that it can't read the eviction policy.
+- `+info` is optional. Without it, the Store skips the version check.
 - A user with write access can write as any Producer.
 - A key pattern gives a user every Stream of a prefix, since a key has no namespace. Users that
   must not share Streams need prefixes of their own.
@@ -133,7 +132,7 @@ these lists on a standalone server and on a cluster.
 ## Eviction and replication
 
 - Use `maxmemory-policy noeviction`. Another policy can evict the meta and keep the log, which loses
-  the fence, the dedupe and the close. The Store warns about it on connect.
+  the fence, the dedupe and the close. The Store doesn't read the policy, so set it on the server.
 - A failover can lose a write that Redis acknowledged. With `wait_replicas`, each write waits for
   that many replicas with `WAIT`. A write that they don't have after `wait_timeout` fails with
   `stream_storage_unavailable`, and its retry with the same sequence writes it once.
