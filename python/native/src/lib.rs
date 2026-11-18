@@ -166,7 +166,8 @@ impl StreamBridge {
         let request = request.to_vec();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let streams = inner.streams.get_or_init(|| (inner.build)()).clone();
-            let result = streams.call(&operation, &request).await;
+            let result =
+                temporalio_streams_log::dispatch::call(&streams, &operation, &request).await;
             Python::attach(|py| match result {
                 Ok(response) => response_type
                     .bind(py)
