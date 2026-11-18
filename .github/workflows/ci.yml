@@ -196,7 +196,10 @@ jobs:
           key: temporalio-wheel-${{ runner.os }}-${{ env.SDK_PYTHON_REV }}
       - name: Build the temporalio wheel
         if: steps.sdk-wheel.outputs.cache-hit != 'true'
-        run: python -m pip wheel --no-deps --wheel-dir sdk-wheel ./sdk-python
+        # Inside this checkout, cargo takes the SDK's bridge for a member of this repo's workspace.
+        run: |
+          mv sdk-python "$RUNNER_TEMP/sdk-python"
+          python -m pip wheel --no-deps --wheel-dir sdk-wheel "$RUNNER_TEMP/sdk-python"
       - name: Install Redis from the Redis apt repo
         run: |
           curl -fsSL https://packages.redis.io/gpg \
@@ -229,6 +232,8 @@ jobs:
           - name: linux-aarch64
             runner: ubuntu-latest
             target: aarch64
+            # The compiler of the cross image doesn't define it, and `ring` needs it.
+            docker-options: -e CFLAGS_aarch64_unknown_linux_gnu=-D__ARM_ARCH=8
           - name: macos-arm64
             runner: macos-latest
             target: aarch64
@@ -252,6 +257,7 @@ jobs:
           target: ${{ matrix.platform.target }}
           args: --release --out dist --manifest-path python/${{ matrix.package }}/Cargo.toml
           manylinux: auto
+          docker-options: ${{ matrix.platform.docker-options }}
           # The Linux build runs in a container, which has no protoc.
           before-script-linux: |
             release=https://github.com/protocolbuffers/protobuf/releases/download/v29.3
