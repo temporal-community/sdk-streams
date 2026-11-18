@@ -14,7 +14,7 @@ use temporalio_streams::{
         CreateStreamRequest, CreateStreamResponse, DescribeStreamRequest, DescribeStreamResponse,
         ReadRecordsRequest, ReadRecordsResponse, StreamIdConflictPolicy, StreamRef, StreamStatus,
     },
-    record::data_records,
+    record::data_record,
 };
 
 /// The Stream service on a [LogStore] of log calls. The runtime of `temporalio-streams` checks each
@@ -25,27 +25,20 @@ pub(crate) struct LogStreamStore {
     pub(crate) store: Arc<dyn LogStore>,
 }
 
-/// Gives the [StreamStore] of a Store of log calls. `store_name` is the name that lang registered
-/// the Store under, which the refs that the Store builds carry. A Store that connects later, such
-/// as a [crate::store::LazyStore], lets a bridge build the runtime with no async runtime.
-pub fn stream_store(
-    store_name: impl Into<String>,
-    store: Arc<dyn LogStore>,
-) -> Arc<dyn StreamStore> {
-    Arc::new(LogStreamStore {
-        store_name: store_name.into(),
-        store,
-    })
-}
-
-/// Builds the Stream runtime on a Store of log calls, with [stream_store]. The runtime records
-/// metrics on `meter`, lang's runtime meter, if set.
+/// Builds the Stream runtime on a Store of log calls. `store_name` is the name that lang
+/// registered the Store under, which the refs that the Store builds carry. A Store that connects
+/// later, such as a [crate::store::LazyStore], lets a bridge build the runtime with no async
+/// runtime. The runtime records metrics on `meter`, lang's runtime meter, if set.
 pub fn stream_runtime(
     store_name: impl Into<String>,
     store: Arc<dyn LogStore>,
     meter: Option<TemporalMeter>,
 ) -> Arc<StreamRuntime> {
-    StreamRuntime::new(stream_store(store_name, store), meter)
+    let store = Arc::new(LogStreamStore {
+        store_name: store_name.into(),
+        store,
+    });
+    StreamRuntime::new(store, meter)
 }
 
 /// The conflict policy of a create. Unspecified is FAIL, as for a Workflow start.
@@ -83,7 +76,10 @@ async fn append_to_log(
         capabilities.require(Capabilities::NEXT_SEQUENCE)?;
     }
     let digest = batch_digest(&records);
-    let records = data_records(&producer, records)?;
+    let records: Vec<_> = records
+        .into_iter()
+        .map(|record| data_record(&producer, record))
+        .collect();
     let batch = Batch {
         producer: &producer,
         sequence,
