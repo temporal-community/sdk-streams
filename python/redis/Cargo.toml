@@ -1,0 +1,33 @@
+[package]
+name = "temporalio-streams-redis-python"
+description = "The native module of the Python package of the Redis Store of the Stream runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license-file.workspace = true
+homepage.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+name = "temporalio_streams_redis_native"
+crate-type = ["cdylib"]
+
+[features]
+default = ["tls-ring"]
+# The same TLS features as the Redis crate. A build takes one of them.
+tls-ring = ["temporalio-streams-redis/tls-ring"]
+tls-aws-lc = ["temporalio-streams-redis/tls-aws-lc", "dep:rustls"]
+fips = ["tls-aws-lc", "temporalio-streams-redis/fips"]
+
+[dependencies]
+pyo3 = { workspace = true, features = ["extension-module"] }
+# Only with `tls-aws-lc`, to install the provider that the Redis crate's TLS reads.
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"], optional = true }
+temporalio-common = { workspace = true }
+temporalio-streams-python-native = { workspace = true }
+temporalio-streams-redis = { path = "../../crates/streams-redis", default-features = false }
+
+[lints]
+workspace = true

@@ -1,8 +1,10 @@
 from collections.abc import Awaitable
 from datetime import timedelta
+from typing import TypeVar
 
-class StreamCallError(Exception):
-    """A failed call. The args are the reason (an int) and the message."""
+from google.protobuf.message import Message
+
+_Response = TypeVar("_Response", bound=Message)
 
 class RedisRuntime:
     def __init__(
@@ -18,4 +20,6 @@ class RedisRuntime:
         wait_replicas: int,
         wait_timeout: timedelta | None,
     ) -> None: ...
-    def call(self, operation: str, request: bytes) -> Awaitable[bytes]: ...
+    def call(
+        self, operation: str, request: bytes, response_type: type[_Response]
+    ) -> Awaitable[_Response]: ...

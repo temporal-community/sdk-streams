@@ -15,7 +15,10 @@ from helpers import (
     with_store,
 )
 from temporalio.api.enums.v1 import StreamErrorReason
-from temporalio.api.streamservice.v1 import DescribeStreamRequest
+from temporalio.api.streamservice.v1 import (
+    DescribeStreamRequest,
+    DescribeStreamResponse,
+)
 from temporalio.client import Client, StreamStore
 from temporalio.nexus.system.stream_service import (
     ClientProducer,
@@ -188,7 +191,7 @@ async def test_store_in_a_forked_child_raises_runtime_error():
     if pid == 0:
         status = 1
         try:
-            store._runtime.call("DescribeStream", b"")  # type: ignore[reportPrivateUsage]
+            store._runtime.call("DescribeStream", b"", DescribeStreamResponse)  # type: ignore[reportPrivateUsage]
         except RuntimeError as err:
             status = 0 if "child of a fork" in str(err) else 2
         finally:
