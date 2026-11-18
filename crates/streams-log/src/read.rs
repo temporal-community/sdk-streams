@@ -31,9 +31,6 @@ impl LogStreamStore {
         // The wire from_offset is exclusive, so a read starts after it. The empty value is a read
         // from the start.
         let from_offset = offset_from_wire(&request.from_offset)?;
-        if from_offset < 0 {
-            return Err(StreamError::invalid("The offset is below zero"));
-        }
         let max_bytes = max_bytes(request.max_bytes)?;
         let max = match request.max_records {
             n if n <= 0 => MAX_RECORDS,

@@ -21,22 +21,18 @@ pub fn offset_to_wire(offset: i64) -> Vec<u8> {
     (offset as u64).to_be_bytes().to_vec()
 }
 
-/// The offset of a wire value that [offset_to_wire] wrote. The empty string is "no offset", zero.
-///
-/// A value longer than 8 bytes is a bad request, since no offset has more.
+/// The offset of a wire value that [offset_to_wire] wrote. The empty value is "no offset", zero.
+/// Any other value that [offset_to_wire] can't write is a bad request.
 pub fn offset_from_wire(bytes: &[u8]) -> StreamResult<i64> {
     if bytes.is_empty() {
         return Ok(0);
     }
-    if bytes.len() > 8 {
-        return Err(StreamError::invalid(format!(
-            "A Stream offset has {} bytes, more than 8",
-            bytes.len()
-        )));
+    let bad = || StreamError::invalid("The offset is not one that the Store gave");
+    let bytes: [u8; 8] = bytes.try_into().map_err(|_| bad())?;
+    match i64::try_from(u64::from_be_bytes(bytes)) {
+        Ok(offset) if offset > 0 => Ok(offset),
+        _ => Err(bad()),
     }
-    let mut buf = [0u8; 8];
-    buf[8 - bytes.len()..].copy_from_slice(bytes);
-    Ok(u64::from_be_bytes(buf) as i64)
 }
 
 const SEQ_MASK: i64 = (1 << SEQ_BITS) - 1;
@@ -78,14 +74,12 @@ mod tests {
         // The byte order matches the i64 order, so lang compares two offsets as bytes.
         assert!(offset_to_wire(1) > offset_to_wire(0));
         assert!(offset_to_wire(256) > offset_to_wire(255));
-        // A right-aligned short value reads as the same number a full one would.
-        assert_eq!(offset_from_wire(&[1]).unwrap(), 1);
-        assert_eq!(
-            offset_from_wire(&[0, 0, 0, 0, 0, 0, 0, 0, 0])
-                .unwrap_err()
-                .reason,
-            Reason::Invalid
-        );
+        // Offsets compare as bytes, so a value that `offset_to_wire` can't write is no offset.
+        let bad: [&[u8]; 4] = [&[1], &[0; 8], &[0; 9], &[0xff; 8]];
+        for value in bad {
+            let error = offset_from_wire(value).unwrap_err();
+            assert_eq!(error.reason, Reason::Invalid, "{value:?}");
+        }
     }
 
     #[test]
