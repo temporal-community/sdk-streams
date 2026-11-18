@@ -2233,7 +2233,6 @@ dependencies = [
 [[package]]
 name = "temporalio-common"
 version = "1.2.0"
-source = "git+https://github.com/moetemp/sdk-rust?rev=9b121cf32dcd7920a067a04fb61bbb000178290b#9b121cf32dcd7920a067a04fb61bbb000178290b"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2264,7 +2263,6 @@ dependencies = [
 [[package]]
 name = "temporalio-common-wasm"
 version = "1.2.0"
-source = "git+https://github.com/moetemp/sdk-rust?rev=9b121cf32dcd7920a067a04fb61bbb000178290b#9b121cf32dcd7920a067a04fb61bbb000178290b"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2290,7 +2288,6 @@ dependencies = [
 [[package]]
 name = "temporalio-protos"
 version = "0.11.0"
-source = "git+https://github.com/moetemp/sdk-rust?rev=9b121cf32dcd7920a067a04fb61bbb000178290b#9b121cf32dcd7920a067a04fb61bbb000178290b"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -2311,17 +2308,36 @@ dependencies = [
 [[package]]
 name = "temporalio-streams"
 version = "0.1.0"
-source = "git+https://github.com/moetemp/sdk-rust?rev=9b121cf32dcd7920a067a04fb61bbb000178290b#9b121cf32dcd7920a067a04fb61bbb000178290b"
 dependencies = [
  "async-trait",
- "parking_lot",
+ "prost",
+ "prost-wkt-types",
+ "temporalio-common",
+ "thiserror",
+ "tonic",
+]
+
+[[package]]
+name = "temporalio-streams-log"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
  "prost",
  "prost-wkt-types",
  "sha2",
  "temporalio-common",
- "thiserror",
+ "temporalio-streams",
  "tokio",
- "tonic",
+]
+
+[[package]]
+name = "temporalio-streams-python-native"
+version = "0.1.0"
+dependencies = [
+ "pyo3",
+ "pyo3-async-runtimes",
+ "temporalio-streams",
+ "tokio",
 ]
 
 [[package]]
@@ -2337,6 +2353,7 @@ dependencies = [
  "redis",
  "temporalio-common",
  "temporalio-streams",
+ "temporalio-streams-log",
  "thiserror",
  "tokio",
  "tonic-prost-build",
@@ -2349,12 +2366,10 @@ name = "temporalio-streams-redis-python"
 version = "0.1.0"
 dependencies = [
  "pyo3",
- "pyo3-async-runtimes",
  "rustls",
  "temporalio-common",
- "temporalio-streams",
+ "temporalio-streams-python-native",
  "temporalio-streams-redis",
- "tokio",
 ]
 
 [[package]]
