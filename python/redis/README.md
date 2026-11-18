@@ -14,7 +14,7 @@ package needs a `temporalio` that has Streams.
 No release is on PyPI. Build it from a checkout of this repo, with Rust and `maturin` installed:
 
 ```sh
-pip install ./python
+pip install ./python/redis
 ```
 
 ## Use
@@ -59,9 +59,13 @@ For Workflow code, Core calls the Store as it calls any Store that is written in
 each call as a task on the Worker's event loop. A create or a describe of a Stream in Workflow code
 runs in a Local Activity. The package needs no code for this.
 
-Please note that the Workflow sandbox imports a module again when it is not passed through. Keep
-the Store in a module that no Workflow module imports, or pass `temporalio_streams_redis` through,
-with `SandboxRestrictions.default.with_passthrough_modules("temporalio_streams_redis")`.
+## The Workflow sandbox
+
+Build the Store where you build the client. A module that defines Workflows has no need to
+import this package. If such a module does import it, pass the import through the sandbox:
+
+    with workflow.unsafe.imports_passed_through():
+        from temporalio_streams_redis import RedisStreamStore
 
 ## Limits
 
@@ -71,6 +75,12 @@ with `SandboxRestrictions.default.with_passthrough_modules("temporalio_streams_r
 
 ## Development
 
-Run `maturin develop` in `python/`, then `STREAMS_REDIS_URL=redis://localhost:6379 pytest tests`.
-The tests need a `temporalio` with a bridge that has the Stream runtime. Without the URL, the
-tests that need Redis are skipped.
+Run `maturin develop` in `python/redis/`. Then run the tests in the same directory:
+
+```sh
+STREAMS_REDIS_URL=redis://localhost:6379 pytest tests
+```
+
+The tests need a `temporalio` with a bridge that has the Stream runtime. Without the URL, the tests
+that need Redis are skipped. The tests that are not about Redis are in `python/suite`, and
+`tests/test_suite_on_redis.py` runs them on this Store.

@@ -108,7 +108,7 @@ jobs:
       - run: cargo test -p temporalio-streams-redis -- --include-ignored --test-threads=8
 
   python-lint:
-    name: Python package lint
+    name: Python packages lint
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -139,7 +139,10 @@ jobs:
             echo "scripts/patch-sdk-rust.sh has '$script_rev', python/Cargo.toml has '$toml_revs'"
             exit 1
           fi
-      - run: cargo fmt --manifest-path python/Cargo.toml -- --check
+      # `python/LICENSE.txt` is a copy, since `maturin` takes no license file from outside the
+      # Cargo workspace of `python`.
+      - run: cmp LICENSE.txt python/LICENSE.txt
+      - run: cargo fmt --manifest-path python/Cargo.toml --all -- --check
       - run: cargo clippy --manifest-path python/Cargo.toml -- -D warnings
       # `pip install --group` needs pip 25.1 or later. The SDK's own dependencies give pyright the
       # types that `temporalio` uses.
@@ -163,7 +166,7 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}/sdk-python
 
   python-test:
-    name: Python package tests
+    name: Python packages tests
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
@@ -205,22 +208,23 @@ jobs:
             | sudo tee /etc/apt/sources.list.d/redis.list
           sudo apt-get update && sudo apt-get install -y redis
       - run: crates/streams-redis/scripts/redis-test-servers.sh >> "$GITHUB_ENV"
-      - name: Install the wheel, the package and the test tools
+      - name: Install the wheel, the two packages and the test tools
         run: |
           python -m pip install -U pip
           python -m pip install --group python/pyproject.toml:dev
-          python -m pip install sdk-wheel/temporalio-*.whl ./python
-      - run: python -m pytest python/tests
+          python -m pip install sdk-wheel/temporalio-*.whl ./python/redis ./python/memory
+      - run: python -m pytest python/redis/tests python/memory/tests
         timeout-minutes: 30
 
   python-wheels:
-    name: Python package wheel (${{ matrix.name }})
-    runs-on: ${{ matrix.runner }}
+    name: Python package wheel (${{ matrix.package }}, ${{ matrix.platform.name }})
+    runs-on: ${{ matrix.platform.runner }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        include:
+        package: [redis, memory]
+        platform:
           - name: linux-x86_64
             runner: ubuntu-latest
             target: x86_64
@@ -247,8 +251,8 @@ jobs:
       - name: Build the wheel
         uses: PyO3/maturin-action@v1
         with:
-          target: ${{ matrix.target }}
-          args: --release --out dist --manifest-path python/Cargo.toml
+          target: ${{ matrix.platform.target }}
+          args: --release --out dist --manifest-path python/${{ matrix.package }}/Cargo.toml
           manylinux: auto
           # The Linux build runs in a container, which has no protoc.
           before-script-linux: |
@@ -258,5 +262,5 @@ jobs:
             chmod +x /usr/local/bin/protoc
       - uses: actions/upload-artifact@v4
         with:
-          name: wheel-${{ matrix.name }}
+          name: wheel-${{ matrix.package }}-${{ matrix.platform.name }}
           path: dist
