@@ -1,4 +1,10 @@
 #![warn(missing_docs)]
+// A panic in a lang bridge's worker ends the process, so the library returns errors instead.
+#![warn(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::cast_possible_truncation
+)]
 
 //! Experimental. The shared part of the Stores that keep each Stream as a log.
 //!
@@ -20,7 +26,9 @@ pub mod producer_field;
 mod read;
 mod runtime;
 pub mod store;
+// The suites are test code, and a failed unwrap there is a failed case.
 #[cfg(feature = "test-support")]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 pub mod testing;
 
 pub use runtime::stream_runtime;

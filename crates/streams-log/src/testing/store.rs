@@ -72,6 +72,11 @@ async fn append(
         .await
 }
 
+/// A duration in ms, as `PTTL` gives it.
+fn millis(duration: Duration) -> i64 {
+    i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+}
+
 /// The create of a Stream that uses an existing one.
 fn use_existing() -> Create<'static> {
     Create {
@@ -330,16 +335,13 @@ async fn an_open_stream_with_no_producer_idle_ttl_never_expires_until_the_close(
     for target in stores_for(Needs::RAW_KEYS).await {
         target.create().await;
         append(&target, &client(), 1, &["a"]).await.unwrap();
-        let week = Duration::from_secs(7 * 86_400).as_millis() as i64;
+        let week = millis(Duration::from_secs(7 * 86_400));
         assert_eq!(target.ttls().await, (-1, -1));
         assert_eq!(target.meta("exp").await, None);
         target.close(&client()).await.unwrap();
         let (ttl, meta) = target.ttls().await;
         assert!(0 < ttl && ttl <= week, "{ttl}");
-        assert!(
-            meta > Duration::from_secs(36 * 86_400).as_millis() as i64,
-            "{meta}"
-        );
+        assert!(meta > millis(Duration::from_secs(36 * 86_400)), "{meta}");
     }
 }
 

@@ -65,7 +65,7 @@ impl std::fmt::Debug for MemoryStore {
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |since| since.as_millis() as i64)
+        .map_or(0, millis)
 }
 
 fn millis(duration: Duration) -> i64 {
@@ -292,14 +292,16 @@ impl MemoryStore {
 
     /// Adds an entry with an explicit id, as `XADD <id>`, for tests.
     #[doc(hidden)]
-    pub fn test_add_entry(&self, stream_id: &str, id: &str) {
+    pub fn test_add_entry(&self, stream_id: &str, id: &str) -> StreamResult<()> {
         self.with(stream_id, |keys, _| {
-            let id = parse_id(id).expect("an entry id");
+            let id =
+                parse_id(id).ok_or_else(|| refuse(Reason::Invalid, "the id isn't <ms>-<seq>"))?;
             keys.last_id = keys.last_id.max(id);
             keys.log
                 .get_or_insert_with(BTreeMap::new)
                 .insert(id, Fields::default());
-        });
+            Ok(())
+        })
     }
 
     /// The number of log entries, as `XLEN`, for tests.
@@ -530,7 +532,7 @@ impl LogStore for MemoryStore {
             let number = |field: &str| keys.number(field);
             let state = StreamState {
                 exists: keys.get("v").is_some(),
-                version: number("v") as u32,
+                version: u32::try_from(number("v")).unwrap_or(u32::MAX),
                 closed: keys.get("closed").is_some(),
                 newest: offset("newest")?,
                 trimmed: offset("trimmed")?,

@@ -28,7 +28,7 @@ impl TestStore for MemoryTestStore {
             retention: config.retention,
             producer_idle_ttl: config.producer_idle_ttl,
         };
-        MemoryStreamRuntime::new(config.store_name.clone(), options, None)
+        MemoryStreamRuntime::create(config.store_name.clone(), options, None)
     }
 }
 
@@ -47,7 +47,9 @@ impl RawKeys for MemoryStore {
     }
 
     async fn add_raw_entry(&self, stream: &str, id: &str) {
+        // A bad id is a bug in the case, which fails it.
         self.test_add_entry(stream, id)
+            .unwrap_or_else(|error| panic!("{error:?}"))
     }
 
     async fn log_len(&self, stream: &str) -> usize {

@@ -23,9 +23,7 @@ pub struct MemoryStreamRuntime;
 
 impl MemoryStreamRuntime {
     /// Builds a runtime on a new memory Store. A zero duration in `options` is the same as `None`.
-    /// The type only holds this constructor, so it returns the runtime and not `Self`.
-    #[allow(clippy::new_ret_no_self)]
-    pub fn new(
+    pub fn create(
         store_name: impl Into<String>,
         options: MemoryStreamOptions,
         meter: Option<TemporalMeter>,
