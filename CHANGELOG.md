@@ -10,10 +10,12 @@
   the five Stream operations, which was `StreamRuntime::call` in `temporalio-streams`. The second
   is a Store that keeps its Streams in memory, for tests. A read from the start of a closed Stream
   that lost its log fails with `stream_expired`, and an offset that no Store gave is refused.
-- The `temporalio-streams-redis` Python package, in `python/`. It has its own native module, and
-  `RedisStreamStore` is a plain `temporalio.client.StreamStore`, so the Python SDK needs no Redis
-  code. Client and Activity code call the Store directly. For Workflow code, Core calls it as a
-  task on the Worker's event loop. The package has no release on PyPI yet.
+- Two Python packages, in `python/`. `temporalio-streams-redis` has `RedisStreamStore`, and
+  `temporalio-streams-memory` has `MemoryStreamStore`, for tests. Each has its own native module,
+  and its Store is a plain `temporalio.client.StreamStore`, so the Python SDK needs no Store code.
+  Client and Activity code call the Store directly. For Workflow code, Core calls it as a task on
+  the Worker's event loop. The tests that every Store must pass are in `python/suite`. Neither
+  package has a release on PyPI yet.
 - The `temporalio-streams-redis` crate, the Redis Store of the Temporal Stream runtime. It answers
   the five operations of the Stream service of `temporalio-streams` on Redis, standalone or a
   cluster. A lang bridge builds `RedisStreamRuntime` from an encoded `RedisStreamConfig` and calls

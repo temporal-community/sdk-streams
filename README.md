@@ -58,8 +58,15 @@ that it prints, and run `cargo test -- --include-ignored`.
 
 ## Python
 
-`python/` has `temporalio-streams-redis`, a Python package that runs this Redis Store in its own
-native module. The Python SDK needs no Redis code to use it. See `python/README.md`.
+`python/` has two Python packages. Each runs a Store of this repo in its own native module, so the
+Python SDK needs no Store code.
+
+- `python/redis` is `temporalio-streams-redis`, the Redis Store. See `python/redis/README.md`.
+- `python/memory` is `temporalio-streams-memory`, the memory Store, for tests. See
+  `python/memory/README.md`.
+
+`python/native` is the Rust that both native modules share. `python/suite` has the tests that every
+Store must pass.
 
 ## License
 
