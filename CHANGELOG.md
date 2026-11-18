@@ -23,3 +23,7 @@
   dedupe and fence state of each Producer for as long as its Stream exists.
 - A read gives only Records, and a close shows as `done`. A read of a Stream that nobody created
   fails at once with `stream_not_found`.
+- The batch limits of a Store as options. `RedisStreamConfig` has `max_record_bytes`,
+  `max_batch_bytes` and `max_batch_records`, and `MemoryStreamOptions` has `limits`. A Store can
+  allow less than the default, and never more. The runtime refuses a larger batch with
+  `stream_too_large`.

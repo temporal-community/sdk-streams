@@ -22,8 +22,8 @@ Lang sends the options as a `RedisStreamConfig`, from
 `crates/streams-redis/protos/temporal/sdk/streams/v1/redis.proto`. Rust code can call
 `RedisStore::connect` with `RedisStoreOptions`. The Store needs Redis 7.0 or later. The table
 lists the main config fields. `RedisStoreOptions` has the same ones, except that
-`servers: RedisServers` replaces `urls` and `cluster`, and `wait: Option<WaitOptions>` replaces
-the two `wait_` fields.
+`servers: RedisServers` replaces `urls` and `cluster`, `wait: Option<WaitOptions>` replaces the
+two `wait_` fields, and `limits: BatchLimits` replaces the three `max_` fields.
 
 | Option | Default | Use |
 |---|---|---|
@@ -35,6 +35,9 @@ the two `wait_` fields.
 | `producer_idle_ttl` | none | How long an open Stream stays after the last write of any Producer. None keeps it open |
 | `wait_replicas` | 0 | The replicas that must have each write, with `WAIT` |
 | `wait_timeout` | 1 s | How long a write waits for its replicas |
+| `max_record_bytes` | 1536 KiB | The most bytes of one stored Record. At most the default |
+| `max_batch_bytes` | 4 MiB | The most bytes of the stored Records of one batch. At most the default |
+| `max_batch_records` | 1000 | The most Records of one batch. At most the default |
 
 The URL sets the credentials and TLS. `crates/streams-redis/docs/redis.md` has the key layout, the
 TTLs, the ACLs and the known limits.
