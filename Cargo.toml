@@ -1,5 +1,7 @@
 [workspace]
 members = ["crates/streams-log", "crates/streams-memory", "crates/streams-redis"]
+# The Python packages are their own workspace, so the jobs of the Rust crates don't build them.
+exclude = ["python"]
 resolver = "3"
 
 [workspace.package]
