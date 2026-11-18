@@ -43,8 +43,8 @@ incremental = false
 # checks that they match.
 [patch.crates-io.temporalio-common]
 git = "https://github.com/moetemp/sdk-rust"
-rev = "f730d733f236e945eea939d33360c26efe276697"
+rev = "cc3f70365363d074ee453f993fa4a6b24b0eb927"
 
 [patch.crates-io.temporalio-streams]
 git = "https://github.com/moetemp/sdk-rust"
-rev = "f730d733f236e945eea939d33360c26efe276697"
+rev = "cc3f70365363d074ee453f993fa4a6b24b0eb927"

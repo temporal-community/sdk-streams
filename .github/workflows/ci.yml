@@ -13,7 +13,7 @@ env:
   CARGO_TERM_COLOR: always
   # The sdk-python commit that has the Streams API and lets Core call a Store that is written in
   # Python. It moves to a release of `temporalio` when one has Streams.
-  SDK_PYTHON_REV: 6b014ea7cf42098afe3430b95444ec5fe7e7ca6c
+  SDK_PYTHON_REV: 340a1a78632dda93e9585944612d6233920d10f1
 
 jobs:
   lint:
