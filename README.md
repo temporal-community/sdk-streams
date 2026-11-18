@@ -4,7 +4,9 @@ Experimental.
 
 `temporalio-streams-redis` is the Redis Store of the Temporal Stream runtime. The runtime itself,
 `temporalio-streams`, is in [sdk-rust](https://github.com/temporalio/sdk-rust). A lang bridge builds
-the runtime with `RedisStreamRuntime`, which connects on its first call that needs Redis.
+the runtime with `RedisStreamRuntime`, which connects on its first call that needs Redis. Then the
+bridge calls `StreamRuntime::call` with the name of one of the five Stream operations and the
+encoded request, and it gets the encoded response.
 
 ## Connecting
 
@@ -12,16 +14,17 @@ Lang sends the options as a `RedisStreamConfig`, from
 `crates/streams-redis/protos/temporal/sdk/streams/v1/redis.proto`. Rust code can call
 `RedisStore::connect` with `RedisStoreOptions`. The Store needs Redis 7.0 or later. The table
 lists the main config fields. `RedisStoreOptions` has the same ones, except that
-`topology: Topology` replaces `urls` and `cluster`, and `wait: Option<WaitOptions>` replaces the two
-`wait_` fields.
+`servers: RedisServers` replaces `urls` and `cluster`, and `wait: Option<WaitOptions>` replaces
+the two `wait_` fields.
 
 | Option | Default | Use |
 |---|---|---|
 | `urls` | | One `redis://` or `rediss://` URL, or the seeds of a cluster |
 | `cluster` | `false` | Set for a Redis Cluster |
 | `key_prefix` | `temporal-streams` | The prefix of every key |
-| `retention` | 7 days | The Retention of a Stream whose create sets none |
-| `safety_ttl` | 90 days | How long an open Workflow-owned Stream stays after its last write |
+| `store_name` | empty | The name that lang registered the Store under. It goes on each ref |
+| `retention` | 7 days | The Retention of each Stream. It counts from the close. |
+| `producer_idle_ttl` | none | How long an open Stream stays after the last write of any Producer. None keeps it open |
 | `wait_replicas` | 0 | The replicas that must have each write, with `WAIT` |
 | `wait_timeout` | 1 s | How long a write waits for its replicas |
 

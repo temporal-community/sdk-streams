@@ -1,5 +1,5 @@
 //! The errors of the Redis Store. Each one becomes a Stream error at the `Store` trait, with the
-//! reason that lang turns into an error class, so a caller gets the same classes on every backend.
+//! reason that lang turns into an error class, so a caller gets the same classes on every Store.
 
 use redis::{ErrorKind, RedisError, ServerErrorKind};
 use temporalio_streams::{Reason, StreamError};

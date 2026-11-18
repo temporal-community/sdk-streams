@@ -1,16 +1,16 @@
 //! The Stream runtime on Redis.
 
 use crate::{
-    KeyPrefix, RedisStore, RedisStoreError, RedisStoreOptions, RedisStoreResult, Topology,
+    KeyPrefix, RedisServers, RedisStore, RedisStoreError, RedisStoreOptions, RedisStoreResult,
     WaitOptions, proto::RedisStreamConfig,
 };
 use prost::Message;
 use std::{num::NonZeroUsize, sync::Arc, time::Duration};
 use temporalio_common::telemetry::metrics::TemporalMeter;
-use temporalio_streams::{StoreFactory, StreamResult, StreamRuntime, store::Store};
-
-/// The name that [StreamRuntime::name] gives for a Redis runtime.
-pub const REDIS_RUNTIME_NAME: &str = "temporalio-streams-redis";
+use temporalio_streams::{
+    StreamRuntime,
+    store::{Capabilities, LazyStore},
+};
 
 /// The options of a Stream runtime on Redis.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,11 +18,11 @@ pub const REDIS_RUNTIME_NAME: &str = "temporalio-streams-redis";
 pub struct RuntimeOptions {
     /// How to connect to Redis.
     pub store: RedisStoreOptions,
-    /// The backend name that lang registered the runtime under, for the handles it builds.
-    pub backend: String,
+    /// The Store name that lang registered the runtime under, for the refs it builds.
+    pub store_name: String,
 }
 
-/// The options from the backend's config message. An unset or zero field keeps its default.
+/// The options from the Store's config message. An unset or zero field keeps its default.
 impl TryFrom<RedisStreamConfig> for RuntimeOptions {
     type Error = RedisStoreError;
 
@@ -30,16 +30,16 @@ impl TryFrom<RedisStreamConfig> for RuntimeOptions {
         let mut urls = config.urls.into_iter();
         let first = urls
             .next()
-            .ok_or_else(|| RedisStoreError::invalid("The Redis Stream backend needs a URL"))?;
+            .ok_or_else(|| RedisStoreError::invalid("The Redis Stream Store needs a URL"))?;
         let first = crate::options::parse_url(&first)?;
-        let topology = match (config.cluster, urls.len()) {
-            (true, _) => Topology::Cluster {
+        let servers = match (config.cluster, urls.len()) {
+            (true, _) => RedisServers::Cluster {
                 first,
                 rest: urls
                     .map(|url| crate::options::parse_url(&url))
                     .collect::<RedisStoreResult<_>>()?,
             },
-            (false, 0) => Topology::Standalone(first),
+            (false, 0) => RedisServers::Standalone(first),
             // A standalone Store connects to one server, so the other URLs would have no effect.
             (false, _) => {
                 return Err(RedisStoreError::invalid(
@@ -47,7 +47,7 @@ impl TryFrom<RedisStreamConfig> for RuntimeOptions {
                 ));
             }
         };
-        let defaults = RedisStoreOptions::from(topology);
+        let defaults = RedisStoreOptions::from(servers);
         // A bad timeout is refused even with no replicas, since the config is wrong either way.
         let wait_timeout = duration("wait_timeout", config.wait_timeout)?;
         let wait = count("wait_replicas", config.wait_replicas)?.map(|replicas| WaitOptions {
@@ -61,7 +61,7 @@ impl TryFrom<RedisStreamConfig> for RuntimeOptions {
         let store = RedisStoreOptions {
             key_prefix,
             retention: duration("retention", config.retention)?.unwrap_or(defaults.retention),
-            safety_ttl: duration("safety_ttl", config.safety_ttl)?.unwrap_or(defaults.safety_ttl),
+            producer_idle_ttl: duration("producer_idle_ttl", config.producer_idle_ttl)?,
             blocking_reads_per_node: count(
                 "blocking_reads_per_node",
                 config.blocking_reads_per_node,
@@ -76,7 +76,7 @@ impl TryFrom<RedisStreamConfig> for RuntimeOptions {
         crate::store::check(&store)?;
         Ok(Self {
             store,
-            backend: config.backend,
+            store_name: config.store_name,
         })
     }
 }
@@ -101,30 +101,19 @@ fn count(field: &str, value: i32) -> RedisStoreResult<Option<NonZeroUsize>> {
     Ok(NonZeroUsize::new(count))
 }
 
-/// Connects to Redis on the runtime's first call that needs Redis.
-struct Connect(RedisStoreOptions);
-
-#[async_trait::async_trait]
-impl StoreFactory for Connect {
-    async fn connect(&self) -> StreamResult<Arc<dyn Store>> {
-        Ok(Arc::new(RedisStore::connect(self.0.clone()).await?))
-    }
-}
-
 /// Builds the Stream runtime on Redis. It connects on the first call that needs Redis, so a bridge
-/// can build it with no async runtime, and a Workflow that never publishes needs no Redis.
+/// can build it with no async runtime.
 #[derive(Debug)]
 pub struct RedisStreamRuntime;
 
 impl RedisStreamRuntime {
     /// Builds the runtime on Redis. It records metrics on `meter`, lang's runtime meter, if set.
     pub fn create(options: RuntimeOptions, meter: Option<TemporalMeter>) -> Arc<StreamRuntime> {
-        StreamRuntime::new(
-            REDIS_RUNTIME_NAME,
-            options.backend,
-            Arc::new(Connect(options.store)),
-            meter,
-        )
+        let store = options.store;
+        let lazy = LazyStore::new(Capabilities::ALL, move || {
+            RedisStore::connect(store.clone())
+        });
+        StreamRuntime::new(options.store_name, Arc::new(lazy), meter)
     }
 
     /// Builds the runtime from an encoded [RedisStreamConfig].
