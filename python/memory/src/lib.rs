@@ -33,7 +33,7 @@ impl MemoryRuntime {
         };
         // The runtime is built at the first call, inside the Tokio runtime, since it spawns tasks.
         let bridge = StreamBridge::new(IDENTITY, move || {
-            MemoryStreamRuntime::new(store_name.clone(), options.clone(), None)
+            MemoryStreamRuntime::create(store_name.clone(), options.clone(), None)
         });
         Ok(Self { bridge })
     }
