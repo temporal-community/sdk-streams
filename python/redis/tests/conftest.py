@@ -1,28 +1,25 @@
-import asyncio
-from collections.abc import AsyncGenerator, Iterator
+import uuid
+from typing import Any
 
 import pytest
-import pytest_asyncio
-from temporalio.client import Client
-from temporalio.testing import WorkflowEnvironment
+from helpers import REDIS_URL
+from temporalio.client import StreamStore
+
+from suite.helpers import NewStore
+from temporalio_streams_redis import RedisStreamStore
 
 
-# pytest-asyncio 0.21 runs each test on the loop of its fixtures. The session fixture of the
-# dev server needs one loop for the whole session.
-@pytest.fixture(scope="session")
-def event_loop() -> Iterator[asyncio.AbstractEventLoop]:
-    loop = asyncio.new_event_loop()
-    yield loop
-    loop.close()
+@pytest.fixture
+def new_store(request: pytest.FixtureRequest) -> NewStore:
+    url = REDIS_URL
+    if not url:
+        # A test with no `client` builds a Store and sends it no request that reaches Redis.
+        if "client" in request.fixturenames:
+            pytest.skip("STREAMS_REDIS_URL is not set to a Redis server")
+        url = "redis://127.0.0.1:6379"
 
+    def build(**options: Any) -> StreamStore:
+        # Each Store has its own key prefix, so that runs on one Redis don't share Streams.
+        return RedisStreamStore(url, key_prefix=f"test-{uuid.uuid4()}", **options)
 
-@pytest_asyncio.fixture(scope="session")  # type: ignore[reportUntypedFunctionDecorator]
-async def env() -> AsyncGenerator[WorkflowEnvironment, None]:
-    env = await WorkflowEnvironment.start_local()
-    yield env
-    await env.shutdown()
-
-
-@pytest_asyncio.fixture  # type: ignore[reportUntypedFunctionDecorator]
-async def client(env: WorkflowEnvironment) -> Client:
-    return env.client
+    return build

@@ -8,9 +8,9 @@ from pathlib import Path
 
 import pytest
 import pytest_asyncio
-from helpers import new_stream, with_store
 from temporalio.client import Client
 
+from suite.helpers import new_stream, with_store
 from temporalio_streams_redis import RedisStreamStore
 
 pytestmark = pytest.mark.skipif(
