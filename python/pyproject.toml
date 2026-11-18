@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "The Redis Store of Temporal Streams for the Python SDK"
 authors = [{ name = "Temporal Technologies Inc", email = "sdk@temporal.io" }]
 requires-python = ">=3.11"
+readme = "README.md"
 license = "MIT"
 keywords = ["temporal", "workflow", "streams", "redis"]
 dependencies = ["temporalio"]
