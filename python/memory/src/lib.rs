@@ -1,7 +1,7 @@
 //! The native module of the Python package of the memory Stream Store. Python calls the five Stream
 //! service operations by name, with the encoded request, and gets the encoded response.
 
-use pyo3::prelude::*;
+use pyo3::{exceptions::PyValueError, prelude::*};
 use temporalio_streams_memory::{MemoryStreamOptions, MemoryStreamRuntime};
 use temporalio_streams_python_native::{Identity, StreamBridge, duration_option};
 
@@ -19,17 +19,36 @@ struct MemoryRuntime {
 #[pymethods]
 impl MemoryRuntime {
     /// Builds nothing but the bridge. A `None` duration takes the default of the crate, and a
-    /// negative one raises `ValueError`.
+    /// negative one raises `ValueError`. So does a batch limit that the crate refuses.
     #[new]
-    #[pyo3(signature = (*, retention, producer_idle_ttl, store_name))]
+    #[pyo3(signature = (
+        *,
+        retention,
+        producer_idle_ttl,
+        store_name,
+        max_record_bytes,
+        max_batch_bytes,
+        max_batch_records,
+    ))]
     fn new(
         retention: Option<Bound<'_, PyAny>>,
         producer_idle_ttl: Option<Bound<'_, PyAny>>,
         store_name: String,
+        max_record_bytes: usize,
+        max_batch_bytes: usize,
+        max_batch_records: usize,
     ) -> PyResult<Self> {
+        // The crate re-exports no `BatchLimits`, so the default options give the value to set.
+        let limits = MemoryStreamOptions::default()
+            .limits
+            .with_max_record_bytes(max_record_bytes)
+            .and_then(|limits| limits.with_max_batch_bytes(max_batch_bytes))
+            .and_then(|limits| limits.with_max_batch_records(max_batch_records))
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
         let options = MemoryStreamOptions {
             retention: duration_option("retention", retention.as_ref())?,
             producer_idle_ttl: duration_option("producer_idle_ttl", producer_idle_ttl.as_ref())?,
+            limits,
         };
         // The runtime is built at the first call, inside the Tokio runtime, since it spawns tasks.
         let bridge = StreamBridge::new(IDENTITY, move || {

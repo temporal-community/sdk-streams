@@ -15,7 +15,8 @@
   and its Store is a plain `temporalio.client.StreamStore`, so the Python SDK needs no Store code.
   Client and Activity code call the Store directly. For Workflow code, Core calls it as a task on
   the Worker's event loop. The tests that every Store must pass are in `python/suite`. Neither
-  package has a release on PyPI yet.
+  package has a release on PyPI yet. Both Stores take `max_record_bytes`, `max_batch_bytes` and
+  `max_batch_records`, and give them as `StreamStore.limits`.
 - The `temporalio-streams-redis` crate, the Redis Store of the Temporal Stream runtime. It answers
   the five operations of the Stream service of `temporalio-streams` on Redis, standalone or a
   cluster. A lang bridge builds `RedisStreamRuntime` from an encoded `RedisStreamConfig` and calls

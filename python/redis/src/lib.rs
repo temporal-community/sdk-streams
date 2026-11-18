@@ -46,6 +46,9 @@ impl RedisRuntime {
         store_name,
         wait_replicas,
         wait_timeout,
+        max_record_bytes,
+        max_batch_bytes,
+        max_batch_records,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -58,6 +61,9 @@ impl RedisRuntime {
         store_name: String,
         wait_replicas: i32,
         wait_timeout: Option<Bound<'_, PyAny>>,
+        max_record_bytes: i64,
+        max_batch_bytes: i64,
+        max_batch_records: i32,
     ) -> PyResult<Self> {
         let retention = duration_option("retention", retention.as_ref())?;
         let producer_idle_ttl = duration_option("producer_idle_ttl", producer_idle_ttl.as_ref())?;
@@ -74,6 +80,9 @@ impl RedisRuntime {
             store_name,
             wait_replicas,
             wait_timeout: proto_duration("wait_timeout", wait_timeout)?,
+            max_record_bytes,
+            max_batch_bytes,
+            max_batch_records,
             ..Default::default()
         };
         let options = RuntimeOptions::try_from(config)

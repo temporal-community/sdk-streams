@@ -110,3 +110,15 @@ async def test_cancelled_read_ends_and_the_store_still_works(
     await stream.append("a")
     page = await stream.read_page()
     assert [record.body for record in page.records] == ["a"]
+
+
+async def test_client_batch_over_the_limits_of_its_store_is_too_large(
+    client: Client, new_store: NewStore
+):
+    stream = await new_stream(with_store(client, new_store(max_batch_records=2)))
+    err = await stream_error(stream.append("a", "b", "c"))
+    assert err.reason == StreamErrorReason.STREAM_ERROR_REASON_TOO_LARGE
+
+    await stream.append("a", "b")
+    # The refused batch wrote nothing.
+    assert [record.body async for record in stream.read()] == ["a", "b"]

@@ -45,6 +45,9 @@ A Worker that is built from this client uses the same Store for Activities and W
 | `response_timeout` | 5 s | The longest time of one Redis call |
 | `wait_replicas` | 0 | The replicas that must have each write, with `WAIT` |
 | `wait_timeout` | 1 s | How long a write waits for its replicas |
+| `max_record_bytes` | 1536 KiB | The most bytes of one stored Record. At most the default |
+| `max_batch_bytes` | 4 MiB | The most bytes of the stored Records of one batch. At most the default |
+| `max_batch_records` | 1000 | The most Records of one batch. At most the default |
 | `name` | `redis` | The Store name that the refs of its Streams carry |
 
 The URL sets the credentials and TLS. A key has no namespace, so give each Temporal namespace its

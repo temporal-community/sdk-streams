@@ -38,31 +38,60 @@ class MemoryStreamStore(temporalio.client.StreamStore):
     def __init__(
         self,
         *,
+        max_record_bytes: int | None = None,
+        max_batch_bytes: int | None = None,
+        max_batch_records: int | None = None,
         name: str = "memory",
         retention: timedelta | None = None,
         producer_idle_ttl: timedelta | None = None,
     ) -> None:
         """Create a memory Store. It builds its Stream runtime at its first call.
 
-        A negative duration raises ``ValueError``.
+        A negative duration raises ``ValueError``. A limit below 1 or above its largest value
+        raises ``ValueError``.
 
         Args:
+            max_record_bytes: The most bytes of one stored Record, at most 1,572,864. ``None``
+                takes that. The stored form of a Record has its Producer and its body.
+            max_batch_bytes: The most bytes of the stored Records of one batch, at most
+                4,194,304. ``None`` takes that.
+            max_batch_records: The most Records of one batch, at most 1,000. ``None`` takes
+                that.
             name: Name of the Store, which the refs of its Streams carry.
             retention: How long a closed Stream stays readable. ``None`` takes 7 days.
             producer_idle_ttl: How long an open Stream stays after the last write of any
                 Producer. ``None`` keeps an open Stream until its close.
         """
         self._name = name
+        # The dataclass checks each limit, so a bad one raises before the runtime exists.
+        set_limits = {
+            field: value
+            for field, value in (
+                ("max_record_bytes", max_record_bytes),
+                ("max_batch_bytes", max_batch_bytes),
+                ("max_batch_records", max_batch_records),
+            )
+            if value is not None
+        }
+        self._limits = temporalio.client.StreamBatchLimits(**set_limits)
         self._runtime = MemoryRuntime(
             retention=retention,
             producer_idle_ttl=producer_idle_ttl,
             store_name=name,
+            max_record_bytes=self._limits.max_record_bytes,
+            max_batch_bytes=self._limits.max_batch_bytes,
+            max_batch_records=self._limits.max_batch_records,
         )
 
     @property
     def name(self) -> str:
         """Name of the Store."""
         return self._name
+
+    @property
+    def limits(self) -> temporalio.client.StreamBatchLimits:
+        """The limits of one batch on this Store, from its options."""
+        return self._limits
 
     async def create_stream(self, request: CreateStreamRequest) -> CreateStreamResponse:
         """See base class."""
