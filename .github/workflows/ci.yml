@@ -11,6 +11,9 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # The sdk-python commit that has the Streams API and a bridge with the Stream runtime. It moves
+  # to a release of `temporalio` when one has Streams.
+  SDK_PYTHON_REV: 29aef5954b2503cc03c8638083993cc49c7b83f9
 
 jobs:
   lint:
@@ -103,3 +106,157 @@ jobs:
         env:
           STREAMS_REDIS_IMAGE: redis:7.0
       - run: cargo test -p temporalio-streams-redis -- --include-ignored --test-threads=8
+
+  python-lint:
+    name: Python package lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      # Only its source, for pyright. The package is not built here.
+      - uses: actions/checkout@v4
+        with:
+          repository: temporalio/sdk-python
+          ref: ${{ env.SDK_PYTHON_REV }}
+          path: sdk-python
+      - uses: dtolnay/rust-toolchain@1.94.0
+        with:
+          components: clippy, rustfmt
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: python
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: The sdk-rust commit of python/Cargo.toml is the one of the patch script
+        run: |
+          script_rev=$(sed -n 's/^rev=.*:-\([0-9a-f]*\)}$/\1/p' scripts/patch-sdk-rust.sh)
+          toml_revs=$(sed -n 's/^rev = "\([0-9a-f]*\)"$/\1/p' python/Cargo.toml | sort -u)
+          if [ -z "$script_rev" ] || [ "$script_rev" != "$toml_revs" ]; then
+            echo "scripts/patch-sdk-rust.sh has '$script_rev', python/Cargo.toml has '$toml_revs'"
+            exit 1
+          fi
+      - run: cargo fmt --manifest-path python/Cargo.toml -- --check
+      - run: cargo clippy --manifest-path python/Cargo.toml -- -D warnings
+      # `pip install --group` needs pip 25.1 or later. The SDK's own dependencies give pyright the
+      # types that `temporalio` uses.
+      - name: Install ruff, pyright and the dependencies of temporalio
+        run: |
+          python -m pip install -U pip
+          python -m pip install --group python/pyproject.toml:dev
+          python - <<'PY' > sdk-requirements.txt
+          import tomllib
+
+          with open("sdk-python/pyproject.toml", "rb") as file:
+              print(*tomllib.load(file)["project"]["dependencies"], sep="\n")
+          PY
+          python -m pip install -r sdk-requirements.txt
+      - run: ruff check python
+      - run: ruff format --check python
+      # No release of `temporalio` has Streams yet, so pyright reads the SDK source.
+      - run: pyright
+        working-directory: python
+        env:
+          PYTHONPATH: ${{ github.workspace }}/sdk-python
+
+  python-test:
+    name: Python package tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: temporalio/sdk-python
+          ref: ${{ env.SDK_PYTHON_REV }}
+          submodules: recursive
+          path: sdk-python
+      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: python
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      # The wheel is the slow part, so it is cached by the sdk-python commit.
+      - name: Restore the temporalio wheel
+        id: sdk-wheel
+        uses: actions/cache@v4
+        with:
+          path: sdk-wheel
+          key: temporalio-wheel-${{ runner.os }}-${{ env.SDK_PYTHON_REV }}
+      - name: Build the temporalio wheel
+        if: steps.sdk-wheel.outputs.cache-hit != 'true'
+        env:
+          MATURIN_PEP517_ARGS: --features streams
+        run: python -m pip wheel --no-deps --wheel-dir sdk-wheel sdk-python
+      - name: Install Redis from the Redis apt repo
+        run: |
+          curl -fsSL https://packages.redis.io/gpg \
+            | sudo gpg --dearmor -o /usr/share/keyrings/redis-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/redis-archive-keyring.gpg]" \
+            "https://packages.redis.io/deb $(lsb_release -cs) main" \
+            | sudo tee /etc/apt/sources.list.d/redis.list
+          sudo apt-get update && sudo apt-get install -y redis
+      - run: crates/streams-redis/scripts/redis-test-servers.sh >> "$GITHUB_ENV"
+      - name: Install the wheel, the package and the test tools
+        run: |
+          python -m pip install -U pip
+          python -m pip install --group python/pyproject.toml:dev
+          python -m pip install sdk-wheel/temporalio-*.whl ./python
+      - run: python -m pytest python/tests
+        timeout-minutes: 30
+
+  python-wheels:
+    name: Python package wheel (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            runner: ubuntu-latest
+            target: x86_64
+          - name: linux-aarch64
+            runner: ubuntu-latest
+            target: aarch64
+          - name: macos-arm64
+            runner: macos-latest
+            target: aarch64
+          - name: macos-x86_64
+            runner: macos-15-intel
+            target: x86_64
+          - name: windows-x86_64
+            runner: windows-latest
+            target: x64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build the wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist --manifest-path python/Cargo.toml
+          manylinux: auto
+          # The Linux build runs in a container, which has no protoc.
+          before-script-linux: |
+            release=https://github.com/protocolbuffers/protobuf/releases/download/v29.3
+            curl -fsSL -o /tmp/protoc.zip "$release/protoc-29.3-linux-x86_64.zip"
+            /opt/python/cp311-cp311/bin/python -m zipfile -e /tmp/protoc.zip /usr/local
+            chmod +x /usr/local/bin/protoc
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.name }}
+          path: dist

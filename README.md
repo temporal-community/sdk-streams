@@ -62,6 +62,11 @@ TTLs, the ACLs and the known limits.
 them, start the servers with `crates/streams-redis/scripts/redis-test-servers.sh`, set the two URLs
 that it prints, and run `cargo test -- --include-ignored`.
 
+## Python
+
+`python/` has `temporalio-streams-redis`, a Python package that runs this Redis Store in its own
+native module. The Python SDK needs no Redis code to use it. See `python/README.md`.
+
 ## License
 
 MIT. See `LICENSE.txt`.
