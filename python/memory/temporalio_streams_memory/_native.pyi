@@ -13,6 +13,9 @@ class MemoryRuntime:
         retention: timedelta | None,
         producer_idle_ttl: timedelta | None,
         store_name: str,
+        max_record_bytes: int,
+        max_batch_bytes: int,
+        max_batch_records: int,
     ) -> None: ...
     def call(
         self, operation: str, request: bytes, response_type: type[_Response]

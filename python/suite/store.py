@@ -1,3 +1,4 @@
+import dataclasses
 import os
 from datetime import timedelta
 from typing import Any
@@ -7,7 +8,7 @@ from temporalio.api.streamservice.v1 import (
     DescribeStreamRequest,
     DescribeStreamResponse,
 )
-from temporalio.client import StreamStore
+from temporalio.client import StreamBatchLimits, StreamStore
 
 from suite.helpers import NewStore, stream_error
 
@@ -30,6 +31,18 @@ def test_negative_duration_fails_with_value_error(option: str, new_store: NewSto
     options: dict[str, Any] = {option: timedelta(seconds=-1)}
     with pytest.raises(ValueError, match=f"{option} must not be negative"):
         new_store(**options)
+
+
+def test_store_gives_the_limits_of_its_options(new_store: NewStore):
+    assert new_store().limits == StreamBatchLimits()
+    assert new_store(max_batch_records=2).limits == StreamBatchLimits(
+        max_batch_records=2
+    )
+    for option, most in dataclasses.asdict(StreamBatchLimits()).items():
+        for value in (0, most + 1):
+            options: dict[str, Any] = {option: value}
+            with pytest.raises(ValueError, match=option):
+                new_store(**options)
 
 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="The platform has no fork")

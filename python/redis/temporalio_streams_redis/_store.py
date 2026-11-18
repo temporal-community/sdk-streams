@@ -49,12 +49,16 @@ class RedisStreamStore(temporalio.client.StreamStore):
         response_timeout: timedelta | None = None,
         wait_replicas: int = 0,
         wait_timeout: timedelta | None = None,
+        max_record_bytes: int | None = None,
+        max_batch_bytes: int | None = None,
+        max_batch_records: int | None = None,
         name: str = "redis",
     ) -> None:
         """Create a Redis Store. It checks its options and connects at its first call.
 
         A negative duration raises ``ValueError``. So does a bad option, with the message of the
-        Redis crate for the options that the crate checks.
+        Redis crate for the options that the crate checks. A limit below 1 or above its largest
+        value raises ``ValueError``.
 
         Args:
             url: A ``redis://`` or ``rediss://`` URL, or the seed URLs of a cluster.
@@ -73,10 +77,27 @@ class RedisStreamStore(temporalio.client.StreamStore):
                 with the Redis ``WAIT`` command. Zero sends no ``WAIT``.
             wait_timeout: How long a write waits for its replicas, at most half of
                 ``response_timeout``. ``None`` takes 1 second.
+            max_record_bytes: The most bytes of one stored Record, at most 1,572,864. ``None``
+                takes that. The stored form of a Record has its Producer and its body.
+            max_batch_bytes: The most bytes of the stored Records of one batch, at most
+                4,194,304. ``None`` takes that.
+            max_batch_records: The most Records of one batch, at most 1,000. ``None`` takes
+                that.
             name: Name of the Store, which the refs of its Streams carry, so that every
                 process can route a ref that it gets.
         """
         self._name = name
+        # The dataclass checks each limit, so a bad one raises before the runtime exists.
+        set_limits = {
+            field: value
+            for field, value in (
+                ("max_record_bytes", max_record_bytes),
+                ("max_batch_bytes", max_batch_bytes),
+                ("max_batch_records", max_batch_records),
+            )
+            if value is not None
+        }
+        self._limits = temporalio.client.StreamBatchLimits(**set_limits)
         self._runtime = RedisRuntime(
             [url] if isinstance(url, str) else list(url),
             cluster=cluster,
@@ -87,12 +108,20 @@ class RedisStreamStore(temporalio.client.StreamStore):
             store_name=name,
             wait_replicas=wait_replicas,
             wait_timeout=wait_timeout,
+            max_record_bytes=self._limits.max_record_bytes,
+            max_batch_bytes=self._limits.max_batch_bytes,
+            max_batch_records=self._limits.max_batch_records,
         )
 
     @property
     def name(self) -> str:
         """Name of the Store."""
         return self._name
+
+    @property
+    def limits(self) -> temporalio.client.StreamBatchLimits:
+        """The limits of one batch on this Store, from its options."""
+        return self._limits
 
     async def create_stream(self, request: CreateStreamRequest) -> CreateStreamResponse:
         """See base class."""

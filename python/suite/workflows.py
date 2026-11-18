@@ -265,3 +265,28 @@ async def test_read_takes_the_limits_of_a_client_read(
             expected.append([StreamErrorReason.Name(err.reason), err.message])
     assert results == expected
     assert results[0] == ["STREAM_ERROR_REASON_INVALID", expected[0][1]]
+
+
+@workflow.defn
+class BatchOverLimitsWorkflow:
+    @workflow.run
+    async def run(self, ref: StreamRef[str]) -> str:
+        stream = workflow.get_stream(ref, body_type=str)
+        reason = "NO_ERROR"
+        try:
+            await stream.append("a", "b", "c")
+        except StreamError as err:
+            reason = StreamErrorReason.Name(err.reason)
+        await stream.append("d", "e")
+        return reason
+
+
+async def test_workflow_batch_over_the_limits_of_its_store_is_too_large(
+    client: Client, new_store: NewStore
+):
+    stream_client = with_store(client, new_store(max_batch_records=2))
+    stream = await new_stream(stream_client)
+    _, reason = await _run(stream_client, BatchOverLimitsWorkflow, stream.ref)
+    assert reason == "STREAM_ERROR_REASON_TOO_LARGE"
+    # Only the batch within the limits was written.
+    assert [record.body async for record in stream.read()] == ["d", "e"]

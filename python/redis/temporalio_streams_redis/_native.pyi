@@ -19,6 +19,9 @@ class RedisRuntime:
         store_name: str,
         wait_replicas: int,
         wait_timeout: timedelta | None,
+        max_record_bytes: int,
+        max_batch_bytes: int,
+        max_batch_records: int,
     ) -> None: ...
     def call(
         self, operation: str, request: bytes, response_type: type[_Response]

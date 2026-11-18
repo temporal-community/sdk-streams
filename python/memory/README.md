@@ -39,6 +39,9 @@ A Worker that is built from this client uses the same Store for Activities and W
 | `name` | `memory` | The Store name that the refs of its Streams carry |
 | `retention` | 7 days | How long a closed Stream stays readable |
 | `producer_idle_ttl` | none | How long an open Stream stays after the last write |
+| `max_record_bytes` | 1536 KiB | The most bytes of one stored Record. At most the default |
+| `max_batch_bytes` | 4 MiB | The most bytes of the stored Records of one batch. At most the default |
+| `max_batch_records` | 1000 | The most Records of one batch. At most the default |
 
 ## The Workflow sandbox
 
