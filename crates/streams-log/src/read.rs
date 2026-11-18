@@ -122,8 +122,12 @@ impl LogStreamStore {
             check_expiry(&chunk_state, if from > 0 { start } else { 0 })?;
             end = (chunk_state.closed, chunk_state.newest);
             if entries.is_empty() {
-                // Only an expired log has no entry at an offset up to `newest`.
-                if from > 0 && start == from && from <= chunk_state.newest {
+                // Only a log that lost its Records has no entry at an offset up to `newest`. A read
+                // from an offset asked for those Records. A read from the start of a closed Stream
+                // gets no more Records, so it would never end.
+                let lost = start <= chunk_state.newest;
+                let asked = from > 0 && start == from;
+                if lost && (asked || (chunk_state.closed && records.is_empty())) {
                     return Err(expired());
                 }
                 break;

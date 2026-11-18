@@ -781,6 +781,7 @@ async fn a_quiet_read_ends_empty_after_its_wait_and_a_long_poll_wakes_on_append(
             };
             ext.append_records(request).await
         });
+        let started = Instant::now();
         let woke = case
             .read(ReadRecordsRequest {
                 from_offset: from,
@@ -790,6 +791,8 @@ async fn a_quiet_read_ends_empty_after_its_wait_and_a_long_poll_wakes_on_append(
             .await
             .unwrap();
         assert_eq!(texts(&woke), ["2"]);
+        // A Store whose wait never wakes would give the Record only at the end of the wait.
+        assert!(started.elapsed() < Duration::from_millis(2500));
         appender.await.unwrap().unwrap();
     }
 }
@@ -860,6 +863,47 @@ async fn a_read_of_an_expired_closed_stream_fails_instead_of_waiting() {
             assert_eq!(reason(&error), "stream_expired");
             assert!(started.elapsed() < Duration::from_secs(1));
         }
+    }
+}
+
+/// A closed Stream that lost its log has no Record to give a read from the start, and no append
+/// can come, so such a read would never end. It fails as expired, and a read from the newest offset
+/// is still done.
+async fn a_read_from_the_start_of_a_closed_stream_that_lost_its_log_fails() {
+    for target in super::support::stores_for(Needs::RAW_KEYS).await {
+        // The runtime goes on the Store that loses the log, since a runtime has no way to drop it.
+        let unique = unique();
+        let case = Case {
+            ext: crate::stream_runtime("", target.store.clone(), None),
+            namespace: format!("ns-{unique}"),
+            stream: target.stream.clone(),
+        };
+        case.create().await.unwrap();
+        let written = case
+            .append(client(), 1, vec![record("1"), record("2")])
+            .await
+            .unwrap();
+        case.close(client()).await.unwrap();
+        target.drop_log().await;
+        let started = Instant::now();
+        let error = case
+            .read(ReadRecordsRequest {
+                wait: millis(5000),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(reason(&error), "stream_expired");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let read = case
+            .read(ReadRecordsRequest {
+                from_offset: written.last_offset.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(read.records.is_empty() && read.done);
+        assert_eq!(read.last_offset, written.last_offset);
     }
 }
 
@@ -1077,6 +1121,7 @@ pub const CASES: &[super::Case] = &[
     case!(a_quiet_read_ends_empty_after_its_wait_and_a_long_poll_wakes_on_append),
     case!(a_close_ends_every_read_with_done),
     case!(a_read_of_an_expired_closed_stream_fails_instead_of_waiting),
+    case!(a_read_from_the_start_of_a_closed_stream_that_lost_its_log_fails),
     case!(the_retention_counts_from_the_close),
     case!(an_open_stream_expires_after_its_producer_idle_ttl),
     case!(a_create_answer_names_the_store_and_the_store_never_reads_it),
