@@ -196,7 +196,7 @@ jobs:
           key: temporalio-wheel-${{ runner.os }}-${{ env.SDK_PYTHON_REV }}
       - name: Build the temporalio wheel
         if: steps.sdk-wheel.outputs.cache-hit != 'true'
-        run: python -m pip wheel --no-deps --wheel-dir sdk-wheel sdk-python
+        run: python -m pip wheel --no-deps --wheel-dir sdk-wheel ./sdk-python
       - name: Install Redis from the Redis apt repo
         run: |
           curl -fsSL https://packages.redis.io/gpg \
@@ -256,7 +256,9 @@ jobs:
           before-script-linux: |
             release=https://github.com/protocolbuffers/protobuf/releases/download/v29.3
             curl -fsSL -o /tmp/protoc.zip "$release/protoc-29.3-linux-x86_64.zip"
-            /opt/python/cp311-cp311/bin/python -m zipfile -e /tmp/protoc.zip /usr/local
+            # The aarch64 container runs on x86_64, and its `/opt/python` is for the target.
+            python=$(command -v python3 || echo /opt/python/cp311-cp311/bin/python)
+            "$python" -m zipfile -e /tmp/protoc.zip /usr/local
             chmod +x /usr/local/bin/protoc
       - uses: actions/upload-artifact@v4
         with:
