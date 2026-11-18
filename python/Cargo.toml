@@ -2,7 +2,7 @@
 # one patch of the sdk-rust crates. It is apart from the repo's root workspace, so the jobs of the
 # Rust crates don't build it.
 [workspace]
-members = ["native", "redis"]
+members = ["native", "memory", "redis"]
 resolver = "3"
 
 [workspace.package]
