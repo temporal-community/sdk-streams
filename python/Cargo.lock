@@ -2331,6 +2331,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "temporalio-streams-memory"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "parking_lot",
+ "temporalio-common",
+ "temporalio-streams",
+ "temporalio-streams-log",
+ "tokio",
+]
+
+[[package]]
+name = "temporalio-streams-memory-python"
+version = "0.1.0"
+dependencies = [
+ "pyo3",
+ "temporalio-streams-memory",
+ "temporalio-streams-python-native",
+]
+
+[[package]]
 name = "temporalio-streams-python-native"
 version = "0.1.0"
 dependencies = [

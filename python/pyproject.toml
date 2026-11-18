@@ -17,14 +17,14 @@ filterwarnings = ["ignore::DeprecationWarning"]
 pythonpath = ["."]
 
 [tool.pyright]
-include = ["suite", "redis"]
+include = ["suite", "redis", "memory"]
 exclude = ["**/__pycache__"]
-extraPaths = ["redis", "redis/tests"]
-strict = ["redis/temporalio_streams_redis"]
+extraPaths = ["redis", "redis/tests", "memory"]
+strict = ["redis/temporalio_streams_redis", "memory/temporalio_streams_memory"]
 
 [tool.ruff]
 target-version = "py311"
-src = ["redis", "."]
+src = ["redis", "memory", "."]
 
 [tool.ruff.lint]
 extend-select = ["I"]
