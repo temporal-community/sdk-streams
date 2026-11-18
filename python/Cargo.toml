@@ -1,0 +1,46 @@
+# Its own workspace, so the repo's root workspace and its CI don't build this package.
+[workspace]
+
+[package]
+name = "temporalio-streams-redis-python"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88.0"
+authors = ["Temporal Technologies Inc. <sdk@temporal.io>"]
+license = "MIT"
+description = "The native module of the Python package of the Redis Store of the Stream runtime"
+homepage = "https://temporal.io/"
+repository = "https://github.com/temporal-community/sdk-streams"
+publish = false
+
+[lib]
+name = "_native"
+crate-type = ["cdylib"]
+
+[features]
+default = ["tls-ring"]
+# The same TLS features as the Redis crate. A build takes one of them.
+tls-ring = ["temporalio-streams-redis/tls-ring"]
+tls-aws-lc = ["temporalio-streams-redis/tls-aws-lc", "dep:rustls"]
+fips = ["tls-aws-lc", "temporalio-streams-redis/fips"]
+
+[dependencies]
+pyo3 = { version = "0.29", features = ["extension-module", "abi3-py311"] }
+pyo3-async-runtimes = { version = "0.29", features = ["tokio-runtime"] }
+# Only with `tls-aws-lc`, to install the provider that the Redis crate's TLS reads.
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"], optional = true }
+temporalio-common = { version = "1.1", default-features = false }
+temporalio-streams = "0.1"
+temporalio-streams-redis = { path = "../crates/streams-redis", default-features = false }
+tokio = { version = "1.26", features = ["net", "rt-multi-thread", "time"] }
+
+# `temporalio-streams` isn't on crates.io yet. These two entries must have the same commit as
+# `SDK_RUST_REV` in `scripts/patch-sdk-rust.sh`, which the repo's CI uses. The `python-lint` job
+# checks that they match.
+[patch.crates-io.temporalio-common]
+git = "https://github.com/moetemp/sdk-rust"
+rev = "9b121cf32dcd7920a067a04fb61bbb000178290b"
+
+[patch.crates-io.temporalio-streams]
+git = "https://github.com/moetemp/sdk-rust"
+rev = "9b121cf32dcd7920a067a04fb61bbb000178290b"
