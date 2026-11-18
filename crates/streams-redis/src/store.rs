@@ -26,7 +26,7 @@ use temporalio_streams_log::{
     offset::entry_id_of_offset,
     store::{
         Appended, Batch, Capabilities, Closed, ConflictPolicy, Create, Created, Entry,
-        FORMAT_VERSION, MAX_TTL, Store, StreamState, TOMBSTONE,
+        FORMAT_VERSION, LogStore, MAX_TTL, StreamState, TOMBSTONE,
     },
 };
 use tokio::time::Instant;
@@ -164,7 +164,7 @@ impl RedisStore {
 // The trait returns Stream errors, so the runtime and lang get the same reasons on every Store.
 // A Redis error converts through the crate's error, since this crate can't add that `From`.
 #[async_trait::async_trait]
-impl Store for RedisStore {
+impl LogStore for RedisStore {
     // Every rule is in the Lua scripts.
     fn capabilities(&self) -> Capabilities {
         Capabilities::ALL

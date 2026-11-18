@@ -6,7 +6,7 @@ use std::{num::NonZeroUsize, sync::Arc, time::Duration};
 use temporalio_streams::StreamRuntime;
 use temporalio_streams_log::{
     ids::StreamKeys,
-    store::Store,
+    store::LogStore,
     testing::{Needs, RawKeys, RuntimeConfig, TestStore},
 };
 use temporalio_streams_redis::{
@@ -88,7 +88,7 @@ impl TestStore for RedisTestStore {
         Needs::ALL
     }
 
-    async fn connect(&self) -> (Arc<dyn Store>, Arc<dyn RawKeys>) {
+    async fn connect(&self) -> (Arc<dyn LogStore>, Arc<dyn RawKeys>) {
         let store = Arc::new(RedisStore::connect(self.options()).await.unwrap());
         let raw = Arc::new(Raw::open(&self.servers).await);
         (store, raw)

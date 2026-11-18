@@ -18,7 +18,7 @@ use temporalio_streams::{
     },
 };
 use temporalio_streams_log::{
-    store::{Appended, Batch, Capabilities, Create, Created, Entry, Store, StreamState},
+    store::{Appended, Batch, Capabilities, Create, Created, Entry, LogStore, StreamState},
     stream_runtime,
 };
 use temporalio_streams_memory::MemoryStore;
@@ -36,7 +36,7 @@ struct Trimming {
 }
 
 #[async_trait::async_trait]
-impl Store for Trimming {
+impl LogStore for Trimming {
     fn capabilities(&self) -> Capabilities {
         self.inner.capabilities()
     }

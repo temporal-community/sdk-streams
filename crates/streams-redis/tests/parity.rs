@@ -25,7 +25,7 @@ use temporalio_streams::{
 use temporalio_streams_log::{
     digest::batch_digest,
     ids::StreamKeys,
-    store::{Batch, ConflictPolicy, Create, CreateOutcome, Entry, Store},
+    store::{Batch, ConflictPolicy, Create, CreateOutcome, Entry, LogStore},
 };
 use temporalio_streams_memory::MemoryStore;
 use temporalio_streams_redis::{
@@ -272,7 +272,7 @@ enum Answer {
 
 /// One Store of a seed, with the offsets of each Stream's log after the last call.
 struct Side {
-    store: Arc<dyn Store>,
+    store: Arc<dyn LogStore>,
     logs: [Vec<i64>; 2],
 }
 
@@ -532,7 +532,7 @@ enum Which {
 }
 
 /// The offsets of a Stream's whole log.
-async fn listing(store: &dyn Store, stream: &StreamRef) -> Vec<i64> {
+async fn listing(store: &dyn LogStore, stream: &StreamRef) -> Vec<i64> {
     let read: StreamResult<_> = store.read(stream, 0, 100_000).await;
     read.map_or_else(
         |_| Vec::new(),

@@ -2,7 +2,7 @@
 
 //! Experimental. The rules of the Stream service for a Store that keeps each Stream as a log.
 //!
-//! A [store::Store] has a few log calls: create, append, read, wait and close. [stream_store]
+//! A [store::LogStore] has a few log calls: create, append, read, wait and close. [stream_store]
 //! turns one into a [StreamStore](temporalio_streams::StreamStore), which answers the five
 //! operations of the Stream service. It applies the rules in one place, so every Store that is
 //! built on it keeps the same ones. [stream_runtime] gives a

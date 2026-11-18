@@ -3,7 +3,7 @@
 use crate::{
     digest::batch_digest,
     offset::offset_to_wire,
-    store::{Batch, Capabilities, ConflictPolicy, Create, CreateOutcome, Store},
+    store::{Batch, Capabilities, ConflictPolicy, Create, CreateOutcome, LogStore},
 };
 use std::sync::Arc;
 use temporalio_common::telemetry::metrics::TemporalMeter;
@@ -17,18 +17,21 @@ use temporalio_streams::{
     record::data_records,
 };
 
-/// The Stream service on a [Store] of log calls. The runtime of `temporalio-streams` checks each
+/// The Stream service on a [LogStore] of log calls. The runtime of `temporalio-streams` checks each
 /// request before it calls this type, so the type applies only the rules of the log.
 pub(crate) struct LogStreamStore {
     /// The name of the Store, which the refs that this type builds carry.
     store_name: String,
-    pub(crate) store: Arc<dyn Store>,
+    pub(crate) store: Arc<dyn LogStore>,
 }
 
 /// Gives the [StreamStore] of a Store of log calls. `store_name` is the name that lang registered
 /// the Store under, which the refs that the Store builds carry. A Store that connects later, such
 /// as a [crate::store::LazyStore], lets a bridge build the runtime with no async runtime.
-pub fn stream_store(store_name: impl Into<String>, store: Arc<dyn Store>) -> Arc<dyn StreamStore> {
+pub fn stream_store(
+    store_name: impl Into<String>,
+    store: Arc<dyn LogStore>,
+) -> Arc<dyn StreamStore> {
     Arc::new(LogStreamStore {
         store_name: store_name.into(),
         store,
@@ -39,7 +42,7 @@ pub fn stream_store(store_name: impl Into<String>, store: Arc<dyn Store>) -> Arc
 /// metrics on `meter`, lang's runtime meter, if set.
 pub fn stream_runtime(
     store_name: impl Into<String>,
-    store: Arc<dyn Store>,
+    store: Arc<dyn LogStore>,
     meter: Option<TemporalMeter>,
 ) -> Arc<StreamRuntime> {
     StreamRuntime::new(stream_store(store_name, store), meter)
@@ -60,7 +63,7 @@ fn conflict_policy(value: i32) -> StreamResult<ConflictPolicy> {
 
 /// Appends a batch that the runtime checked to a Store of log calls.
 async fn append_to_log(
-    store: &dyn Store,
+    store: &dyn LogStore,
     request: AppendRecordsRequest,
 ) -> StreamResult<AppendRecordsResponse> {
     let AppendRecordsRequest {

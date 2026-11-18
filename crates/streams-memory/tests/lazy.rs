@@ -6,7 +6,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 use temporalio_streams::{Reason, StreamError, proto::StreamRef};
-use temporalio_streams_log::store::{Capabilities, Create, DEFAULT_RETENTION, LazyStore, Store};
+use temporalio_streams_log::store::{Capabilities, Create, DEFAULT_RETENTION, LazyStore, LogStore};
 use temporalio_streams_memory::MemoryStore;
 
 fn stream() -> StreamRef {

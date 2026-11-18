@@ -16,7 +16,7 @@ use temporalio_streams::{
     },
 };
 use temporalio_streams_log::{
-    store::{Appended, Batch, Capabilities, Closed, Create, Created, Entry, Store, StreamState},
+    store::{Appended, Batch, Capabilities, Closed, Create, Created, Entry, LogStore, StreamState},
     stream_runtime,
 };
 use temporalio_streams_memory::MemoryStore;
@@ -30,7 +30,7 @@ struct Masked {
 }
 
 #[async_trait::async_trait]
-impl Store for Masked {
+impl LogStore for Masked {
     fn capabilities(&self) -> Capabilities {
         self.inner.capabilities().without(self.without)
     }

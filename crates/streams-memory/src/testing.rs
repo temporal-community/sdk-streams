@@ -4,7 +4,7 @@ use crate::{MemoryStore, MemoryStreamOptions, MemoryStreamRuntime};
 use std::sync::Arc;
 use temporalio_streams::StreamRuntime;
 use temporalio_streams_log::{
-    store::{DEFAULT_RETENTION, Store},
+    store::{DEFAULT_RETENTION, LogStore},
     testing::{Needs, RawKeys, RuntimeConfig, TestStore},
 };
 
@@ -18,7 +18,7 @@ impl TestStore for MemoryTestStore {
         Needs::ALL
     }
 
-    async fn connect(&self) -> (Arc<dyn Store>, Arc<dyn RawKeys>) {
+    async fn connect(&self) -> (Arc<dyn LogStore>, Arc<dyn RawKeys>) {
         let store = Arc::new(MemoryStore::new(DEFAULT_RETENTION, None));
         (store.clone(), store)
     }

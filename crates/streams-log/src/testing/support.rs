@@ -4,7 +4,7 @@
 use super::{RawKeys, RuntimeConfig, test_stores};
 use crate::{
     digest::batch_digest,
-    store::{Appended, Batch, Closed, Create, Created, Entry, Store},
+    store::{Appended, Batch, Closed, Create, Created, Entry, LogStore},
 };
 use prost::Message;
 use prost_types::Timestamp;
@@ -59,7 +59,7 @@ impl Needs {
 
 /// One Stream on one server, fresh for each case.
 pub(crate) struct Target {
-    pub(crate) store: Arc<dyn Store>,
+    pub(crate) store: Arc<dyn LogStore>,
     pub(crate) raw: Arc<dyn RawKeys>,
     pub(crate) stream: String,
     /// What the Store gives. A case checks it before a step that needs more than it asked for.

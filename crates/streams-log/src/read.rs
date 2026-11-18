@@ -3,7 +3,7 @@
 use crate::{
     offset::{offset_from_wire, offset_to_wire},
     runtime::LogStreamStore,
-    store::{FORMAT_VERSION, Store, StreamState},
+    store::{FORMAT_VERSION, LogStore, StreamState},
 };
 use prost::Message;
 use std::time::Duration;
@@ -97,7 +97,7 @@ impl LogStreamStore {
     /// `(max, max_bytes)` caps the Records and their bytes.
     async fn page(
         &self,
-        store: &dyn Store,
+        store: &dyn LogStore,
         stream: &StreamRef,
         state: &StreamState,
         from: i64,

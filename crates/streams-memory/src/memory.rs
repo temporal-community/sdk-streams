@@ -18,7 +18,7 @@ use temporalio_streams_log::{
     producer_field::{ProducerField, entry_id},
     store::{
         Appended, Batch, Capabilities, Closed, ConflictPolicy, Create, CreateOutcome, Created,
-        Entry, FORMAT_VERSION, Store, StreamState, TOMBSTONE,
+        Entry, FORMAT_VERSION, LogStore, StreamState, TOMBSTONE,
     },
 };
 use tokio::{sync::Notify, time::Instant};
@@ -332,7 +332,7 @@ fn offsets(first: &str, last: &str) -> StreamResult<Option<(i64, i64)>> {
 }
 
 #[async_trait::async_trait]
-impl Store for MemoryStore {
+impl LogStore for MemoryStore {
     fn capabilities(&self) -> Capabilities {
         Capabilities::ALL
     }

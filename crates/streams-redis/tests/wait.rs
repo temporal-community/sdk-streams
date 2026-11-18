@@ -7,7 +7,7 @@ use temporalio_streams::{
     Reason,
     proto::{ClientProducer, Producer, StreamRecord, StreamRef, producer::Kind},
 };
-use temporalio_streams_log::store::{Batch, Create, CreateOutcome, Store};
+use temporalio_streams_log::store::{Batch, Create, CreateOutcome, LogStore};
 use temporalio_streams_redis::{
     RedisServers, RedisStore, RedisStoreOptions, Url, WaitOptions,
     testing::{SlotRange, cluster_url, standalone_url},

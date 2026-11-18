@@ -9,7 +9,7 @@ pub mod store;
 
 pub use support::Needs;
 
-use crate::store::Store;
+use crate::store::LogStore;
 use futures_util::{FutureExt, future::join_all};
 use std::{future::Future, panic::AssertUnwindSafe, pin::Pin, sync::Arc, time::Duration};
 use temporalio_streams::StreamRuntime;
@@ -48,7 +48,7 @@ pub trait TestStore: Send + Sync {
     /// What the Store gives. A case that needs more doesn't run on it.
     fn gives(&self) -> Needs;
     /// A Store for one case, and the state under it.
-    async fn connect(&self) -> (Arc<dyn Store>, Arc<dyn RawKeys>);
+    async fn connect(&self) -> (Arc<dyn LogStore>, Arc<dyn RawKeys>);
     /// A runtime on the Store with `config`.
     fn runtime(&self, config: &RuntimeConfig) -> Arc<StreamRuntime>;
 }

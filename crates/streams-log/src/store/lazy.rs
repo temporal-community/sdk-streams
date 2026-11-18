@@ -1,7 +1,7 @@
 //! A Store that connects on its first call.
 
 use crate::store::{
-    Appended, Batch, Capabilities, Closed, Create, Created, Entry, Store, StreamState,
+    Appended, Batch, Capabilities, Closed, Create, Created, Entry, LogStore, StreamState,
 };
 use std::{future::Future, pin::Pin};
 use temporalio_streams::{
@@ -17,13 +17,13 @@ type Connect<S> =
 /// no async runtime, and a Workflow that never publishes never connects. A failed connect is tried
 /// again on the next call. An inner Store that lacks a declared capability is refused once, and
 /// every later call fails with that refusal.
-pub struct LazyStore<S: Store> {
+pub struct LazyStore<S: LogStore> {
     capabilities: Capabilities,
     connect: Connect<S>,
     store: OnceCell<StreamResult<S>>,
 }
 
-impl<S: Store> std::fmt::Debug for LazyStore<S> {
+impl<S: LogStore> std::fmt::Debug for LazyStore<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LazyStore")
             .field("capabilities", &self.capabilities)
@@ -32,7 +32,7 @@ impl<S: Store> std::fmt::Debug for LazyStore<S> {
     }
 }
 
-impl<S: Store> LazyStore<S> {
+impl<S: LogStore> LazyStore<S> {
     /// A Store that `connect` connects on its first call. The runtime asks for the capabilities
     /// before any call connects, so the Store declares `capabilities` when it is built, and a
     /// connect fails if the inner Store lacks one of them.
@@ -71,7 +71,7 @@ impl<S: Store> LazyStore<S> {
 }
 
 #[async_trait::async_trait]
-impl<S: Store> Store for LazyStore<S> {
+impl<S: LogStore> LogStore for LazyStore<S> {
     fn capabilities(&self) -> Capabilities {
         self.capabilities
     }

@@ -206,14 +206,14 @@ fn unsupported(capability: &str) -> StreamError {
     )
 }
 
-/// The calls of a Store. Each one is atomic, as one Lua script is on Redis.
+/// The log calls of a Store. Each one is atomic, as one Lua script is on Redis.
 ///
 /// The required calls make the log contract. They are a create key, an atomic batch append, an
 /// ordered read with the Stream's state, stable offsets, a Retention that counts from the close and
 /// a wait for the next entry. An append applies the rules of the capabilities that the Store
 /// declares. The optional calls fail by default.
 #[async_trait::async_trait]
-pub trait Store: Send + Sync + 'static {
+pub trait LogStore: Send + Sync + 'static {
     /// What the Store does atomically beyond the log. It has no default, so a Store that wraps
     /// another one must say what it forwards.
     fn capabilities(&self) -> Capabilities;
