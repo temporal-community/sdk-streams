@@ -4,6 +4,10 @@
 
 ### Added
 
+- The `temporalio-streams-log` and `temporalio-streams-memory` crates. The first has the `LogStore`
+  trait of a Store that keeps each Stream as a log, the code that turns it into a `StreamStore` of
+  `temporalio-streams`, and the shared test suites. The second is a Store that keeps its Streams in
+  memory, for tests.
 - The `temporalio-streams-redis` crate, the Redis Store of the Temporal Stream runtime. It answers
   the five operations of the Stream service of `temporalio-streams` on Redis, standalone or a
   cluster. A lang bridge builds `RedisStreamRuntime` from an encoded `RedisStreamConfig` and calls

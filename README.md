@@ -2,11 +2,18 @@
 
 Experimental.
 
-`temporalio-streams-redis` is the Redis Store of the Temporal Stream runtime. The runtime itself,
-`temporalio-streams`, is in [sdk-rust](https://github.com/temporalio/sdk-rust). A lang bridge builds
-the runtime with `RedisStreamRuntime`, which connects on its first call that needs Redis. Then the
-bridge calls `StreamRuntime::call` with the name of one of the five Stream operations and the
-encoded request, and it gets the encoded response.
+The Stores of the Temporal Stream runtime. The runtime itself, `temporalio-streams`, is in
+[sdk-rust](https://github.com/temporalio/sdk-rust). This repo has three crates.
+
+- `temporalio-streams-log` has the `LogStore` trait of a Store that keeps each Stream as a log,
+  what such Stores share, and the shared test suites.
+- `temporalio-streams-memory` is a Store that keeps its Streams in the memory of one process, for
+  tests.
+- `temporalio-streams-redis` is the Redis Store.
+
+A lang bridge builds the runtime with `RedisStreamRuntime`, which connects on its first call that
+needs Redis. Then the bridge calls `StreamRuntime::call` with the name of one of the five Stream
+operations and the encoded request, and it gets the encoded response.
 
 ## Connecting
 

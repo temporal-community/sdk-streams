@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.88.0"
 authors = ["Temporal Technologies Inc. <sdk@temporal.io>"]
 license-file = { workspace = true }
-description = "The rules of the Stream service for a Store that keeps each Stream as a log"
+description = "The shared part of the Temporal Stream Stores that keep each Stream as a log"
 homepage = "https://temporal.io/"
 repository = "https://github.com/temporal-community/sdk-streams"
 keywords = ["temporal", "workflow", "streams"]

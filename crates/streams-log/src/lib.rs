@@ -1,12 +1,16 @@
 #![warn(missing_docs)]
 
-//! Experimental. The rules of the Stream service for a Store that keeps each Stream as a log.
+//! Experimental. The shared part of the Stores that keep each Stream as a log.
 //!
 //! A [store::LogStore] has a few log calls: create, append, read, wait and close. [stream_store]
 //! turns one into a [StreamStore](temporalio_streams::StreamStore), which answers the five
-//! operations of the Stream service. It applies the rules in one place, so every Store that is
-//! built on it keeps the same ones. [stream_runtime] gives a
+//! operations of the Stream service. [stream_runtime] gives a
 //! [StreamRuntime](temporalio_streams::StreamRuntime) on that Store.
+//!
+//! The crate does what is the same for every log: the form of an offset, the digest of a batch,
+//! the pages and the deadline of a read, and the check that a Stream has expired. A `LogStore`
+//! does what must happen in one step with its write: it gives each entry its id, and it applies
+//! the fence of a Producer's epochs, the dedupe of a batch that comes again, and Retention.
 
 pub mod digest;
 pub mod ids;

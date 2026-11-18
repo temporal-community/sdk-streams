@@ -22,7 +22,7 @@ pub enum RedisStoreError {
     /// retry can't fix it.
     #[error("{0}")]
     Corrupt(String),
-    /// A rule of the Stream runtime refused a value that Redis keeps.
+    /// A rule of the Stream service refused a value that Redis keeps.
     #[error(transparent)]
     Stream(#[from] StreamError),
 }
