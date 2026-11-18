@@ -3,7 +3,7 @@
 use crate::MemoryStore;
 use std::{sync::Arc, time::Duration};
 use temporalio_common::telemetry::metrics::TemporalMeter;
-use temporalio_streams::StreamRuntime;
+use temporalio_streams::{StreamRuntime, record::BatchLimits};
 use temporalio_streams_log::{store::DEFAULT_RETENTION, stream_runtime};
 
 /// The settings of the memory Store runtime. A field left `None` takes its default.
@@ -14,6 +14,8 @@ pub struct MemoryStreamOptions {
     /// How long an open Stream stays after the last write of any Producer. `None` keeps an open
     /// Stream until its close.
     pub producer_idle_ttl: Option<Duration>,
+    /// The limits of one batch. The default is the largest batch that any Store may take.
+    pub limits: BatchLimits,
 }
 
 /// The Stream runtime on the memory Store, for tests. It serves the same calls with the same
@@ -33,6 +35,6 @@ impl MemoryStreamRuntime {
             positive(options.retention).unwrap_or(DEFAULT_RETENTION),
             positive(options.producer_idle_ttl),
         ));
-        stream_runtime(store_name, store, meter)
+        stream_runtime(store_name, store, options.limits, meter)
     }
 }

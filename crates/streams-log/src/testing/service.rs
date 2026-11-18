@@ -21,6 +21,7 @@ use temporalio_streams::{
         StreamErrorDetails, StreamIdConflictPolicy, StreamRef, StreamStatus, WorkflowProducer,
         WorkflowTaskEpoch, producer::Kind,
     },
+    record::BatchLimits,
 };
 use tonic::Code;
 
@@ -656,7 +657,7 @@ async fn a_read_from_the_start_of_a_closed_stream_that_lost_its_log_fails() {
         // The runtime goes on the Store that loses the log, since a runtime has no way to drop it.
         let unique = unique();
         let case = Case {
-            ext: crate::stream_runtime("", target.store.clone(), None),
+            ext: crate::stream_runtime("", target.store.clone(), BatchLimits::default(), None),
             namespace: format!("ns-{unique}"),
             stream: target.stream.clone(),
         };

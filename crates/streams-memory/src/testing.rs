@@ -27,6 +27,7 @@ impl TestStore for MemoryTestStore {
         let options = MemoryStreamOptions {
             retention: config.retention,
             producer_idle_ttl: config.producer_idle_ttl,
+            ..Default::default()
         };
         MemoryStreamRuntime::create(config.store_name.clone(), options, None)
     }

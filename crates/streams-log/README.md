@@ -16,10 +16,10 @@ service.
 - A Store crate runs the shared suites, which check that its `LogStore` keeps these rules as the
   other Stores do.
 
-`stream_runtime` gives a `StreamRuntime` on a `LogStore`. `dispatch::call` is the byte form of the
-five operations, for a binding in another language. It takes an operation name and the encoded
-request, and gives the encoded response. A `LazyStore` connects its inner Store at the first call
-that needs it.
+`stream_runtime` gives a `StreamRuntime` on a `LogStore`, with the batch limits of the Store.
+`dispatch::call` is the byte form of the five operations, for a binding in another language. It
+takes an operation name and the encoded request, and gives the encoded response. A `LazyStore`
+connects its inner Store at the first call that needs it.
 
 ## The shared suites and vectors
 

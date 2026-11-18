@@ -16,6 +16,7 @@ use temporalio_streams::{
         CreateStreamRequest, CreateStreamResponse, Producer, ReadRecordsRequest,
         ReadRecordsResponse, StreamErrorDetails, StreamErrorReason, StreamRef, producer::Kind,
     },
+    record::BatchLimits,
 };
 use temporalio_streams_log::{
     store::{Appended, Batch, Capabilities, Create, Created, Entry, LogStore, StreamState},
@@ -79,7 +80,7 @@ fn trimming() -> (Arc<Trimming>, Arc<StreamRuntime>) {
         trim_next: AtomicBool::new(false),
         pulled: AtomicUsize::new(0),
     });
-    let ext = stream_runtime("", store.clone(), None);
+    let ext = stream_runtime("", store.clone(), BatchLimits::default(), None);
     (store, ext)
 }
 

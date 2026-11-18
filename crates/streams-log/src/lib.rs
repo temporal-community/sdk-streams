@@ -9,9 +9,10 @@
 //! Experimental. The shared part of the Stores that keep each Stream as a log.
 //!
 //! A [store::LogStore] has a few log calls: create, append, read, wait and close. [stream_runtime]
-//! gives a [StreamRuntime](temporalio_streams::StreamRuntime) on a [store::LogStore].
-//! [dispatch::call] is the byte form of the five operations, for a binding in another language. It
-//! takes an operation name and the encoded request, and gives the encoded response.
+//! gives a [StreamRuntime](temporalio_streams::StreamRuntime) on a [store::LogStore], with the
+//! batch limits of the Store. [dispatch::call] is the byte form of the five operations, for a
+//! binding in another language. It takes an operation name and the encoded request, and gives the
+//! encoded response.
 //!
 //! The crate does what is the same for every log: the form of an offset, the digest of a batch,
 //! the pages and the deadline of a read, and the check that a Stream has expired. A `LogStore`

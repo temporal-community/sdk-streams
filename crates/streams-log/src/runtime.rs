@@ -14,7 +14,7 @@ use temporalio_streams::{
         CreateStreamRequest, CreateStreamResponse, DescribeStreamRequest, DescribeStreamResponse,
         ReadRecordsRequest, ReadRecordsResponse, StreamIdConflictPolicy, StreamRef, StreamStatus,
     },
-    record::data_record,
+    record::{BatchLimits, data_record},
 };
 
 /// The Stream service on a [LogStore] of log calls. The runtime of `temporalio-streams` checks each
@@ -23,20 +23,25 @@ pub(crate) struct LogStreamStore {
     /// The name of the Store, which the refs that this type builds carry.
     store_name: String,
     pub(crate) store: Arc<dyn LogStore>,
+    /// Held here because the runtime asks the Store, not the caller, for its limits.
+    limits: BatchLimits,
 }
 
 /// Builds the Stream runtime on a Store of log calls. `store_name` is the name that lang
 /// registered the Store under, which the refs that the Store builds carry. A Store that connects
 /// later, such as a [crate::store::LazyStore], lets a bridge build the runtime with no async
-/// runtime. The runtime records metrics on `meter`, lang's runtime meter, if set.
+/// runtime. The runtime refuses a batch over `limits` before the Store sees it. The runtime
+/// records metrics on `meter`, lang's runtime meter, if set.
 pub fn stream_runtime(
     store_name: impl Into<String>,
     store: Arc<dyn LogStore>,
+    limits: BatchLimits,
     meter: Option<TemporalMeter>,
 ) -> Arc<StreamRuntime> {
     let store = Arc::new(LogStreamStore {
         store_name: store_name.into(),
         store,
+        limits,
     });
     StreamRuntime::new(store, meter)
 }
@@ -165,5 +170,9 @@ impl StreamStore for LogStreamStore {
             status: status as i32,
             last_offset: offset_to_wire(state.newest),
         })
+    }
+
+    fn limits(&self) -> BatchLimits {
+        self.limits
     }
 }

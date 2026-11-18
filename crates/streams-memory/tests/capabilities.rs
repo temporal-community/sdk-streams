@@ -14,6 +14,7 @@ use temporalio_streams::{
         CreateStreamRequest, DescribeStreamRequest, DescribeStreamResponse, Producer,
         StreamErrorDetails, StreamErrorReason, StreamRef, StreamStatus, producer::Kind,
     },
+    record::BatchLimits,
 };
 use temporalio_streams_log::{
     store::{Appended, Batch, Capabilities, Closed, Create, Created, Entry, LogStore, StreamState},
@@ -90,7 +91,7 @@ fn case(without: Capabilities) -> Case {
         .unwrap()
         .as_nanos();
     Case {
-        ext: stream_runtime("", store, None),
+        ext: stream_runtime("", store, BatchLimits::default(), None),
         memory,
         stream: format!("wf:run-{unique}"),
     }
