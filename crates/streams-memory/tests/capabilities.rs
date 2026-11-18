@@ -135,7 +135,7 @@ impl Case {
         operation: &str,
         request: Req,
     ) -> Result<Vec<u8>, StreamError> {
-        self.ext.call(operation, &request.encode_to_vec()).await
+        temporalio_streams_log::dispatch::call(&self.ext, operation, &request.encode_to_vec()).await
     }
 
     async fn create(&self) {

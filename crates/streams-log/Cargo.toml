@@ -30,6 +30,8 @@ tonic = { version = "0.14", default-features = false, optional = true }
 serde_json = "1"
 # The tests of `testing` need the feature that gates it.
 temporalio-streams-log = { path = ".", features = ["test-support"] }
+# The tests of `dispatch` need `#[tokio::test]`.
+tokio = { version = "1.47", default-features = false, features = ["macros", "rt"] }
 
 [lints]
 workspace = true

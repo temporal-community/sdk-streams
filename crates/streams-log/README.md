@@ -17,7 +17,9 @@ service.
   other Stores do.
 
 `stream_store` gives the `StreamStore` of a `LogStore`, and `stream_runtime` gives a
-`StreamRuntime` on it. A `LazyStore` connects its inner Store at the first call that needs it.
+`StreamRuntime` on it. `dispatch::call` is the byte form of the five operations, for a binding in
+another language. It takes an operation name and the encoded request, and gives the encoded
+response. A `LazyStore` connects its inner Store at the first call that needs it.
 
 ## The shared suites and vectors
 

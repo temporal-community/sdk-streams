@@ -96,7 +96,8 @@ async fn try_call<Req: Message, Resp: Message + Default>(
     operation: &str,
     request: Req,
 ) -> Result<Resp, StreamError> {
-    let bytes = ext.call(operation, &request.encode_to_vec()).await?;
+    let bytes =
+        temporalio_streams_log::dispatch::call(ext, operation, &request.encode_to_vec()).await?;
     Ok(Resp::decode(bytes.as_slice()).unwrap())
 }
 

@@ -12,8 +12,9 @@ The Stores of the Temporal Stream runtime. The runtime itself, `temporalio-strea
 - `temporalio-streams-redis` is the Redis Store.
 
 A lang bridge builds the runtime with `RedisStreamRuntime`, which connects on its first call that
-needs Redis. Then the bridge calls `StreamRuntime::call` with the name of one of the five Stream
-operations and the encoded request, and it gets the encoded response.
+needs Redis. Then the bridge calls `dispatch::call` of `temporalio-streams-log` with the runtime,
+the name of one of the five Stream operations and the encoded request, and it gets the encoded
+response.
 
 ## Connecting
 
