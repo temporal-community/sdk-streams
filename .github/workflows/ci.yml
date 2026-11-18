@@ -11,9 +11,9 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # The sdk-python commit that has the Streams API and a bridge with the Stream runtime. It moves
-  # to a release of `temporalio` when one has Streams.
-  SDK_PYTHON_REV: 29aef5954b2503cc03c8638083993cc49c7b83f9
+  # The sdk-python commit that has the Streams API and lets Core call a Store that is written in
+  # Python. It moves to a release of `temporalio` when one has Streams.
+  SDK_PYTHON_REV: 6b014ea7cf42098afe3430b95444ec5fe7e7ca6c
 
 jobs:
   lint:
@@ -196,8 +196,6 @@ jobs:
           key: temporalio-wheel-${{ runner.os }}-${{ env.SDK_PYTHON_REV }}
       - name: Build the temporalio wheel
         if: steps.sdk-wheel.outputs.cache-hit != 'true'
-        env:
-          MATURIN_PEP517_ARGS: --features streams
         run: python -m pip wheel --no-deps --wheel-dir sdk-wheel sdk-python
       - name: Install Redis from the Redis apt repo
         run: |
