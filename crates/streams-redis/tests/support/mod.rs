@@ -10,7 +10,7 @@ use temporalio_streams::{
     testing::{Needs, RawKeys, RuntimeConfig, TestStore},
 };
 use temporalio_streams_redis::{
-    RedisStore, RedisStoreOptions, RedisStreamRuntime, Topology, Url, WaitOptions,
+    RedisServers, RedisStore, RedisStoreOptions, RedisStreamRuntime, Url, WaitOptions,
     proto::RedisStreamConfig,
     testing::{cluster_url, standalone_url},
 };
@@ -25,28 +25,28 @@ pub(crate) fn standalone() -> Vec<Arc<dyn TestStore>> {
         has_replica(&url),
         "the server at STREAMS_REDIS_URL needs a replica"
     );
-    test_stores(Topology::Standalone(url.parse().unwrap()))
+    test_stores(RedisServers::Standalone(url.parse().unwrap()))
 }
 
 /// The Stores of the cluster, with `WAIT` on each primary's replica and with none.
 pub(crate) fn cluster() -> Vec<Arc<dyn TestStore>> {
-    test_stores(Topology::Cluster {
+    test_stores(RedisServers::Cluster {
         first: cluster_url().parse().unwrap(),
         rest: Vec::new(),
     })
 }
 
 // Each write of the first Store goes through the `WAIT` pipeline, refusals too.
-fn test_stores(topology: Topology<Url>) -> Vec<Arc<dyn TestStore>> {
+fn test_stores(servers: RedisServers<Url>) -> Vec<Arc<dyn TestStore>> {
     let waits = RedisTestStore {
-        topology: topology.clone(),
+        servers: servers.clone(),
         wait: Some(WaitOptions {
             replicas: NonZeroUsize::MIN,
             timeout: WAIT_TIMEOUT,
         }),
     };
     let plain = RedisTestStore {
-        topology,
+        servers,
         wait: None,
     };
     vec![Arc::new(waits), Arc::new(plain)]
@@ -65,7 +65,7 @@ pub(crate) fn has_replica(url: &str) -> bool {
 
 /// The Redis of a Store under test, and its `WAIT`, if any.
 pub(crate) struct RedisTestStore {
-    topology: Topology<Url>,
+    servers: RedisServers<Url>,
     wait: Option<WaitOptions>,
 }
 
@@ -74,7 +74,7 @@ const WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl RedisTestStore {
     fn options(&self) -> RedisStoreOptions {
-        let mut options = RedisStoreOptions::from(self.topology.clone());
+        let mut options = RedisStoreOptions::from(self.servers.clone());
         options.key_prefix = PREFIX.parse().unwrap();
         options.response_timeout = 2 * WAIT_TIMEOUT;
         options.wait = self.wait;
@@ -90,7 +90,7 @@ impl TestStore for RedisTestStore {
 
     async fn connect(&self) -> (Arc<dyn Store>, Arc<dyn RawKeys>) {
         let store = Arc::new(RedisStore::connect(self.options()).await.unwrap());
-        let raw = Arc::new(Raw::open(&self.topology).await);
+        let raw = Arc::new(Raw::open(&self.servers).await);
         (store, raw)
     }
 
@@ -101,8 +101,8 @@ impl TestStore for RedisTestStore {
             nanos: i32::try_from(duration.subsec_nanos()).unwrap(),
         };
         let config = RedisStreamConfig {
-            urls: self.topology.servers().map(|url| url.to_string()).collect(),
-            cluster: matches!(self.topology, Topology::Cluster { .. }),
+            urls: self.servers.iter().map(|url| url.to_string()).collect(),
+            cluster: matches!(self.servers, RedisServers::Cluster { .. }),
             key_prefix: PREFIX.to_string(),
             store_name: runtime.store_name.clone(),
             wait_replicas: self
@@ -135,16 +135,15 @@ enum Raw {
 }
 
 impl Raw {
-    async fn open(topology: &Topology<Url>) -> Self {
-        match topology {
-            Topology::Standalone(url) => {
+    async fn open(servers: &RedisServers<Url>) -> Self {
+        match servers {
+            RedisServers::Standalone(url) => {
                 let client = redis::Client::open(url.as_str()).unwrap();
                 Raw::Standalone(client.get_connection_manager().await.unwrap())
             }
-            Topology::Cluster { .. } => {
+            RedisServers::Cluster { .. } => {
                 let client =
-                    redis::cluster::ClusterClient::new(topology.servers().map(Url::as_str))
-                        .unwrap();
+                    redis::cluster::ClusterClient::new(servers.iter().map(Url::as_str)).unwrap();
                 Raw::Cluster(client.get_async_connection().await.unwrap())
             }
         }

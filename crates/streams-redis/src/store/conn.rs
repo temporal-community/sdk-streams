@@ -2,7 +2,7 @@
 //! connection, so each one gets a dedicated connection, and the short calls share one.
 
 use crate::{
-    RedisStoreOptions, Topology,
+    RedisServers, RedisStoreOptions,
     slots::{SlotNode, SlotRange},
 };
 use parking_lot::Mutex;
@@ -41,7 +41,7 @@ const WAIT_CONNECTIONS: NonZeroUsize = match NonZeroUsize::new(8) {
 
 /// Where the Store's Redis is, parsed once from the URLs of the options.
 pub(crate) struct Endpoint {
-    topology: Topology<Seed>,
+    servers: RedisServers<Seed>,
     response_timeout: Duration,
 }
 
@@ -67,7 +67,7 @@ impl TryFrom<&RedisStoreOptions> for Endpoint {
 
     fn try_from(options: &RedisStoreOptions) -> RedisResult<Self> {
         Ok(Self {
-            topology: options.topology.try_map(|url| Seed::try_from(url))?,
+            servers: options.servers.try_map(|url| Seed::try_from(url))?,
             response_timeout: options.response_timeout,
         })
     }
@@ -76,22 +76,22 @@ impl TryFrom<&RedisStoreOptions> for Endpoint {
 impl Endpoint {
     /// How a blocking read of `key` finds its first node.
     fn route(&self, key: &str) -> Route {
-        match self.topology {
-            Topology::Standalone(_) => Route::Standalone,
-            Topology::Cluster { .. } => Route::Slot(slot(key)),
+        match self.servers {
+            RedisServers::Standalone(_) => Route::Standalone,
+            RedisServers::Cluster { .. } => Route::Slot(slot(key)),
         }
     }
 
     /// The server, or the cluster seed whose credentials and TLS every node gets.
     fn first(&self) -> &Seed {
-        match &self.topology {
-            Topology::Standalone(first) | Topology::Cluster { first, .. } => first,
+        match &self.servers {
+            RedisServers::Standalone(first) | RedisServers::Cluster { first, .. } => first,
         }
     }
 
     /// The server, or each seed of the cluster, with the first one first.
     fn seeds(&self) -> impl Iterator<Item = &Seed> {
-        self.topology.servers()
+        self.servers.iter()
     }
 
     /// Opens a connection for short calls, which the client reconnects when it drops.
@@ -102,8 +102,8 @@ impl Endpoint {
     /// Opens a connection for short calls. A cluster client also gets the `live` nodes as seeds,
     /// since after a failover every configured seed can be down.
     async fn open_with(&self, live: &[Node]) -> RedisResult<SharedConnection> {
-        match &self.topology {
-            Topology::Cluster { first, .. } => {
+        match &self.servers {
+            RedisServers::Cluster { first, .. } => {
                 let live = live.iter().map(|node| node.info(&first.info));
                 let seeds = self.seeds().map(|seed| seed.info.clone()).chain(live);
                 let client = ClusterClient::builder(seeds)
@@ -113,7 +113,7 @@ impl Endpoint {
                     client.get_async_connection().await?,
                 ))
             }
-            Topology::Standalone(server) => {
+            RedisServers::Standalone(server) => {
                 let client = Client::open(server.info.clone())?;
                 let config = ConnectionManagerConfig::new()
                     .set_response_timeout(Some(self.response_timeout));
@@ -885,21 +885,21 @@ mod tests {
         RedisError::from(std::io::Error::new(kind, "test"))
     }
 
-    fn standalone_at(url: &str) -> Topology<Url> {
-        Topology::Standalone(url.parse().unwrap())
+    fn standalone_at(url: &str) -> RedisServers<Url> {
+        RedisServers::Standalone(url.parse().unwrap())
     }
 
-    fn cluster_at(url: &str) -> Topology<Url> {
-        Topology::Cluster {
+    fn cluster_at(url: &str) -> RedisServers<Url> {
+        RedisServers::Cluster {
             first: url.parse().unwrap(),
             rest: Vec::new(),
         }
     }
 
-    fn endpoint(topology: Topology<Url>) -> Arc<Endpoint> {
+    fn endpoint(servers: RedisServers<Url>) -> Arc<Endpoint> {
         let options = RedisStoreOptions {
             response_timeout: Duration::from_secs(1),
-            ..RedisStoreOptions::from(topology)
+            ..RedisStoreOptions::from(servers)
         };
         Arc::new(Endpoint::try_from(&options).unwrap())
     }

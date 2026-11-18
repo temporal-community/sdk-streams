@@ -17,7 +17,7 @@ use temporalio_streams::{
     store::{Batch, Create, Store},
 };
 use temporalio_streams_redis::{
-    RedisStore, RedisStoreError, RedisStoreOptions, Topology, WaitOptions,
+    RedisServers, RedisStore, RedisStoreError, RedisStoreOptions, WaitOptions,
     testing::{SlotNode, SlotRange, cluster_url, documented_commands, standalone_url},
 };
 
@@ -377,7 +377,7 @@ async fn the_documented_commands_serve_a_cluster_while_a_slot_moves() {
         let _: () = cmd.query_async(&mut cluster).await.unwrap();
     }
     let connect = |name: &str| {
-        let mut options = RedisStoreOptions::from(Topology::Cluster {
+        let mut options = RedisStoreOptions::from(RedisServers::Cluster {
             first: login(&url, name).parse().unwrap(),
             rest: Vec::new(),
         });

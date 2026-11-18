@@ -9,7 +9,7 @@ use temporalio_streams::{
     store::{Batch, Create, CreateOutcome, Store},
 };
 use temporalio_streams_redis::{
-    RedisStore, RedisStoreOptions, Topology, Url, WaitOptions,
+    RedisServers, RedisStore, RedisStoreOptions, Url, WaitOptions,
     testing::{SlotRange, cluster_url, standalone_url},
 };
 
@@ -23,8 +23,8 @@ static SERVER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 const SHORT: Duration = Duration::from_millis(50);
 const LONG: Duration = Duration::from_secs(5);
 
-async fn store(topology: &Topology<Url>, wait: Option<WaitOptions>) -> RedisStore {
-    let mut options = RedisStoreOptions::from(topology.clone());
+async fn store(servers: &RedisServers<Url>, wait: Option<WaitOptions>) -> RedisStore {
+    let mut options = RedisStoreOptions::from(servers.clone());
     options.key_prefix = PREFIX.parse().unwrap();
     options.response_timeout = 2 * LONG;
     options.wait = wait;
@@ -39,8 +39,8 @@ fn wait_for(replicas: usize, timeout: Duration) -> Option<WaitOptions> {
     })
 }
 
-fn cluster_at(url: &str) -> Topology<Url> {
-    Topology::Cluster {
+fn cluster_at(url: &str) -> RedisServers<Url> {
+    RedisServers::Cluster {
         first: url.parse().unwrap(),
         rest: Vec::new(),
     }
@@ -152,7 +152,7 @@ fn client() -> Producer {
 #[ignore = "needs Redis"]
 async fn a_write_that_too_few_replicas_have_fails_and_its_retry_finds_it() {
     let _lock = SERVER.lock().await;
-    too_few_replicas(Topology::Standalone(standalone_url().parse().unwrap())).await;
+    too_few_replicas(RedisServers::Standalone(standalone_url().parse().unwrap())).await;
 }
 
 #[tokio::test]
@@ -162,7 +162,7 @@ async fn a_write_that_too_few_replicas_have_fails_on_a_redis_cluster() {
     too_few_replicas(cluster_at(&cluster_url())).await;
 }
 
-async fn too_few_replicas(topology: Topology<Url>) {
+async fn too_few_replicas(servers: RedisServers<Url>) {
     // A key holds no namespace, so each run takes Stream ids of its own.
     let stream_ref = StreamRef {
         id: unique("s"),
@@ -180,17 +180,17 @@ async fn too_few_replicas(topology: Topology<Url>) {
         }
     };
     // No test server has this many replicas.
-    let waits = store(&topology, wait_for(16, SHORT)).await;
+    let waits = store(&servers, wait_for(16, SHORT)).await;
     // So the write reloads its script between the script call and its `WAIT`.
     let flush = redis::cmd("SCRIPT").arg("FLUSH").clone();
-    match &topology {
-        Topology::Cluster { .. } => {
+    match &servers {
+        RedisServers::Cluster { .. } => {
             let client =
-                redis::cluster::ClusterClient::new(topology.servers().map(Url::as_str)).unwrap();
+                redis::cluster::ClusterClient::new(servers.iter().map(Url::as_str)).unwrap();
             let mut conn = client.get_async_connection().await.unwrap();
             let _: () = flush.query_async(&mut conn).await.unwrap();
         }
-        Topology::Standalone(url) => {
+        RedisServers::Standalone(url) => {
             let _: () = flush
                 .query_async(&mut admin(url.as_str()).await)
                 .await
@@ -199,15 +199,15 @@ async fn too_few_replicas(topology: Topology<Url>) {
     }
     let refused = create(&waits).await.unwrap_err();
     assert_eq!(refused.reason, Reason::StorageUnavailable, "{refused}");
-    let plain = store(&topology, None).await;
+    let plain = store(&servers, None).await;
     assert_eq!(
         create(&plain).await.unwrap().outcome,
         CreateOutcome::Created
     );
-    if let Topology::Standalone(url) = &topology {
+    if let RedisServers::Standalone(url) = &servers {
         let count = replicas(url.as_str()).await.len();
         assert!(count > 0, "the server at STREAMS_REDIS_URL needs a replica");
-        let enough = store(&topology, wait_for(count, LONG)).await;
+        let enough = store(&servers, wait_for(count, LONG)).await;
         assert_eq!(
             create(&enough).await.unwrap().outcome,
             CreateOutcome::Created
@@ -258,7 +258,7 @@ async fn a_call_that_finds_its_write_waits_for_the_replicas() {
         id: unique("s"),
         ..Default::default()
     };
-    let standalone = Topology::Standalone(url.parse().unwrap());
+    let standalone = RedisServers::Standalone(url.parse().unwrap());
     let plain = store(&standalone, None).await;
     // A Store per call, since a call's own write puts its connection's offset past the replica's.
     let mut waits = vec![];
@@ -319,7 +319,7 @@ async fn writes_wait_for_their_replicas_at_once() {
     let waits = RedisStore::connect(options).await.unwrap();
     let run = unique("run");
     // A write that finds no script runs its `WAIT` twice, so load the script first.
-    store(&Topology::Standalone(url.parse().unwrap()), None)
+    store(&RedisServers::Standalone(url.parse().unwrap()), None)
         .await
         .create(
             &StreamRef {

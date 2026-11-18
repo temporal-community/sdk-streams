@@ -11,7 +11,7 @@ use url::Url;
 /// Where the Store's Redis is. Each server is a `redis://` or `rediss://` URL, which also sets the
 /// credentials and TLS.
 #[derive(Clone, PartialEq, Eq)]
-pub enum Topology<T = String> {
+pub enum RedisServers<T = String> {
     /// One server.
     Standalone(T),
     /// The seeds of a Redis Cluster. Every node gets the credentials and TLS of the first one.
@@ -23,24 +23,24 @@ pub enum Topology<T = String> {
     },
 }
 
-impl<T> Topology<T> {
+impl<T> RedisServers<T> {
     /// The server, or each seed with the first one first.
-    pub fn servers(&self) -> impl Iterator<Item = &T> {
+    pub fn iter(&self) -> impl Iterator<Item = &T> {
         let (first, rest) = match self {
-            Topology::Standalone(first) => (first, &[][..]),
-            Topology::Cluster { first, rest } => (first, rest.as_slice()),
+            RedisServers::Standalone(first) => (first, &[][..]),
+            RedisServers::Cluster { first, rest } => (first, rest.as_slice()),
         };
         std::iter::once(first).chain(rest)
     }
 
-    /// The same topology with `f` applied to each server, or the first error.
+    /// The same servers with `f` applied to each server, or the first error.
     pub(crate) fn try_map<U, E>(
         &self,
         mut f: impl FnMut(&T) -> Result<U, E>,
-    ) -> Result<Topology<U>, E> {
+    ) -> Result<RedisServers<U>, E> {
         Ok(match self {
-            Topology::Standalone(server) => Topology::Standalone(f(server)?),
-            Topology::Cluster { first, rest } => Topology::Cluster {
+            RedisServers::Standalone(server) => RedisServers::Standalone(f(server)?),
+            RedisServers::Cluster { first, rest } => RedisServers::Cluster {
                 first: f(first)?,
                 rest: rest.iter().map(&mut f).collect::<Result<_, _>>()?,
             },
@@ -49,11 +49,11 @@ impl<T> Topology<T> {
 }
 
 // The URLs can hold a password, so the debug form shows them with no user info.
-impl std::fmt::Debug for Topology<Url> {
+impl std::fmt::Debug for RedisServers<Url> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.try_map(|url| Ok::<_, std::convert::Infallible>(redacted(url))) {
-            Ok(Topology::Standalone(url)) => f.debug_tuple("Standalone").field(&url).finish(),
-            Ok(Topology::Cluster { first, rest }) => f
+            Ok(RedisServers::Standalone(url)) => f.debug_tuple("Standalone").field(&url).finish(),
+            Ok(RedisServers::Cluster { first, rest }) => f
                 .debug_struct("Cluster")
                 .field("first", &first)
                 .field("rest", &rest)
@@ -68,7 +68,7 @@ impl std::fmt::Debug for Topology<Url> {
 #[non_exhaustive]
 pub struct RedisStoreOptions {
     /// Where the Redis is.
-    pub topology: Topology<Url>,
+    pub servers: RedisServers<Url>,
     /// The prefix of every key.
     pub key_prefix: KeyPrefix,
     /// The Retention of a Stream whose create sets none.
@@ -93,7 +93,7 @@ impl RedisStoreOptions {
     /// The defaults for one Redis at `url`. The URL is parsed now, so a wrong URL fails here, not
     /// at connect time.
     pub fn new(url: impl AsRef<str>) -> RedisStoreResult<Self> {
-        Ok(Topology::Standalone(parse_url(url.as_ref())?).into())
+        Ok(RedisServers::Standalone(parse_url(url.as_ref())?).into())
     }
 }
 
@@ -103,11 +103,11 @@ pub(crate) fn parse_url(url: &str) -> RedisStoreResult<Url> {
         .map_err(|error| RedisStoreError::invalid(format!("The Redis URL is wrong. {error}")))
 }
 
-/// The defaults for the Redis at `topology`.
-impl From<Topology<Url>> for RedisStoreOptions {
-    fn from(topology: Topology<Url>) -> Self {
+/// The defaults for the Redis at `servers`.
+impl From<RedisServers<Url>> for RedisStoreOptions {
+    fn from(servers: RedisServers<Url>) -> Self {
         Self {
-            topology,
+            servers,
             key_prefix: KeyPrefix::default(),
             retention: DEFAULT_RETENTION,
             producer_idle_ttl: None,

@@ -1,7 +1,7 @@
 //! The Stream runtime on Redis.
 
 use crate::{
-    KeyPrefix, RedisStore, RedisStoreError, RedisStoreOptions, RedisStoreResult, Topology,
+    KeyPrefix, RedisServers, RedisStore, RedisStoreError, RedisStoreOptions, RedisStoreResult,
     WaitOptions, proto::RedisStreamConfig,
 };
 use prost::Message;
@@ -32,14 +32,14 @@ impl TryFrom<RedisStreamConfig> for RuntimeOptions {
             .next()
             .ok_or_else(|| RedisStoreError::invalid("The Redis Stream Store needs a URL"))?;
         let first = crate::options::parse_url(&first)?;
-        let topology = match (config.cluster, urls.len()) {
-            (true, _) => Topology::Cluster {
+        let servers = match (config.cluster, urls.len()) {
+            (true, _) => RedisServers::Cluster {
                 first,
                 rest: urls
                     .map(|url| crate::options::parse_url(&url))
                     .collect::<RedisStoreResult<_>>()?,
             },
-            (false, 0) => Topology::Standalone(first),
+            (false, 0) => RedisServers::Standalone(first),
             // A standalone Store connects to one server, so the other URLs would have no effect.
             (false, _) => {
                 return Err(RedisStoreError::invalid(
@@ -47,7 +47,7 @@ impl TryFrom<RedisStreamConfig> for RuntimeOptions {
                 ));
             }
         };
-        let defaults = RedisStoreOptions::from(topology);
+        let defaults = RedisStoreOptions::from(servers);
         // A bad timeout is refused even with no replicas, since the config is wrong either way.
         let wait_timeout = duration("wait_timeout", config.wait_timeout)?;
         let wait = count("wait_replicas", config.wait_replicas)?.map(|replicas| WaitOptions {

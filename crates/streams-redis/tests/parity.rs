@@ -27,7 +27,7 @@ use temporalio_streams::{
     store::{Batch, ConflictPolicy, Create, CreateOutcome, Entry, Store},
 };
 use temporalio_streams_redis::{
-    RedisStore, RedisStoreOptions, Topology, Url, WaitOptions,
+    RedisServers, RedisStore, RedisStoreOptions, Url, WaitOptions,
     testing::{cluster_url, standalone_url},
 };
 
@@ -45,7 +45,7 @@ const TEXTS: [&str; 5] = ["a", "b", "c", "dd", "eee"];
 #[ignore = "needs Redis"]
 async fn the_redis_store_answers_as_the_memory_store_on_redis() {
     let mut options =
-        RedisStoreOptions::from(Topology::Standalone(standalone_url().parse().unwrap()));
+        RedisStoreOptions::from(RedisServers::Standalone(standalone_url().parse().unwrap()));
     // The `WAIT` pipeline has its own path for script loads and errors.
     options.wait = Some(WaitOptions {
         replicas: std::num::NonZeroUsize::MIN,
@@ -58,7 +58,7 @@ async fn the_redis_store_answers_as_the_memory_store_on_redis() {
 #[tokio::test]
 #[ignore = "needs a Redis cluster"]
 async fn the_redis_store_answers_as_the_memory_store_on_a_redis_cluster() {
-    run(RedisStoreOptions::from(Topology::Cluster {
+    run(RedisStoreOptions::from(RedisServers::Cluster {
         first: cluster_url().parse().unwrap(),
         rest: Vec::new(),
     }))
@@ -69,7 +69,7 @@ async fn run(mut options: RedisStoreOptions) {
     options.key_prefix = PREFIX.parse().unwrap();
     options.retention = RETENTION;
     options.producer_idle_ttl = Some(RETENTION);
-    let raw = Raw::open(&options.topology).await;
+    let raw = Raw::open(&options.servers).await;
     let redis = Arc::new(RedisStore::connect(options).await.unwrap());
     let seeds: Vec<u64> = match std::env::var("STREAMS_PARITY_SEED") {
         Ok(seed) => vec![seed.parse().unwrap()],
@@ -596,14 +596,14 @@ enum Raw {
 }
 
 impl Raw {
-    async fn open(topology: &Topology<Url>) -> Self {
-        match topology {
-            Topology::Standalone(url) => {
+    async fn open(servers: &RedisServers<Url>) -> Self {
+        match servers {
+            RedisServers::Standalone(url) => {
                 let client = redis::Client::open(url.as_str()).unwrap();
                 Raw::Standalone(client.get_connection_manager().await.unwrap())
             }
-            Topology::Cluster { .. } => {
-                let seeds = topology.servers().map(Url::as_str);
+            RedisServers::Cluster { .. } => {
+                let seeds = servers.iter().map(Url::as_str);
                 let client = redis::cluster::ClusterClient::new(seeds).unwrap();
                 Raw::Cluster(client.get_async_connection().await.unwrap())
             }
