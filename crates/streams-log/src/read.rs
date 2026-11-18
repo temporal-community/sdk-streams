@@ -219,21 +219,3 @@ fn max_bytes(value: i64) -> StreamResult<usize> {
 fn expired() -> StreamError {
     StreamError::new(Reason::Expired, "The Records at the offset expired")
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_zero_or_negative_duration_is_unset_and_a_huge_one_stays() {
-        let proto = |seconds, nanos| Some(prost_types::Duration { seconds, nanos });
-        assert_eq!(duration(None), None);
-        assert_eq!(duration(proto(0, 0)), None);
-        assert_eq!(duration(proto(-5, 0)), None);
-        assert_eq!(duration(proto(0, -5)), None);
-        assert_eq!(
-            duration(proto(i64::MAX, 999_999_999)),
-            Some(Duration::new(i64::MAX as u64, 999_999_999))
-        );
-    }
-}

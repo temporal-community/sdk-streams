@@ -20,7 +20,7 @@ pub mod producer_field;
 mod read;
 mod runtime;
 pub mod store;
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(feature = "test-support")]
 pub mod testing;
 
 pub use runtime::stream_runtime;

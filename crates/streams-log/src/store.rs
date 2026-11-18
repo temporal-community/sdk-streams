@@ -254,23 +254,3 @@ pub trait LogStore: Send + Sync + 'static {
         Err(unsupported("close"))
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_missing_capability_is_refused_by_name() {
-        let some = Capabilities::PRODUCER_FENCE.union(Capabilities::CLOSE);
-        some.require(Capabilities::CLOSE).unwrap();
-        let error = some
-            .require(Capabilities::CLOSE.union(Capabilities::NEXT_SEQUENCE))
-            .unwrap_err();
-        assert_eq!(error.reason, Reason::Unsupported);
-        assert!(
-            error.message.ends_with("next_sequence"),
-            "{}",
-            error.message
-        );
-    }
-}

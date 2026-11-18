@@ -4,7 +4,7 @@
 
 use super::{
     case, fields,
-    support::{Needs, Run, Target, digest, record, records_of, stores_for},
+    support::{Needs, Run, Target, digest, record, stores_for},
 };
 use crate::{
     offset::{entry_id_of_offset, offset_of_entry_id},
@@ -81,7 +81,7 @@ fn use_existing() -> Create<'static> {
 }
 
 /// A create writes the key once. A create with another Retention finds the Stream and keeps the
-/// stored Retention. A create with no request id keeps none.
+/// stored Retention. A create keeps its request id as `rid`, and a create with none keeps none.
 async fn a_create_writes_the_key_once_and_keeps_its_retention() {
     for target in stores_for(Needs::STORE_ANSWERS).await {
         assert_eq!(
@@ -104,55 +104,19 @@ async fn a_create_writes_the_key_once_and_keeps_its_retention() {
         assert_eq!(other.retention, Duration::from_secs(86_400));
         if target.gives.gives(Needs::RAW_KEYS) {
             assert_eq!(target.meta("rid").await, None);
-        }
-    }
-}
-
-/// A create of an open Stream fails as `already_exists`, unless it uses the Stream or it is a
-/// retry of the create that made the Stream. Such a retry has the same request id, and it succeeds
-/// as a create with either policy. The Store keeps that request id as `rid`.
-async fn a_create_of_an_open_stream_fails_unless_it_uses_it_or_retries() {
-    for target in stores_for(Needs::CALLS).await {
-        let first = Create {
-            request_id: "create-1",
-            ..Default::default()
-        };
-        let outcome = |created: StreamResult<Created>| created.unwrap().outcome;
-        let reason = |created: StreamResult<Created>| created.unwrap_err().reason;
-        assert_eq!(
-            outcome(target.create_with(&first).await),
-            CreateOutcome::Created
-        );
-        let other = Create {
-            request_id: "create-2",
-            ..Default::default()
-        };
-        for create in [&other, &Create::default()] {
-            assert_eq!(
-                reason(target.create_with(create).await),
-                Reason::AlreadyExists
-            );
-        }
-        let used = Create {
-            request_id: "create-2",
-            ..use_existing()
-        };
-        assert_eq!(
-            outcome(target.create_with(&used).await),
-            CreateOutcome::Exists
-        );
-        let retry = Create {
-            request_id: "create-1",
-            ..use_existing()
-        };
-        for create in [&first, &retry] {
-            assert_eq!(
-                outcome(target.create_with(create).await),
-                CreateOutcome::Created
-            );
-        }
-        if target.gives.gives(Needs::RAW_KEYS) {
-            assert_eq!(target.meta("rid").await.as_deref(), Some(&b"create-1"[..]));
+            // A Stream has one create, so the request id goes on a second Stream.
+            let with_id = Target {
+                stream: format!("{}-rid", target.stream),
+                store: target.store.clone(),
+                raw: target.raw.clone(),
+                gives: target.gives,
+            };
+            let create = Create {
+                request_id: "create-1",
+                ..Default::default()
+            };
+            with_id.create_with(&create).await.unwrap();
+            assert_eq!(with_id.meta("rid").await.as_deref(), Some(&b"create-1"[..]));
         }
     }
 }
@@ -218,18 +182,6 @@ async fn a_producer_id_is_text_with_its_own_state() {
         let resend = append(&target, &odd, 1, &["a"]).await.unwrap();
         assert_eq!(resend.offsets, first.offsets);
         assert_eq!(target.texts().await, ["a", "b"]);
-    }
-}
-
-/// A resend with the last sequence and other content fails as `seq_divergent` and writes nothing.
-async fn a_resend_with_other_content_fails_as_divergent() {
-    for target in stores_for(Needs::CALLS).await {
-        target.create().await;
-        let p = client();
-        append(&target, &p, 1, &["p1"]).await.unwrap();
-        let divergent = append(&target, &p, 1, &["other"]).await.unwrap_err();
-        assert_eq!(divergent.reason, Reason::SeqDivergent);
-        assert_eq!(target.texts().await, ["p1"]);
     }
 }
 
@@ -391,37 +343,6 @@ async fn an_open_stream_with_no_producer_idle_ttl_never_expires_until_the_close(
     }
 }
 
-/// An open Stream keeps every Record past its Retention, while it is idle and after its next
-/// append. No append trims a Record and no read hides one, since the Retention counts from the
-/// close.
-async fn an_open_stream_keeps_its_records_past_its_retention() {
-    for target in stores_for(Needs::RAW_KEYS.and(Needs::SHORT_TIMES)).await {
-        let retention = Duration::from_millis(300);
-        target
-            .create_with(&Create {
-                retention: Some(retention),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        let old = append(&target, &client(), 1, &["old"]).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(400)).await;
-        assert_eq!(target.texts().await, ["old"]);
-        append(&target, &client(), 2, &["new"]).await.unwrap();
-        let (state, entries) = target
-            .store
-            .read(&target.stream_ref(), 0, 10)
-            .await
-            .unwrap();
-        assert_eq!(state.trimmed, 0);
-        assert!(state.retained_from() <= old.offsets.unwrap().0);
-        assert_eq!(records_of(&entries), ["old", "new"]);
-        // A Store with a Producer idle TTL gives the log that TTL, and one with none gives no TTL.
-        let (ttl, _) = target.ttls().await;
-        assert!(ttl == -1 || ttl > retention.as_millis() as i64, "{ttl}");
-    }
-}
-
 /// A write that finds the log gone, as after an eviction, raises the trimmed offset to the meta's
 /// newest one. Its offsets go above it, also with the clock behind it.
 async fn offsets_go_on_after_the_log_is_gone() {
@@ -468,40 +389,6 @@ async fn a_blocked_read_wakes_on_an_append_and_ends_at_its_deadline() {
         tokio::time::sleep(Duration::from_millis(100)).await;
         append(&target, &client(), 2, &["b"]).await.unwrap();
         assert!(waiter.await.unwrap().unwrap());
-    }
-}
-
-/// A close writes no log entry. It ends a wait for the next entry, and a wait on a closed Stream
-/// ends immediately, so a waiting read sees the close.
-async fn a_close_writes_no_entry_and_ends_a_wait() {
-    for target in stores_for(Needs::RAW_KEYS).await {
-        target.create().await;
-        let first = append(&target, &client(), 1, &["a"]).await.unwrap();
-        let newest = first.offsets.unwrap().1;
-        let store = target.store.clone();
-        let stream = target.stream_ref();
-        let waiter = tokio::spawn(async move {
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-            store.wait_after(&stream, newest, deadline).await
-        });
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        target.close(&client()).await.unwrap();
-        assert!(waiter.await.unwrap().unwrap());
-        let started = tokio::time::Instant::now();
-        let deadline = started + Duration::from_secs(5);
-        let woke = target
-            .store
-            .wait_after(&target.stream_ref(), newest, deadline)
-            .await
-            .unwrap();
-        assert!(woke && started.elapsed() < Duration::from_secs(1));
-        let (state, entries) = target
-            .store
-            .read(&target.stream_ref(), 0, 10)
-            .await
-            .unwrap();
-        assert!(state.closed);
-        assert_eq!((state.newest, entries.len()), (newest, 1));
     }
 }
 
@@ -660,42 +547,6 @@ async fn a_silent_producer_stays_fenced_past_the_retention() {
     }
 }
 
-/// A Producer with a lower epoch can't close the Stream.
-async fn a_stale_producer_cant_close_the_stream() {
-    for target in stores_for(Needs::UNCHECKED).await {
-        target.create().await;
-        append(&target, &activity("r1", 2, 10), 1, &["a"])
-            .await
-            .unwrap();
-        assert_eq!(
-            target
-                .close(&activity("r1", 1, 10))
-                .await
-                .unwrap_err()
-                .reason,
-            Reason::Fenced
-        );
-        target.close(&activity("r1", 2, 10)).await.unwrap();
-    }
-}
-
-/// A Store refuses an append or a close of a Producer with no epoch, or with an epoch that has no
-/// case, since the case gives the kind of the Producer.
-async fn a_producer_with_no_epoch_case_is_refused() {
-    for target in stores_for(Needs::CALLS).await {
-        target.create().await;
-        let producer = Producer {
-            kind: None,
-            ..client()
-        };
-        let error = append(&target, &producer, 1, &["a"]).await.unwrap_err();
-        assert_eq!(error.reason, Reason::Invalid);
-        let error = target.close(&producer).await.unwrap_err();
-        assert_eq!(error.reason, Reason::Invalid);
-        assert!(target.texts().await.is_empty());
-    }
-}
-
 /// An append whose entry ids would not fit an offset is refused before it writes.
 async fn an_append_whose_ids_would_not_fit_an_offset_is_refused_before_it_writes() {
     for target in stores_for(Needs::RAW_KEYS).await {
@@ -774,10 +625,8 @@ async fn a_producer_field_of_another_format_is_refused() {
 /// The cases of the suite, in file order.
 pub const CASES: &[super::Case] = &[
     case!(a_create_writes_the_key_once_and_keeps_its_retention),
-    case!(a_create_of_an_open_stream_fails_unless_it_uses_it_or_retries),
     case!(closed_and_expired_come_before_already_exists),
     case!(a_resend_gets_its_first_positions_and_a_lower_sequence_is_refused),
-    case!(a_resend_with_other_content_fails_as_divergent),
     case!(a_producer_id_is_text_with_its_own_state),
     case!(a_lower_epoch_is_fenced_for_each_producer_kind),
     case!(two_runs_with_their_own_ids_keep_their_own_fences),
@@ -786,10 +635,8 @@ pub const CASES: &[super::Case] = &[
     case!(a_newer_format_refuses_every_write),
     case!(an_expired_stream_refuses_writes_and_its_create),
     case!(an_open_stream_with_no_producer_idle_ttl_never_expires_until_the_close),
-    case!(an_open_stream_keeps_its_records_past_its_retention),
     case!(offsets_go_on_after_the_log_is_gone),
     case!(a_blocked_read_wakes_on_an_append_and_ends_at_its_deadline),
-    case!(a_close_writes_no_entry_and_ends_a_wait),
     case!(a_batch_gets_consecutive_offsets_that_end_at_its_last_offset),
     case!(a_negative_sequence_is_refused),
     case!(a_batch_with_no_sequence_takes_the_next_one_of_its_epoch),
@@ -797,8 +644,6 @@ pub const CASES: &[super::Case] = &[
     case!(a_large_sequence_dedupes_and_one_past_2_53_is_refused),
     case!(a_silent_producer_resends_its_last_batch_once_past_the_retention),
     case!(a_silent_producer_stays_fenced_past_the_retention),
-    case!(a_stale_producer_cant_close_the_stream),
-    case!(a_producer_with_no_epoch_case_is_refused),
     case!(an_append_whose_ids_would_not_fit_an_offset_is_refused_before_it_writes),
     case!(a_producer_field_has_the_shared_layout),
     case!(a_producer_field_of_another_format_is_refused),

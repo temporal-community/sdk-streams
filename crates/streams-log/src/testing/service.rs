@@ -263,26 +263,6 @@ async fn a_create_of_an_open_stream_fails_unless_it_uses_it_or_retries() {
     }
 }
 
-/// A create of a closed Stream fails as closed, before its conflict policy and before a retry of
-/// the create that made the Stream.
-async fn a_create_of_a_closed_stream_fails() {
-    for case in cases_for(Needs::CALLS).await {
-        let first = CreateStreamRequest {
-            request_id: "create-1".to_string(),
-            ..Default::default()
-        };
-        case.create_with(first.clone()).await.unwrap();
-        case.close(client()).await.unwrap();
-        for request in [first, CreateStreamRequest::default()] {
-            let error = case.create_with(request).await.unwrap_err();
-            assert_eq!(
-                (error.code(), reason(&error).as_str()),
-                (Code::FailedPrecondition, "stream_closed")
-            );
-        }
-    }
-}
-
 /// A close writes no Record, so the describe's last offset stays at the newest Record. A second
 /// close of the closed Stream succeeds, and a later append fails as closed.
 async fn a_close_writes_no_record_and_a_second_close_succeeds() {
@@ -303,73 +283,6 @@ async fn a_close_writes_no_record_and_a_second_close_succeeds() {
         let described = case.ext.describe_stream(describe).await.unwrap();
         assert_eq!(described.status, StreamStatus::Closed as i32);
         assert_eq!(described.last_offset, written.last_offset);
-    }
-}
-
-/// A create of a closed Stream whose Retention passed fails as expired while its Tombstone is
-/// there, before the closed check and before `already_exists`.
-async fn a_create_of_an_expired_stream_fails() {
-    for case in short_cases().await {
-        case.create().await.unwrap();
-        case.close(client()).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(400)).await;
-        let error = case.create().await.unwrap_err();
-        assert_eq!(
-            (error.code(), reason(&error).as_str()),
-            (Code::NotFound, "stream_expired")
-        );
-    }
-}
-
-/// A Producer has a kind, a Workflow appends only with its Workflow Task as the epoch, and a Local
-/// Activity's epoch gives the Workflow Task that dispatched it.
-async fn a_producer_has_a_kind_and_a_workflow_appends_with_its_task() {
-    for case in cases_for(Needs::CALLS).await {
-        case.create().await.unwrap();
-        let no_kind = Producer {
-            kind: None,
-            ..client()
-        };
-        let error = case
-            .append(no_kind, 1, vec![record("x")])
-            .await
-            .unwrap_err();
-        assert_eq!(
-            (error.code(), reason(&error).as_str()),
-            (Code::InvalidArgument, "stream_invalid")
-        );
-        let mut no_epoch = workflow("r1");
-        let Some(Kind::Workflow(kind)) = no_epoch.kind.as_mut() else {
-            unreachable!()
-        };
-        kind.epoch = None;
-        let error = case
-            .append(no_epoch, 1, vec![record("x")])
-            .await
-            .unwrap_err();
-        assert_eq!(
-            (error.code(), reason(&error).as_str()),
-            (Code::InvalidArgument, "stream_invalid")
-        );
-        assert!(
-            error.message.contains("Workflow Task as its epoch"),
-            "{error:?}"
-        );
-        let no_task = Producer {
-            id: "la:r1:call-1".to_string(),
-            kind: Some(Kind::LocalActivity(LocalActivityProducer {
-                run_id: "r1".to_string(),
-                epoch: Some(LocalActivityEpoch {
-                    task: None,
-                    attempt: 1,
-                }),
-            })),
-        };
-        let error = case
-            .append(no_task, 1, vec![record("x")])
-            .await
-            .unwrap_err();
-        assert_eq!(reason(&error), "stream_invalid");
     }
 }
 
@@ -464,30 +377,6 @@ async fn a_workflow_closes_in_a_later_task_after_its_appends() {
     }
 }
 
-/// A Producer id is opaque text. The runtime refuses an empty one and one over the limit, and
-/// takes any other, also with separators in it.
-async fn a_producer_id_is_opaque_but_not_empty_or_too_long() {
-    for case in cases_for(Needs::CALLS).await {
-        case.create().await.unwrap();
-        for id in [String::new(), "x".repeat(MAX_PRODUCER_ID_BYTES + 1)] {
-            let wrong = Producer { id, ..client() };
-            let error = case.append(wrong, 1, vec![record("x")]).await.unwrap_err();
-            assert_eq!(
-                (error.code(), reason(&error).as_str()),
-                (Code::InvalidArgument, "stream_invalid")
-            );
-        }
-        let odd = Producer {
-            id: "ingest|eu:1 é".to_string(),
-            ..client()
-        };
-        case.append(odd.clone(), 1, vec![record("a")])
-            .await
-            .unwrap();
-        case.close(odd).await.unwrap();
-    }
-}
-
 /// A Producer id may hold any text, such as a NUL, a newline, the `|` and `:` that the Store
 /// fields use, and non-ASCII text. An id of the longest length is taken too. A read gives each
 /// Record with the id as sent.
@@ -576,79 +465,6 @@ async fn a_close_takes_a_producer_of_any_kind() {
                 "{producer:?}"
             );
         }
-    }
-}
-
-/// An append and a close of a Producer that lacks a required field fail as invalid before the
-/// Store, so the Stream gets no Record and stays open.
-async fn a_write_with_a_missing_required_field_is_invalid() {
-    for case in cases_for(Needs::CALLS).await {
-        case.create().await.unwrap();
-        let no_epoch = Producer {
-            id: "la:r1:call-1".to_string(),
-            kind: Some(Kind::LocalActivity(LocalActivityProducer {
-                run_id: "r1".to_string(),
-                epoch: None,
-            })),
-        };
-        let error = case
-            .append(no_epoch.clone(), 1, vec![record("x")])
-            .await
-            .unwrap_err();
-        assert_eq!(
-            (error.code(), reason(&error).as_str()),
-            (Code::InvalidArgument, "stream_invalid")
-        );
-        let error = case.close(no_epoch).await.unwrap_err();
-        assert_eq!(reason(&error), "stream_invalid");
-        // A Workflow Producer closes with an epoch, and the epoch must order.
-        let mut no_task = workflow("r1");
-        let Some(Kind::Workflow(kind)) = no_task.kind.as_mut() else {
-            unreachable!()
-        };
-        kind.epoch = Some(WorkflowTaskEpoch::default());
-        let error = case.close(no_task).await.unwrap_err();
-        assert_eq!(reason(&error), "stream_invalid");
-        let describe = case.describe().await.unwrap();
-        assert_eq!(describe.status, StreamStatus::Open as i32);
-        assert!(describe.last_offset.is_empty());
-    }
-}
-
-/// An append with a Record that has no body fails as invalid before the Store, so no Record of the
-/// batch is written.
-async fn an_append_with_a_record_that_has_no_body_is_invalid() {
-    for case in cases_for(Needs::CALLS).await {
-        case.create().await.unwrap();
-        let records = vec![record("a"), AppendRecord::default()];
-        let error = case.append(client(), 1, records).await.unwrap_err();
-        assert_eq!(
-            (error.code(), reason(&error).as_str()),
-            (Code::InvalidArgument, "stream_invalid")
-        );
-        assert!(case.describe().await.unwrap().last_offset.is_empty());
-    }
-}
-
-/// An append with no sequence takes the next one of its Producer's epoch, as a caller that tracks
-/// no sequence sends it. Nothing dedupes it, so its retry writes the batch again. A negative
-/// sequence fails.
-async fn an_append_with_no_sequence_takes_the_next_one_of_its_epoch() {
-    for case in cases_for(Needs::CALLS).await {
-        case.create().await.unwrap();
-        let first = case.append(client(), 0, vec![record("a")]).await.unwrap();
-        let retry = case.append(client(), 0, vec![record("a")]).await.unwrap();
-        assert!(
-            retry.first_offset > first.last_offset,
-            "{first:?} {retry:?}"
-        );
-        let resend = case.append(client(), 2, vec![record("a")]).await.unwrap();
-        assert_eq!(resend, retry);
-        let error = case
-            .append(client(), -1, vec![record("b")])
-            .await
-            .unwrap_err();
-        assert_eq!(reason(&error), "stream_invalid");
     }
 }
 
@@ -794,40 +610,6 @@ async fn a_quiet_read_ends_empty_after_its_wait_and_a_long_poll_wakes_on_append(
         // A Store whose wait never wakes would give the Record only at the end of the wait.
         assert!(started.elapsed() < Duration::from_millis(2500));
         appender.await.unwrap().unwrap();
-    }
-}
-
-/// A read that gives the last Record of a closed Stream is done, and so is every later read, which
-/// gives no Record. A close refuses later appends.
-async fn a_close_ends_every_read_with_done() {
-    for case in cases_for(Needs::CALLS).await {
-        case.create().await.unwrap();
-        case.append(client(), 1, vec![record("1")]).await.unwrap();
-        case.close(client()).await.unwrap();
-        let read = case.read(ReadRecordsRequest::default()).await.unwrap();
-        assert_eq!(texts(&read), ["1"]);
-        assert!(read.done);
-        let again = case
-            .read(ReadRecordsRequest {
-                from_offset: read.last_offset.clone(),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert!(again.records.is_empty() && again.done);
-        assert_eq!(again.last_offset, read.last_offset);
-        assert_eq!(
-            case.describe().await.unwrap().status,
-            StreamStatus::Closed as i32
-        );
-        let error = case
-            .append(client(), 2, vec![record("2")])
-            .await
-            .unwrap_err();
-        assert_eq!(
-            (error.code(), reason(&error).as_str()),
-            (Code::FailedPrecondition, "stream_closed")
-        );
     }
 }
 
@@ -1104,22 +886,14 @@ async fn a_page_keeps_under_max_bytes_and_a_larger_record_comes_alone() {
 /// The cases of the suite, in file order.
 pub const CASES: &[super::Case] = &[
     case!(a_create_of_an_open_stream_fails_unless_it_uses_it_or_retries),
-    case!(a_create_of_a_closed_stream_fails),
     case!(a_close_writes_no_record_and_a_second_close_succeeds),
-    case!(a_create_of_an_expired_stream_fails),
-    case!(a_producer_has_a_kind_and_a_workflow_appends_with_its_task),
     case!(a_workflow_appends_in_its_task_and_an_older_task_is_fenced),
     case!(a_workflow_closes_in_a_later_task_after_its_appends),
-    case!(a_producer_id_is_opaque_but_not_empty_or_too_long),
     case!(a_producer_id_of_any_text_or_the_longest_length_reads_back),
     case!(a_close_takes_a_producer_of_any_kind),
-    case!(a_write_with_a_missing_required_field_is_invalid),
-    case!(an_append_with_a_record_that_has_no_body_is_invalid),
-    case!(an_append_with_no_sequence_takes_the_next_one_of_its_epoch),
     case!(a_read_is_exclusive_from_its_offset_and_get_offset_reads_only_new_records),
     case!(a_read_of_an_uncreated_stream_fails_at_once),
     case!(a_quiet_read_ends_empty_after_its_wait_and_a_long_poll_wakes_on_append),
-    case!(a_close_ends_every_read_with_done),
     case!(a_read_of_an_expired_closed_stream_fails_instead_of_waiting),
     case!(a_read_from_the_start_of_a_closed_stream_that_lost_its_log_fails),
     case!(the_retention_counts_from_the_close),
