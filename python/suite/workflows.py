@@ -1,18 +1,11 @@
 import uuid
 from datetime import timedelta
+from typing import Any
 
-from helpers import (
-    needs_redis,
-    new_store,
-    new_stream,
-    new_worker,
-    sandbox_runner,
-    stream_error,
-    with_store,
-)
 from temporalio import activity, workflow
 from temporalio.api.enums.v1 import StreamErrorReason
-from temporalio.client import Client
+from temporalio.client import Client, WorkflowHandle
+from temporalio.exceptions import StreamError
 from temporalio.nexus.system.stream_service import (
     ProducerKindLocalActivity,
     ProducerKindWorkflow,
@@ -23,7 +16,14 @@ from temporalio.nexus.system.stream_service import (
 from temporalio.nexus.system.stream_service.workflow import create_stream
 from temporalio.worker import Replayer
 
-pytestmark = needs_redis
+from suite.helpers import (
+    NewStore,
+    filled_stream,
+    new_stream,
+    new_worker,
+    stream_error,
+    with_store,
+)
 
 
 @activity.defn
@@ -72,7 +72,7 @@ class RunActivityWorkflow:
 
 
 async def test_workflow_local_activity_appends_with_local_activity_producer(
-    client: Client,
+    client: Client, new_store: NewStore
 ):
     stream_client = with_store(client, new_store())
     async with new_worker(
@@ -96,7 +96,7 @@ async def test_workflow_local_activity_appends_with_local_activity_producer(
         assert record.producer.kind.value.run_id == run_id
 
 
-async def test_workflow_appends_and_closes(client: Client):
+async def test_workflow_appends_and_closes(client: Client, new_store: NewStore):
     stream_client = with_store(client, new_store())
     async with new_worker(stream_client, AppendAndCloseWorkflow) as worker:
         handle = await stream_client.start_workflow(
@@ -166,7 +166,7 @@ class ReadWhileActivityRunsWorkflow:
         return got
 
 
-async def test_workflow_read_of_an_activity_on_redis(client: Client):
+async def test_workflow_read_of_an_activity(client: Client, new_store: NewStore):
     stream_client = with_store(client, new_store())
     stream = await new_stream(stream_client)
     seen = await new_stream(stream_client)
@@ -180,15 +180,16 @@ async def test_workflow_read_of_an_activity_on_redis(client: Client):
             task_queue=worker.task_queue,
         )
         assert await handle.result() == ["a", "b", "c", "d", "done"]
-    # The default replay source keeps no Record in History, so the replay reads Redis.
+    # The default replay source keeps no Record in History, so the replay reads the Store.
     await Replayer(
         workflows=[ReadWhileActivityRunsWorkflow],
-        workflow_runner=sandbox_runner(),
         stream_config=stream_client.config()["stream_config"],
     ).replay_workflow(await handle.fetch_history())
 
 
-async def test_activity_appends_with_activity_producer(client: Client):
+async def test_activity_appends_with_activity_producer(
+    client: Client, new_store: NewStore
+):
     stream_client = with_store(client, new_store())
     stream = await new_stream(stream_client)
     async with new_worker(
@@ -207,3 +208,60 @@ async def test_activity_appends_with_activity_producer(client: Client):
     assert record.producer is not None
     assert isinstance(record.producer.kind, ProducerKindWorkflowActivity)
     assert record.producer.kind.value.run_id == handle.result_run_id
+
+
+async def _run(
+    client: Client, workflow_type: type[Any], *args: Any
+) -> tuple[WorkflowHandle[Any, Any], Any]:
+    async with new_worker(client, workflow_type) as worker:
+        handle: WorkflowHandle[Any, Any] = await client.start_workflow(
+            workflow_type.run,
+            args=list(args),
+            id=f"workflow-{uuid.uuid4()}",
+            task_queue=worker.task_queue,
+        )
+        return handle, await handle.result()
+
+
+# A client's read clamps each of these, or refuses it, and a Workflow read does the same.
+_READ_LIMIT_CASES: list[dict[str, Any]] = [
+    {"max_bytes": -1},
+    {"max_records": 0},
+    {"max_records": -1},
+    {"max_records": 5000},
+    {"wait": timedelta(seconds=-1)},
+    {"wait": timedelta(seconds=120)},
+]
+
+
+@workflow.defn
+class ReadLimitsWorkflow:
+    @workflow.run
+    async def run(self, ref: StreamRef[str]) -> list[Any]:
+        stream = workflow.get_stream(ref, body_type=str)
+        results: list[Any] = []
+        for arguments in _READ_LIMIT_CASES:
+            try:
+                page = await stream.read_page(**arguments)
+                results.append(len(page.records))
+            except StreamError as err:
+                results.append([StreamErrorReason.Name(err.reason), err.message])
+        return results
+
+
+async def test_read_takes_the_limits_of_a_client_read(
+    client: Client, new_store: NewStore
+):
+    stream_client = with_store(client, new_store())
+    ref = await filled_stream(stream_client, ["a", "b", "c"])
+    _, results = await _run(stream_client, ReadLimitsWorkflow, ref)
+    stream = stream_client.get_stream(ref, body_type=str)
+    expected: list[Any] = []
+    for arguments in _READ_LIMIT_CASES:
+        try:
+            page = await stream.read_page(**arguments)
+            expected.append(len(page.records))
+        except StreamError as err:
+            expected.append([StreamErrorReason.Name(err.reason), err.message])
+    assert results == expected
+    assert results[0] == ["STREAM_ERROR_REASON_INVALID", expected[0][1]]

@@ -5,13 +5,7 @@ from datetime import timedelta
 from typing import Any, Self
 
 import pytest
-from helpers import (
-    REDIS_URL,
-    assert_eventually,
-    needs_redis,
-    new_worker,
-    with_store,
-)
+from helpers import REDIS_URL, needs_redis
 from temporalio import workflow
 from temporalio.api.enums.v1 import EventType, StreamErrorReason
 from temporalio.client import (
@@ -23,7 +17,10 @@ from temporalio.client import (
 from temporalio.exceptions import StreamError, StreamReplayError
 from temporalio.nexus.system.stream_service import StreamRecord, StreamRef
 
-from temporalio_streams_redis import RedisStreamStore
+from suite.helpers import assert_eventually, filled_stream, new_worker, with_store
+
+with workflow.unsafe.imports_passed_through():
+    from temporalio_streams_redis import RedisStreamStore
 
 
 def _markers(history: WorkflowHistory) -> list[str]:
@@ -44,17 +41,6 @@ def _completed_tasks(history: WorkflowHistory) -> int:
 
 def _hex(value: bytes | None) -> str | None:
     return None if value is None else value.hex()
-
-
-async def _filled_stream(
-    client: Client, bodies: list[str], *, close: bool = True
-) -> StreamRef[str]:
-    stream = await client.create_stream(id=f"stream-{uuid.uuid4()}", body_type=str)
-    if bodies:
-        await stream.append(*bodies)
-    if close:
-        await stream.close()
-    return stream.ref
 
 
 async def _read_all(client: Client, ref: StreamRef[str]) -> list[StreamRecord[str]]:
@@ -209,7 +195,7 @@ async def test_append_during_a_short_outage_appends_once(client: Client):
     assert REDIS_URL
     async with _StoreOutage(REDIS_URL) as outage:
         stream_client = _redis_client(client, outage.url)
-        ref = await _filled_stream(stream_client, [], close=False)
+        ref = await filled_stream(stream_client, [], close=False)
         stream = stream_client.get_stream(ref, body_type=str)
         async with new_worker(
             stream_client, AppendWorkflow, max_cached_workflows=0
@@ -271,7 +257,7 @@ async def test_read_across_a_short_outage_gives_each_record_once(client: Client)
     assert REDIS_URL
     async with _StoreOutage(REDIS_URL) as outage:
         stream_client = _redis_client(client, outage.url)
-        ref = await _filled_stream(stream_client, ["a", "b", "c"], close=False)
+        ref = await filled_stream(stream_client, ["a", "b", "c"], close=False)
         stream = stream_client.get_stream(ref, body_type=str)
         async with new_worker(stream_client, ReadAcrossAnOutageWorkflow) as worker:
             handle = await stream_client.start_workflow(
@@ -315,7 +301,7 @@ async def test_replay_with_its_store_down_fails_only_the_task(
     )
     async with _StoreOutage(REDIS_URL) as outage:
         stream_client = _redis_client(client, outage.url)
-        ref = await _filled_stream(stream_client, ["a", "b"])
+        ref = await filled_stream(stream_client, ["a", "b"])
         task_queue = f"tq-{uuid.uuid4()}"
         # No cache, so the next Worker replays the History and reads the Store.
         async with new_worker(
