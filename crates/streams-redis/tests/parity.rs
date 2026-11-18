@@ -16,16 +16,18 @@ use std::{
 use temporalio_common::protos::temporal::api::common::v1::Payload;
 use temporalio_streams::{
     Reason, StreamResult,
-    digest::batch_digest,
-    ids::StreamKeys,
-    memory::MemoryStore,
     proto::{
         ActivityEpoch, ActivityProducer, AppendRecord, ClientProducer, LocalActivityEpoch,
         LocalActivityProducer, Producer, StreamRecord, StreamRef, WorkflowProducer,
         WorkflowTaskEpoch, producer::Kind,
     },
+};
+use temporalio_streams_log::{
+    digest::batch_digest,
+    ids::StreamKeys,
     store::{Batch, ConflictPolicy, Create, CreateOutcome, Entry, Store},
 };
+use temporalio_streams_memory::MemoryStore;
 use temporalio_streams_redis::{
     RedisServers, RedisStore, RedisStoreOptions, Url, WaitOptions,
     testing::{cluster_url, standalone_url},

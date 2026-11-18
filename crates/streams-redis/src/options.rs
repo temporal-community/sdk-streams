@@ -2,7 +2,7 @@
 
 use crate::{RedisStoreError, RedisStoreResult};
 use std::{num::NonZeroUsize, str::FromStr, time::Duration};
-use temporalio_streams::{
+use temporalio_streams_log::{
     ids::{DEFAULT_KEY_PREFIX, encode_part},
     store::DEFAULT_RETENTION,
 };

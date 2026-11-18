@@ -6,8 +6,8 @@ use std::{num::NonZeroUsize, time::Duration};
 use temporalio_streams::{
     Reason,
     proto::{ClientProducer, Producer, StreamRecord, StreamRef, producer::Kind},
-    store::{Batch, Create, CreateOutcome, Store},
 };
+use temporalio_streams_log::store::{Batch, Create, CreateOutcome, Store};
 use temporalio_streams_redis::{
     RedisServers, RedisStore, RedisStoreOptions, Url, WaitOptions,
     testing::{SlotRange, cluster_url, standalone_url},

@@ -7,9 +7,10 @@ use crate::{
 use prost::Message;
 use std::{num::NonZeroUsize, sync::Arc, time::Duration};
 use temporalio_common::telemetry::metrics::TemporalMeter;
-use temporalio_streams::{
-    StreamRuntime,
+use temporalio_streams::StreamRuntime;
+use temporalio_streams_log::{
     store::{Capabilities, LazyStore},
+    stream_runtime,
 };
 
 /// The options of a Stream runtime on Redis.
@@ -113,7 +114,7 @@ impl RedisStreamRuntime {
         let lazy = LazyStore::new(Capabilities::ALL, move || {
             RedisStore::connect(store.clone())
         });
-        StreamRuntime::new(options.store_name, Arc::new(lazy), meter)
+        stream_runtime(options.store_name, Arc::new(lazy), meter)
     }
 
     /// Builds the runtime from an encoded [RedisStreamConfig].

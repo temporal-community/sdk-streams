@@ -3,8 +3,8 @@
 
 use prost::Message;
 use std::{num::NonZeroUsize, sync::Arc, time::Duration};
-use temporalio_streams::{
-    StreamRuntime,
+use temporalio_streams::StreamRuntime;
+use temporalio_streams_log::{
     ids::StreamKeys,
     store::Store,
     testing::{Needs, RawKeys, RuntimeConfig, TestStore},

@@ -1,0 +1,35 @@
+[package]
+name = "temporalio-streams-memory"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88.0"
+authors = ["Temporal Technologies Inc. <sdk@temporal.io>"]
+license-file = { workspace = true }
+description = "The experimental memory Store of the Temporal Stream runtime, for tests"
+homepage = "https://temporal.io/"
+repository = "https://github.com/temporal-community/sdk-streams"
+keywords = ["temporal", "workflow", "streams"]
+categories = ["development-tools"]
+
+[features]
+# The memory Store in the shared suites, and the hooks that the suites use.
+test-support = ["temporalio-streams-log/test-support"]
+
+[dependencies]
+async-trait = "0.1"
+parking_lot = "0.12"
+temporalio-common = { workspace = true }
+temporalio-streams = { workspace = true }
+temporalio-streams-log = { workspace = true }
+tokio = { version = "1.47", default-features = false, features = ["sync", "time"] }
+
+[dev-dependencies]
+prost = { workspace = true }
+temporalio-streams-log = { workspace = true, features = ["test-support"] }
+# The tests need the hooks that the feature gates.
+temporalio-streams-memory = { path = ".", features = ["test-support"] }
+tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "time"] }
+tonic = { version = "0.14", default-features = false }
+
+[lints]
+workspace = true

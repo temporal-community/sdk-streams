@@ -19,9 +19,11 @@ use std::{num::NonZeroUsize, sync::Arc, time::Duration};
 use temporalio_streams::{
     StreamResult,
     epoch::{ProducerKind, epoch_key},
+    proto::{Producer, StreamRef},
+};
+use temporalio_streams_log::{
     ids::StreamKeys,
     offset::entry_id_of_offset,
-    proto::{Producer, StreamRef},
     store::{
         Appended, Batch, Capabilities, Closed, ConflictPolicy, Create, Created, Entry,
         FORMAT_VERSION, MAX_TTL, Store, StreamState, TOMBSTONE,

@@ -11,9 +11,11 @@ use std::{
 use temporalio_common::protos::temporal::api::common::v1::Payload;
 use temporalio_streams::{
     Reason,
+    proto::{AppendRecord, ClientProducer, Producer, StreamRecord, StreamRef, producer::Kind},
+};
+use temporalio_streams_log::{
     digest::batch_digest,
     ids::StreamKeys,
-    proto::{AppendRecord, ClientProducer, Producer, StreamRecord, StreamRef, producer::Kind},
     store::{Batch, Create, Store},
 };
 use temporalio_streams_redis::{
