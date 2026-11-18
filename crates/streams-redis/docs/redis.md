@@ -1,7 +1,8 @@
 # The Redis layout
 
 Every SDK that uses Streams on Redis must use this layout. The scripts in `lua/` are its canonical
-form, and the `testdata/` of `temporalio-streams-log` has its test vectors.
+form. The `testdata/` of `temporalio-streams-log` has its test vectors, and `temporalio-streams`
+has the vectors of the epoch key.
 
 ## Keys
 

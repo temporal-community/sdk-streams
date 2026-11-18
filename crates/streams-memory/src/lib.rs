@@ -8,7 +8,7 @@
 
 //! Experimental. A Stream Store that keeps its Streams in the memory of one process, for tests.
 //! It is a [LogStore](temporalio_streams_log::store::LogStore) of `temporalio-streams-log`. It
-//! keeps the key layout of the Redis Store and applies the same rules in the same order.
+//! keeps the meta fields of the Redis Store and applies the same rules in the same order.
 
 mod memory;
 mod runtime;

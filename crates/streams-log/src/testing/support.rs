@@ -30,14 +30,14 @@ pub struct Needs(u8);
 impl Needs {
     /// Only the Store's calls on the Stream and reads of its Records.
     pub const CALLS: Self = Self(0);
-    /// The Store's own results beyond the API. These are a create's stored Retention, `resend`,
-    /// `flagged`, and a close's offset and `already`.
+    /// The Store's own results beyond the API. These are a create's stored Retention, `resend` and
+    /// a close's `already`.
     pub const STORE_ANSWERS: Self = Self(1);
     /// The keys under the calls. These are the meta fields, TTLs and raw log entries, and the
     /// Store's log calls `read` and `wait_after`.
     pub const RAW_KEYS: Self = Self(1 << 1);
-    /// Producers and runs as sent. The server checks them against its executions, so a
-    /// case with made-up runs can't run there.
+    /// Producers and runs as sent. A Store that checks them against real executions can't run a
+    /// case with made-up runs.
     pub const UNCHECKED: Self = Self(1 << 2);
     /// A Retention of a few hundred ms.
     pub const SHORT_TIMES: Self = Self(1 << 3);
@@ -268,8 +268,7 @@ impl Target {
 /// One runtime under test, and the namespace its cases use.
 pub(crate) struct Runtime {
     pub(crate) ext: Arc<StreamRuntime>,
-    /// The namespace of a Store that has fixed ones, such as the server. `None` lets the case
-    /// make one of its own.
+    /// The namespace of a Store that has fixed ones. `None` lets the case make one of its own.
     pub(crate) namespace: Option<String>,
 }
 
