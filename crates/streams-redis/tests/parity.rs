@@ -16,16 +16,18 @@ use std::{
 use temporalio_common::protos::temporal::api::common::v1::Payload;
 use temporalio_streams::{
     Reason, StreamResult,
-    digest::batch_digest,
-    ids::StreamKeys,
-    memory::MemoryStore,
     proto::{
         ActivityEpoch, ActivityProducer, AppendRecord, ClientProducer, LocalActivityEpoch,
         LocalActivityProducer, Producer, StreamRecord, StreamRef, WorkflowProducer,
         WorkflowTaskEpoch, producer::Kind,
     },
-    store::{Batch, ConflictPolicy, Create, CreateOutcome, Entry, Store},
 };
+use temporalio_streams_log::{
+    digest::batch_digest,
+    ids::StreamKeys,
+    store::{Batch, ConflictPolicy, Create, CreateOutcome, Entry, Fence, LogStore},
+};
+use temporalio_streams_memory::MemoryStore;
 use temporalio_streams_redis::{
     RedisServers, RedisStore, RedisStoreOptions, Url, WaitOptions,
     testing::{cluster_url, standalone_url},
@@ -41,9 +43,7 @@ const MAX_SEQUENCE: i64 = (1 << 53) - 1;
 const STREAMS: [&str; 2] = ["s0", "s1"];
 const TEXTS: [&str; 5] = ["a", "b", "c", "dd", "eee"];
 
-#[tokio::test]
-#[ignore = "needs Redis"]
-async fn the_redis_store_answers_as_the_memory_store_on_redis() {
+fn standalone_options(fence: Fence) -> RedisStoreOptions {
     let mut options =
         RedisStoreOptions::from(RedisServers::Standalone(standalone_url().parse().unwrap()));
     // The `WAIT` pipeline has its own path for script loads and errors.
@@ -52,23 +52,49 @@ async fn the_redis_store_answers_as_the_memory_store_on_redis() {
         timeout: Duration::from_secs(5),
     });
     options.response_timeout = Duration::from_secs(10);
-    run(options).await;
+    options.fence = fence;
+    options
+}
+
+fn cluster_options(fence: Fence) -> RedisStoreOptions {
+    let mut options = RedisStoreOptions::from(RedisServers::Cluster {
+        first: cluster_url().parse().unwrap(),
+        rest: Vec::new(),
+    });
+    options.fence = fence;
+    options
+}
+
+#[tokio::test]
+#[ignore = "needs Redis"]
+async fn the_redis_store_answers_as_the_memory_store_on_redis() {
+    run(standalone_options(Fence::On)).await;
+}
+
+#[tokio::test]
+#[ignore = "needs Redis"]
+async fn the_redis_store_answers_as_the_memory_store_on_redis_with_the_fence_off() {
+    run(standalone_options(Fence::Off)).await;
 }
 
 #[tokio::test]
 #[ignore = "needs a Redis cluster"]
 async fn the_redis_store_answers_as_the_memory_store_on_a_redis_cluster() {
-    run(RedisStoreOptions::from(RedisServers::Cluster {
-        first: cluster_url().parse().unwrap(),
-        rest: Vec::new(),
-    }))
-    .await;
+    run(cluster_options(Fence::On)).await;
 }
 
+#[tokio::test]
+#[ignore = "needs a Redis cluster"]
+async fn the_redis_store_answers_as_the_memory_store_on_a_redis_cluster_with_the_fence_off() {
+    run(cluster_options(Fence::Off)).await;
+}
+
+/// Runs the seeds on a Redis Store with `options` and on a memory Store with the same fence.
 async fn run(mut options: RedisStoreOptions) {
     options.key_prefix = PREFIX.parse().unwrap();
     options.retention = RETENTION;
     options.producer_idle_ttl = Some(RETENTION);
+    let fence = options.fence;
     let raw = Raw::open(&options.servers).await;
     let redis = Arc::new(RedisStore::connect(options).await.unwrap());
     let seeds: Vec<u64> = match std::env::var("STREAMS_PARITY_SEED") {
@@ -90,7 +116,8 @@ async fn run(mut options: RedisStoreOptions) {
         if tasks.len() == IN_FLIGHT {
             failures.extend(tasks.join_next().await.unwrap().unwrap());
         }
-        let seed = Seed::new(seed, format!("{run}-{seed}"), redis.clone(), raw.clone());
+        let name = format!("{run}-{seed}");
+        let seed = Seed::new(seed, name, redis.clone(), raw.clone(), fence);
         tasks.spawn(seed.run());
     }
     while let Some(failure) = tasks.join_next().await {
@@ -270,7 +297,7 @@ enum Answer {
 
 /// One Store of a seed, with the offsets of each Stream's log after the last call.
 struct Side {
-    store: Arc<dyn Store>,
+    store: Arc<dyn LogStore>,
     logs: [Vec<i64>; 2],
 }
 
@@ -292,7 +319,7 @@ struct Seed {
 }
 
 impl Seed {
-    fn new(seed: u64, run: String, redis: Arc<RedisStore>, raw: Raw) -> Self {
+    fn new(seed: u64, run: String, redis: Arc<RedisStore>, raw: Raw, fence: Fence) -> Self {
         Self {
             seed,
             // Zero is a fixed point of xorshift.
@@ -300,7 +327,7 @@ impl Seed {
             run,
             producers: producers(),
             memory: Side {
-                store: Arc::new(MemoryStore::new(RETENTION, Some(RETENTION))),
+                store: Arc::new(MemoryStore::new(RETENTION, Some(RETENTION)).with_fence(fence)),
                 logs: Default::default(),
             },
             redis: Side {
@@ -530,7 +557,7 @@ enum Which {
 }
 
 /// The offsets of a Stream's whole log.
-async fn listing(store: &dyn Store, stream: &StreamRef) -> Vec<i64> {
+async fn listing(store: &dyn LogStore, stream: &StreamRef) -> Vec<i64> {
     let read: StreamResult<_> = store.read(stream, 0, 100_000).await;
     read.map_or_else(
         |_| Vec::new(),

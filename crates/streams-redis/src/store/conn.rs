@@ -919,7 +919,7 @@ mod tests {
     // key falls outside the hash tag. The ids take the characters that a tag or a key uses.
     #[test]
     fn the_keys_of_a_stream_share_one_slot_for_any_id() {
-        use temporalio_streams::ids::StreamKeys;
+        use temporalio_streams_log::ids::StreamKeys;
         let chars: Vec<char> = "ab{}:|%~ -_./\\*?\u{e9}\u{1f600}".chars().collect();
         let mut state = 0x9e37_79b9_7f4a_7c15_u64;
         let mut text = |len: u64| -> String {

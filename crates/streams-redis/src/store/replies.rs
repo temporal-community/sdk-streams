@@ -5,9 +5,9 @@ use super::records::LogEntry;
 use prost::Message;
 use redis::{FromRedisValue, ParsingError, Value};
 use std::time::Duration;
-use temporalio_streams::{
+use temporalio_streams::proto::Producer;
+use temporalio_streams_log::{
     offset::offset_of_entry_id,
-    proto::Producer,
     store::{Appended, Closed, CreateOutcome, Created, StreamState},
 };
 

@@ -11,20 +11,22 @@ use conn::{BlockingPool, Endpoint, Leased, Origin, Settled, SharedConnection, Wa
 use prost::Message;
 use records::{with_producers, without_producer};
 use redis::{
-    Cmd, ErrorKind, FromRedisValue, InfoDict, Pipeline, RedisError, RedisResult, Script,
-    ServerErrorKind, Value,
+    Cmd, ErrorKind, FromRedisValue, InfoDict, Pipeline, RedisError, RedisResult, RedisWrite,
+    Script, ServerErrorKind, ToRedisArgs, Value,
 };
 use replies::{AppendReply, CloseReply, CreateReply, ReadReply};
 use std::{num::NonZeroUsize, sync::Arc, time::Duration};
 use temporalio_streams::{
     StreamResult,
     epoch::{ProducerKind, epoch_key},
+    proto::{Producer, StreamRef},
+};
+use temporalio_streams_log::{
     ids::StreamKeys,
     offset::entry_id_of_offset,
-    proto::{Producer, StreamRef},
     store::{
         Appended, Batch, Capabilities, Closed, ConflictPolicy, Create, Created, Entry,
-        FORMAT_VERSION, MAX_TTL, Store, StreamState, TOMBSTONE,
+        FORMAT_VERSION, Fence, LogStore, MAX_TTL, StreamState, TOMBSTONE,
     },
 };
 use tokio::time::Instant;
@@ -45,6 +47,7 @@ pub struct RedisStore {
     prefix: KeyPrefix,
     retention: Duration,
     producer_idle_ttl: Option<Duration>,
+    fence: Fence,
 }
 
 impl std::fmt::Debug for RedisStore {
@@ -53,6 +56,7 @@ impl std::fmt::Debug for RedisStore {
             .field("prefix", &self.prefix)
             .field("retention", &self.retention)
             .field("producer_idle_ttl", &self.producer_idle_ttl)
+            .field("fence", &self.fence)
             .finish_non_exhaustive()
     }
 }
@@ -86,6 +90,7 @@ impl RedisStore {
             prefix: options.key_prefix,
             retention: options.retention,
             producer_idle_ttl: options.producer_idle_ttl,
+            fence: options.fence,
         })
     }
 
@@ -162,7 +167,7 @@ impl RedisStore {
 // The trait returns Stream errors, so the runtime and lang get the same reasons on every Store.
 // A Redis error converts through the crate's error, since this crate can't add that `From`.
 #[async_trait::async_trait]
-impl Store for RedisStore {
+impl LogStore for RedisStore {
     // Every rule is in the Lua scripts.
     fn capabilities(&self) -> Capabilities {
         Capabilities::ALL
@@ -201,6 +206,7 @@ impl Store for RedisStore {
             .arg(TOMBSTONE.as_millis())
             .arg(&batch.digest[..])
             .arg(self.wait.is_some())
+            .arg(FenceArg(self.fence))
             .arg(producer.encode_to_vec());
         for record in batch.records {
             call.cmd.arg(without_producer(record, producer)?);
@@ -222,7 +228,8 @@ impl Store for RedisStore {
             .arg(&producer.id)
             .arg(&epoch_key(producer.kind.as_ref())[..])
             .arg(TOMBSTONE.as_millis())
-            .arg(self.wait.is_some());
+            .arg(self.wait.is_some())
+            .arg(FenceArg(self.fence));
         let CloseReply(closed) = self.write(&call).await?;
         Ok(closed)
     }
@@ -315,6 +322,22 @@ impl ScriptCall {
             }
             result => result,
         }
+    }
+}
+
+/// The fence as the append and close scripts take it, `1` for on and `0` for off. A wrapper, since
+/// this crate can't implement `ToRedisArgs` for the `Fence` of another crate.
+struct FenceArg(Fence);
+
+impl ToRedisArgs for FenceArg {
+    fn write_redis_args<W>(&self, out: &mut W)
+    where
+        W: ?Sized + RedisWrite,
+    {
+        out.write_arg(match self.0 {
+            Fence::On => b"1",
+            Fence::Off => b"0",
+        });
     }
 }
 

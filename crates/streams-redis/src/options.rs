@@ -2,9 +2,10 @@
 
 use crate::{RedisStoreError, RedisStoreResult};
 use std::{num::NonZeroUsize, str::FromStr, time::Duration};
-use temporalio_streams::{
+use temporalio_streams::record::BatchLimits;
+use temporalio_streams_log::{
     ids::{DEFAULT_KEY_PREFIX, encode_part},
-    store::DEFAULT_RETENTION,
+    store::{DEFAULT_RETENTION, Fence},
 };
 use url::Url;
 
@@ -82,6 +83,11 @@ pub struct RedisStoreOptions {
     pub response_timeout: Duration,
     /// The replicas that each create, append and close waits for, if any.
     pub wait: Option<WaitOptions>,
+    /// The limits of one batch. The default is the largest batch that any Store may take.
+    pub limits: BatchLimits,
+    /// What the Store does with an append or a close of a Producer with a lower epoch than its
+    /// newest one.
+    pub fence: Fence,
 }
 
 const DEFAULT_BLOCKING_READS_PER_NODE: NonZeroUsize = match NonZeroUsize::new(256) {
@@ -114,6 +120,8 @@ impl From<RedisServers<Url>> for RedisStoreOptions {
             blocking_reads_per_node: DEFAULT_BLOCKING_READS_PER_NODE,
             response_timeout: Duration::from_secs(5),
             wait: None,
+            limits: BatchLimits::default(),
+            fence: Fence::On,
         }
     }
 }

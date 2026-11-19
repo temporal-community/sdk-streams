@@ -2,7 +2,8 @@
 --
 -- ARGV: format version, kind, Producer id, the 40-byte epoch key, sequence (0 takes the next one),
 -- Producer idle TTL ms (empty for none), Tombstone ms, the 16-byte batch digest, `1` when a `WAIT`
--- runs after it, the encoded Producer, then one Record with no Producer per argument.
+-- runs after it, the fence (`0` takes a lower epoch, any other value refuses it), the encoded
+-- Producer, then one Record with no Producer per argument.
 --
 -- Returns {'ok' or 'resend', first id, last id}. A batch that wrote no entry gives '' for both ids.
 local meta, log = KEYS[1], KEYS[2]
@@ -10,8 +11,8 @@ local version, kind, producer = tonumber(ARGV[1]), ARGV[2], ARGV[3]
 local epoch, sequence_text = ARGV[4], ARGV[5]
 local sequence = tonumber(sequence_text)
 local producer_idle_ttl, tombstone = tonumber(ARGV[6]), tonumber(ARGV[7])
-local digest, wait, encoded_producer = ARGV[8], ARGV[9], ARGV[10]
-local records = #ARGV - 10
+local digest, wait, fence, encoded_producer = ARGV[8], ARGV[9], ARGV[10], ARGV[11]
+local records = #ARGV - 11
 local field = 'p|' .. kind .. '|' .. producer
 
 if #epoch ~= EPOCH_KEY_LEN or #digest ~= DIGEST_LEN then
@@ -27,7 +28,8 @@ local stored, unknown = read_producer(meta, field)
 if unknown then
   return unknown
 end
--- Each append sets the fence to its epoch, so the fence is also the epoch of the last batch.
+-- An append sets the fence to its epoch, unless its epoch is lower. So the fence is also the epoch
+-- of the last batch in the field.
 local previous = nil
 if stored and stored.fence == epoch then
   previous = stored
@@ -63,7 +65,8 @@ end
 if redis.call('HGET', meta, 'closed') then
   return refuse('CLOSED', 'the Stream is closed')
 end
-if stored and bytes_below(epoch, stored.fence) then
+local stale = stored and bytes_below(epoch, stored.fence)
+if stale and fence ~= '0' then
   return refuse('FENCED', 'the epoch is lower than the newest one of the Producer')
 end
 
@@ -77,9 +80,9 @@ local first_id, last_id = '', ''
 -- Only the batch's first Record keeps the Producer. Each later one keeps the seq of that first
 -- entry, so a read that starts inside the batch finds the Producer with one lookup.
 local first_seq = next_seq
-for i = 11, #ARGV do
+for i = 12, #ARGV do
   local fields = {'r', ARGV[i], 'b', first_seq}
-  if i == 11 then
+  if i == 12 then
     fields = {'r', ARGV[i], 'p', encoded_producer}
   end
   last_id = add(log, fields)
@@ -88,7 +91,11 @@ for i = 11, #ARGV do
   end
 end
 
-redis.call('HSET', meta, field, producer_value(epoch, sequence, first_id, last_id, digest))
+-- A batch of a lower epoch leaves the field as it is. The field must keep the newest epoch and its
+-- last batch, or the dedupe of that epoch would stop working.
+if not stale then
+  redis.call('HSET', meta, field, producer_value(epoch, sequence, first_id, last_id, digest))
+end
 if last_id ~= '' then
   redis.call('HSET', meta, 'newest', last_id)
 end

@@ -29,4 +29,13 @@ message RedisStreamConfig {
     int32 wait_replicas = 11;
     // How long a write waits for its replicas, at most half of response_timeout. Empty is 1 s.
     google.protobuf.Duration wait_timeout = 12;
+    // The most bytes of one stored Record, at most 1572864. Zero is 1572864.
+    int64 max_record_bytes = 13;
+    // The most bytes of the stored Records of one batch, at most 4194304. Zero is 4194304.
+    int64 max_batch_bytes = 14;
+    // The most Records of one batch, at most 1000. Zero is 1000.
+    int32 max_batch_records = 15;
+    // Takes an append or a close of a Producer with a lower epoch than its newest one. By
+    // default the Store refuses them as fenced.
+    bool fence_off = 16;
 }

@@ -6,11 +6,8 @@ use crate::{RedisStoreError, RedisStoreResult};
 use prost::Message;
 use redis::{FromRedisValue, ParsingError, Value};
 use std::{collections::HashMap, fmt, str::FromStr};
-use temporalio_streams::{
-    offset::offset_of_entry_id,
-    proto::{Producer, StreamRecord},
-    store::Entry,
-};
+use temporalio_streams::proto::{Producer, StreamRecord};
+use temporalio_streams_log::{offset::offset_of_entry_id, store::Entry};
 
 /// The Record with no Producer, when it is a data Record of `producer`.
 pub(super) fn without_producer(record: &[u8], producer: &Producer) -> RedisStoreResult<Vec<u8>> {

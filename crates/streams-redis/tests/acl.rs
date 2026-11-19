@@ -11,10 +11,12 @@ use std::{
 use temporalio_common::protos::temporal::api::common::v1::Payload;
 use temporalio_streams::{
     Reason,
+    proto::{AppendRecord, ClientProducer, Producer, StreamRecord, StreamRef, producer::Kind},
+};
+use temporalio_streams_log::{
     digest::batch_digest,
     ids::StreamKeys,
-    proto::{AppendRecord, ClientProducer, Producer, StreamRecord, StreamRef, producer::Kind},
-    store::{Batch, Create, Store},
+    store::{Batch, Create, LogStore},
 };
 use temporalio_streams_redis::{
     RedisServers, RedisStore, RedisStoreError, RedisStoreOptions, WaitOptions,
@@ -82,11 +84,11 @@ async fn user(url: &str, name: &str, role: (&str, &str)) -> String {
     login(url, name)
 }
 
-async fn store(url: String) -> Box<dyn Store> {
+async fn store(url: String) -> Box<dyn LogStore> {
     store_with(RedisStoreOptions::new(url).unwrap()).await
 }
 
-async fn store_with(mut options: RedisStoreOptions) -> Box<dyn Store> {
+async fn store_with(mut options: RedisStoreOptions) -> Box<dyn LogStore> {
     options.key_prefix = PREFIX.parse().unwrap();
     Box::new(RedisStore::connect(options).await.unwrap())
 }

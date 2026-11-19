@@ -3,7 +3,7 @@
 
 mod support;
 
-use temporalio_streams::testing;
+use temporalio_streams_log::testing;
 
 #[tokio::test]
 #[ignore = "needs Redis"]
