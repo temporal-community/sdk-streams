@@ -1,0 +1,50 @@
+# One workspace for the native modules of the Python packages, so that they share one lock file and
+# one patch of the sdk-rust crates. It is apart from the repo's root workspace, so the jobs of the
+# Rust crates don't build it.
+[workspace]
+members = ["native", "memory", "redis"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88.0"
+authors = ["Temporal Technologies Inc. <sdk@temporal.io>"]
+license-file = "LICENSE.txt"
+homepage = "https://temporal.io/"
+repository = "https://github.com/temporal-community/sdk-streams"
+publish = false
+
+[workspace.dependencies]
+pyo3 = { version = "0.29", features = ["abi3-py311"] }
+pyo3-async-runtimes = { version = "0.29", features = ["tokio-runtime"] }
+temporalio-common = { version = "1.1", default-features = false }
+temporalio-streams = "0.1"
+temporalio-streams-log = { path = "../crates/streams-log" }
+temporalio-streams-python-native = { path = "native" }
+tokio = { version = "1.26", features = ["net", "rt-multi-thread", "time"] }
+
+# A panic on a Tokio worker would take down a call that Python waits for.
+[workspace.lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+cast_possible_truncation = "warn"
+
+# The same profile as the bridge of the Python SDK, which these modules load next to.
+[profile.release]
+opt-level = 3
+debug = false
+lto = true
+incremental = false
+
+# `temporalio-streams` isn't on crates.io yet. These two entries must have the same commit as
+# `SDK_RUST_REV` in `scripts/patch-sdk-rust.sh`, which the repo's CI uses. The `python-lint` job
+# checks that they match.
+[patch.crates-io.temporalio-common]
+git = "https://github.com/moetemp/sdk-rust"
+rev = "cc3f70365363d074ee453f993fa4a6b24b0eb927"
+
+[patch.crates-io.temporalio-streams]
+git = "https://github.com/moetemp/sdk-rust"
+rev = "cc3f70365363d074ee453f993fa4a6b24b0eb927"

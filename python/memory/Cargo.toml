@@ -1,0 +1,23 @@
+[package]
+name = "temporalio-streams-memory-python"
+description = "The native module of the Python package of the memory Store of the Stream runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license-file.workspace = true
+homepage.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+name = "temporalio_streams_memory_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { workspace = true, features = ["extension-module"] }
+temporalio-streams-memory = { path = "../../crates/streams-memory" }
+temporalio-streams-python-native = { workspace = true }
+
+[lints]
+workspace = true

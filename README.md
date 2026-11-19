@@ -62,6 +62,18 @@ TTLs, the ACLs and the known limits.
 them, start the servers with `crates/streams-redis/scripts/redis-test-servers.sh`, set the two URLs
 that it prints, and run `cargo test -- --include-ignored`.
 
+## Python
+
+`python/` has two Python packages. Each runs a Store of this repo in its own native module, so the
+Python SDK needs no Store code.
+
+- `python/redis` is `temporalio-streams-redis`, the Redis Store. See `python/redis/README.md`.
+- `python/memory` is `temporalio-streams-memory`, the memory Store, for tests. See
+  `python/memory/README.md`.
+
+`python/native` is the Rust that both native modules share. `python/suite` has the tests that every
+Store must pass.
+
 ## License
 
 MIT. See `LICENSE.txt`.

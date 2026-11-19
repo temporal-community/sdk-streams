@@ -1,0 +1,27 @@
+[project]
+name = "temporalio-streams-redis"
+version = "0.1.0"
+description = "The Redis Store of Temporal Streams for the Python SDK"
+authors = [{ name = "Temporal Technologies Inc", email = "sdk@temporal.io" }]
+requires-python = ">=3.11"
+readme = "README.md"
+license = "MIT"
+keywords = ["temporal", "workflow", "streams", "redis"]
+dependencies = ["temporalio"]
+classifiers = [
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+]
+
+[project.urls]
+Repository = "https://github.com/temporal-community/sdk-streams"
+
+[build-system]
+requires = ["maturin>=1.8,<2"]
+build-backend = "maturin"
+
+[tool.maturin]
+module-name = "temporalio_streams_redis._native"

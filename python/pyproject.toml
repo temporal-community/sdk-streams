@@ -1,0 +1,30 @@
+# This file holds no package. It has what the packages share: the tools of their development and
+# the settings of pytest, pyright and ruff.
+[dependency-groups]
+dev = [
+  "maturin>=1.8,<2",
+  "pyright==1.1.414",
+  # pytest-asyncio 0.21 relies on pytest internals that pytest 9.2 removed.
+  "pytest>=9.0,<9.2",
+  "pytest-asyncio>=0.21,<0.22",
+  "ruff>=0.15.12,<0.16",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+filterwarnings = ["ignore::DeprecationWarning"]
+# The tests of `suite` run in each package.
+pythonpath = ["."]
+
+[tool.pyright]
+include = ["suite", "redis", "memory"]
+exclude = ["**/__pycache__"]
+extraPaths = ["redis", "redis/tests", "memory"]
+strict = ["redis/temporalio_streams_redis", "memory/temporalio_streams_memory"]
+
+[tool.ruff]
+target-version = "py311"
+src = ["redis", "memory", "."]
+
+[tool.ruff.lint]
+extend-select = ["I"]
