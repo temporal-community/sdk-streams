@@ -39,9 +39,13 @@ start "$REPLICA" --replicaof 127.0.0.1 "$STANDALONE" --replica-announce-ip 127.0
 for port in "${CLUSTER[@]}"; do
   start "$port" --cluster-enabled yes --cluster-config-file nodes.conf
 done
-for _ in $(seq 50); do
-  redis-cli -p "${CLUSTER[${#CLUSTER[@]} - 1]}" ping >/dev/null 2>&1 && break
-  sleep 0.1
+# Every server must answer before the script asks one of them about the cluster. The last node to
+# start can answer before the first one does.
+for port in "$STANDALONE" "$REPLICA" "${CLUSTER[@]}"; do
+  for _ in $(seq 100); do
+    redis-cli -p "$port" ping >/dev/null 2>&1 && break
+    sleep 0.1
+  done
 done
 if ! redis-cli -p "${CLUSTER[0]}" cluster info | grep -q cluster_state:ok; then
   nodes=()
