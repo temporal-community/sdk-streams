@@ -42,6 +42,7 @@ A Worker that is built from this client uses the same Store for Activities and W
 | `max_record_bytes` | 1536 KiB | The most bytes of one stored Record. At most the default |
 | `max_batch_bytes` | 4 MiB | The most bytes of the stored Records of one batch. At most the default |
 | `max_batch_records` | 1000 | The most Records of one batch. At most the default |
+| `fence` | `True` | Refuse an append or a close of a lower epoch of a Producer. `False` takes them |
 
 ## The Workflow sandbox
 

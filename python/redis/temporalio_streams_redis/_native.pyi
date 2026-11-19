@@ -22,6 +22,7 @@ class RedisRuntime:
         max_record_bytes: int,
         max_batch_bytes: int,
         max_batch_records: int,
+        fence: bool,
     ) -> None: ...
     def call(
         self, operation: str, request: bytes, response_type: type[_Response]

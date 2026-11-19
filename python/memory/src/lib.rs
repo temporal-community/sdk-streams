@@ -2,7 +2,7 @@
 //! service operations by name, with the encoded request, and gets the encoded response.
 
 use pyo3::{exceptions::PyValueError, prelude::*};
-use temporalio_streams_memory::{MemoryStreamOptions, MemoryStreamRuntime};
+use temporalio_streams_memory::{Fence, MemoryStreamOptions, MemoryStreamRuntime};
 use temporalio_streams_python_native::{Identity, StreamBridge, duration_option};
 
 const IDENTITY: Identity = Identity {
@@ -29,6 +29,7 @@ impl MemoryRuntime {
         max_record_bytes,
         max_batch_bytes,
         max_batch_records,
+        fence,
     ))]
     fn new(
         retention: Option<Bound<'_, PyAny>>,
@@ -37,6 +38,7 @@ impl MemoryRuntime {
         max_record_bytes: usize,
         max_batch_bytes: usize,
         max_batch_records: usize,
+        fence: bool,
     ) -> PyResult<Self> {
         // The crate re-exports no `BatchLimits`, so the default options give the value to set.
         let limits = MemoryStreamOptions::default()
@@ -49,6 +51,10 @@ impl MemoryRuntime {
             retention: duration_option("retention", retention.as_ref())?,
             producer_idle_ttl: duration_option("producer_idle_ttl", producer_idle_ttl.as_ref())?,
             limits,
+            fence: match fence {
+                true => Fence::On,
+                false => Fence::Off,
+            },
         };
         // The runtime is built at the first call, inside the Tokio runtime, since it spawns tasks.
         let bridge = StreamBridge::new(IDENTITY, move || {

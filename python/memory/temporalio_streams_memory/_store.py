@@ -41,6 +41,7 @@ class MemoryStreamStore(temporalio.client.StreamStore):
         max_record_bytes: int | None = None,
         max_batch_bytes: int | None = None,
         max_batch_records: int | None = None,
+        fence: bool = True,
         name: str = "memory",
         retention: timedelta | None = None,
         producer_idle_ttl: timedelta | None = None,
@@ -57,6 +58,9 @@ class MemoryStreamStore(temporalio.client.StreamStore):
                 4,194,304. ``None`` takes that.
             max_batch_records: The most Records of one batch, at most 1,000. ``None`` takes
                 that.
+            fence: Whether the Store refuses an append or a close of a Producer with a lower
+                epoch than its newest one, with ``STREAM_ERROR_REASON_FENCED``. With ``False``
+                the Store takes them, and a batch of a lower epoch has no dedupe.
             name: Name of the Store, which the refs of its Streams carry.
             retention: How long a closed Stream stays readable. ``None`` takes 7 days.
             producer_idle_ttl: How long an open Stream stays after the last write of any
@@ -81,6 +85,7 @@ class MemoryStreamStore(temporalio.client.StreamStore):
             max_record_bytes=self._limits.max_record_bytes,
             max_batch_bytes=self._limits.max_batch_bytes,
             max_batch_records=self._limits.max_batch_records,
+            fence=fence,
         )
 
     @property
