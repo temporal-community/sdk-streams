@@ -140,6 +140,18 @@ pub struct Entry {
     pub record: Option<Vec<u8>>,
 }
 
+/// What a Store does with an append or a close of a Producer whose epoch is lower than the
+/// newest one that the Store has for it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Fence {
+    /// The Store refuses it as fenced.
+    #[default]
+    On,
+    /// The Store takes it. A batch of a lower epoch changes no state of its Producer, so it has no
+    /// dedupe.
+    Off,
+}
+
 /// The rules that a Store applies atomically beyond the log. The service checks a capability before
 /// a call that needs it. So a Store that lacks the capability refuses the call, and doesn't give
 /// weaker guarantees without notice.
@@ -149,6 +161,7 @@ pub struct Capabilities(u8);
 impl Capabilities {
     /// Each append checks the Producer's epoch and its last `sequence` before it writes. The Store
     /// keeps both for as long as the Stream exists, also for a Producer with no recent append.
+    /// With [Fence::Off] the Store still keeps both, and refuses no lower epoch.
     pub const PRODUCER_FENCE: Self = Self(1);
     /// A close marks the Stream closed and wakes the waiting reads. Every later append is
     /// refused.

@@ -35,4 +35,7 @@ message RedisStreamConfig {
     int64 max_batch_bytes = 14;
     // The most Records of one batch, at most 1000. Zero is 1000.
     int32 max_batch_records = 15;
+    // Takes an append or a close of a Producer with a lower epoch than its newest one. By
+    // default the Store refuses them as fenced.
+    bool fence_off = 16;
 }

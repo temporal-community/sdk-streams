@@ -23,7 +23,8 @@ Lang sends the options as a `RedisStreamConfig`, from
 `RedisStore::connect` with `RedisStoreOptions`. The Store needs Redis 7.0 or later. The table
 lists the main config fields. `RedisStoreOptions` has the same ones, except that
 `servers: RedisServers` replaces `urls` and `cluster`, `wait: Option<WaitOptions>` replaces the
-two `wait_` fields, and `limits: BatchLimits` replaces the three `max_` fields.
+two `wait_` fields, `limits: BatchLimits` replaces the three `max_` fields, and `fence: Fence`
+replaces `fence_off`.
 
 | Option | Default | Use |
 |---|---|---|
@@ -38,6 +39,11 @@ two `wait_` fields, and `limits: BatchLimits` replaces the three `max_` fields.
 | `max_record_bytes` | 1536 KiB | The most bytes of one stored Record. At most the default |
 | `max_batch_bytes` | 4 MiB | The most bytes of the stored Records of one batch. At most the default |
 | `max_batch_records` | 1000 | The most Records of one batch. At most the default |
+| `fence_off` | `false` | Take an append or a close of a lower epoch of a Producer |
+
+A Store refuses an append or a close of a Producer with a lower epoch than its newest one. The
+option `fence` turns that off. Then the Store takes them, and a batch of a lower epoch has no
+dedupe.
 
 The URL sets the credentials and TLS. `crates/streams-redis/docs/redis.md` has the key layout, the
 TTLs, the ACLs and the known limits.

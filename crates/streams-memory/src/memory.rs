@@ -18,7 +18,7 @@ use temporalio_streams_log::{
     producer_field::{ProducerField, entry_id},
     store::{
         Appended, Batch, Capabilities, Closed, ConflictPolicy, Create, CreateOutcome, Created,
-        Entry, FORMAT_VERSION, LogStore, StreamState, TOMBSTONE,
+        Entry, FORMAT_VERSION, Fence, LogStore, StreamState, TOMBSTONE,
     },
 };
 use tokio::{sync::Notify, time::Instant};
@@ -49,6 +49,7 @@ pub struct MemoryStore {
     prefix: String,
     retention: Duration,
     producer_idle_ttl: Option<Duration>,
+    fence: Fence,
     streams: Mutex<HashMap<String, Keys>>,
     appended: Notify,
 }
@@ -58,6 +59,7 @@ impl std::fmt::Debug for MemoryStore {
         f.debug_struct("MemoryStore")
             .field("retention", &self.retention)
             .field("producer_idle_ttl", &self.producer_idle_ttl)
+            .field("fence", &self.fence)
             .finish_non_exhaustive()
     }
 }
@@ -223,9 +225,16 @@ impl MemoryStore {
             prefix: DEFAULT_KEY_PREFIX.to_string(),
             retention,
             producer_idle_ttl,
+            fence: Fence::On,
             streams: Mutex::default(),
             appended: Notify::new(),
         }
+    }
+
+    /// The same Store with `fence` as what it does with a write of a lower epoch.
+    pub fn with_fence(mut self, fence: Fence) -> Self {
+        self.fence = fence;
+        self
     }
 
     fn key(&self, stream_id: &str) -> String {
@@ -388,7 +397,8 @@ impl LogStore for MemoryStore {
             // The format version comes first, since a newer format can change the Producer field.
             keys.check_live(now)?;
             let stored = keys.get(&field).map(ProducerField::try_from).transpose()?;
-            // Every append sets the fence to its epoch, so the fence is the last batch's epoch.
+            // An append sets the fence to its epoch, unless its epoch is lower. So the fence is
+            // also the epoch of the last batch in the field.
             let previous = stored.filter(|stored| stored.fence == epoch);
             // The lock also covers the dedupe check, so no other batch takes the same number.
             let sequence = match batch.sequence {
@@ -433,7 +443,8 @@ impl LogStore for MemoryStore {
             if keys.get("closed").is_some() {
                 return Err(refuse(Reason::Closed, "the Stream is closed"));
             }
-            if stored.is_some_and(|stored| epoch < stored.fence) {
+            let stale = stored.is_some_and(|stored| epoch < stored.fence);
+            if stale && self.fence == Fence::On {
                 return Err(refuse(
                     Reason::Fenced,
                     "the epoch is lower than the newest one of the Producer",
@@ -466,7 +477,11 @@ impl LogStore for MemoryStore {
                 entries,
                 digest: batch.digest,
             };
-            keys.set(field.as_str(), value.encode());
+            // A batch of a lower epoch leaves the field as it is. The field must keep the newest
+            // epoch and its last batch, or the dedupe of that epoch would stop working.
+            if !stale {
+                keys.set(field.as_str(), value.encode());
+            }
             if !last.is_empty() {
                 keys.set("newest", last.clone());
             }
@@ -494,12 +509,16 @@ impl LogStore for MemoryStore {
             if keys.get("closed").is_some() {
                 return Ok(true);
             }
-            let stored = keys.get(&field).map(ProducerField::try_from).transpose()?;
-            if stored.is_some_and(|stored| epoch < stored.fence) {
-                return Err(refuse(
-                    Reason::Fenced,
-                    "the epoch is lower than the newest one of the Producer",
-                ));
+            // Nothing else of a close needs the Producer's field, so with the fence off the close
+            // doesn't read it.
+            if self.fence == Fence::On {
+                let stored = keys.get(&field).map(ProducerField::try_from).transpose()?;
+                if stored.is_some_and(|stored| epoch < stored.fence) {
+                    return Err(refuse(
+                        Reason::Fenced,
+                        "the epoch is lower than the newest one of the Producer",
+                    ));
+                }
             }
             keys.set("closed", "1");
             keys.refresh(now, None, tombstone);

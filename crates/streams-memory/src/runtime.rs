@@ -4,7 +4,10 @@ use crate::MemoryStore;
 use std::{sync::Arc, time::Duration};
 use temporalio_common::telemetry::metrics::TemporalMeter;
 use temporalio_streams::{StreamRuntime, record::BatchLimits};
-use temporalio_streams_log::{store::DEFAULT_RETENTION, stream_runtime};
+use temporalio_streams_log::{
+    store::{DEFAULT_RETENTION, Fence},
+    stream_runtime,
+};
 
 /// The settings of the memory Store runtime. A field left `None` takes its default.
 #[derive(Clone, Debug, Default)]
@@ -16,6 +19,9 @@ pub struct MemoryStreamOptions {
     pub producer_idle_ttl: Option<Duration>,
     /// The limits of one batch. The default is the largest batch that any Store may take.
     pub limits: BatchLimits,
+    /// What the Store does with an append or a close of a Producer with a lower epoch than its
+    /// newest one. The default refuses it as fenced.
+    pub fence: Fence,
 }
 
 /// The Stream runtime on the memory Store, for tests. It serves the same calls with the same
@@ -31,10 +37,13 @@ impl MemoryStreamRuntime {
         meter: Option<TemporalMeter>,
     ) -> Arc<StreamRuntime> {
         let positive = |value: Option<Duration>| value.filter(|value| !value.is_zero());
-        let store = Arc::new(MemoryStore::new(
-            positive(options.retention).unwrap_or(DEFAULT_RETENTION),
-            positive(options.producer_idle_ttl),
-        ));
+        let store = Arc::new(
+            MemoryStore::new(
+                positive(options.retention).unwrap_or(DEFAULT_RETENTION),
+                positive(options.producer_idle_ttl),
+            )
+            .with_fence(options.fence),
+        );
         stream_runtime(store_name, store, options.limits, meter)
     }
 }

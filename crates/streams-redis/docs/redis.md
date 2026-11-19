@@ -62,6 +62,12 @@ No write drops a Producer's `p|` field, however long ago its last append was. So
 Producer's last batch gets the first answer, and a lower epoch of the Producer is fenced, for as
 long as the Stream exists.
 
+A Store refuses an append or a close of a Producer with a lower epoch than its newest one. The
+option `fence` turns that off, and it is `fence_off` in the config. Then the Store takes them, and
+a batch of a lower epoch has no dedupe. Such a batch leaves the `p|` field as it is, so the newest
+epoch keeps its dedupe. A close of a lower epoch closes the Stream, and the close script doesn't
+read the `p|` field.
+
 An append with sequence 0 takes the sequence after the last batch's when the fence is the batch's
 epoch key, and 1 otherwise. The script reads `p|` and writes the batch in one step, so two such
 batches never get the same sequence. Nothing dedupes such a batch, so its retry writes it again.

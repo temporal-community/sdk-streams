@@ -9,7 +9,7 @@ use std::{num::NonZeroUsize, sync::Arc, time::Duration};
 use temporalio_common::telemetry::metrics::TemporalMeter;
 use temporalio_streams::{StreamResult, StreamRuntime, record::BatchLimits};
 use temporalio_streams_log::{
-    store::{Capabilities, LazyStore},
+    store::{Capabilities, Fence, LazyStore},
     stream_runtime,
 };
 
@@ -77,6 +77,10 @@ impl TryFrom<RedisStreamConfig> for RuntimeOptions {
                 .unwrap_or(defaults.response_timeout),
             wait,
             limits,
+            fence: match config.fence_off {
+                true => Fence::Off,
+                false => Fence::On,
+            },
             ..defaults
         };
         // A bridge builds the runtime at startup and connects later, so a bad config fails here.

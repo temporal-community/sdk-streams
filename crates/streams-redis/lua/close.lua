@@ -2,7 +2,7 @@
 -- wakes each read that waits on the Stream.
 --
 -- ARGV: the `:closed` key, format version, kind, Producer id, the 40-byte epoch key, Tombstone ms,
--- `1` when a `WAIT` runs after it.
+-- `1` when a `WAIT` runs after it, the fence (`0` takes a lower epoch, any other value refuses it).
 --
 -- Returns {'closed' or 'already'}.
 local meta, log = KEYS[1], KEYS[2]
@@ -12,7 +12,7 @@ local meta, log = KEYS[1], KEYS[2]
 -- It allows one of the script's own slot, and the slot migration case of `tests/acl.rs` checks it.
 local closed_key, version, kind = ARGV[1], tonumber(ARGV[2]), ARGV[3]
 local producer, epoch, tombstone = ARGV[4], ARGV[5], tonumber(ARGV[6])
-local wait = ARGV[7]
+local wait, fence = ARGV[7], ARGV[8]
 
 local now = now_ms()
 local refused = check_live(meta, version, now)
@@ -23,13 +23,16 @@ if redis.call('HGET', meta, 'closed') then
   touch(meta, wait)
   return {'already'}
 end
--- A Producer is fenced as its appends are, so a stale attempt can't close the Stream.
-local stored, unknown = read_producer(meta, 'p|' .. kind .. '|' .. producer)
-if unknown then
-  return unknown
-end
-if stored and bytes_below(epoch, stored.fence) then
-  return refuse('FENCED', 'the epoch is lower than the newest one of the Producer')
+-- A Producer is fenced as its appends are, so a stale attempt can't close the Stream. Nothing else
+-- of a close needs the Producer's field, so with the fence off the close doesn't read it.
+if fence ~= '0' then
+  local stored, unknown = read_producer(meta, 'p|' .. kind .. '|' .. producer)
+  if unknown then
+    return unknown
+  end
+  if stored and bytes_below(epoch, stored.fence) then
+    return refuse('FENCED', 'the epoch is lower than the newest one of the Producer')
+  end
 end
 
 redis.call('HSET', meta, 'closed', '1')

@@ -17,3 +17,5 @@ pub mod testing;
 
 pub use memory::MemoryStore;
 pub use runtime::{MemoryStreamOptions, MemoryStreamRuntime};
+// The type of `MemoryStreamOptions::fence`, so that a binding needs no dependency on the log crate.
+pub use temporalio_streams_log::store::Fence;

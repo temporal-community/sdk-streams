@@ -27,3 +27,7 @@
   `max_batch_bytes` and `max_batch_records`, and `MemoryStreamOptions` has `limits`. A Store can
   allow less than the default, and never more. The runtime refuses a larger batch with
   `stream_too_large`.
+- A Store option that turns the fence off. A Store refuses an append or a close of a Producer with
+  a lower epoch than its newest one. The option `fence` turns that off. Then the Store takes them,
+  and a batch of a lower epoch has no dedupe. `RedisStreamConfig` has `fence_off`,
+  `RedisStoreOptions` and `MemoryStreamOptions` have `fence`, and `MemoryStore` has `with_fence`.

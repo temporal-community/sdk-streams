@@ -6,7 +6,7 @@ use std::{num::NonZeroUsize, sync::Arc, time::Duration};
 use temporalio_streams::StreamRuntime;
 use temporalio_streams_log::{
     ids::StreamKeys,
-    store::LogStore,
+    store::{Fence, LogStore},
     testing::{Needs, RawKeys, RuntimeConfig, TestStore},
 };
 use temporalio_streams_redis::{
@@ -120,6 +120,7 @@ impl TestStore for RedisTestStore {
                     .producer_idle_ttl
                     .unwrap_or(Duration::from_secs(300)),
             )),
+            fence_off: runtime.fence == Fence::Off,
             ..Default::default()
         };
         RedisStreamRuntime::from_config_bytes(&config.encode_to_vec(), None).unwrap()

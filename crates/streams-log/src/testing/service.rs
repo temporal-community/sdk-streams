@@ -3,6 +3,7 @@
 //! Every Store runs the suite through its own runtime.
 
 use super::{RuntimeConfig, case, support::Needs};
+use crate::store::Fence;
 
 use prost::Message;
 use std::{
@@ -60,6 +61,15 @@ async fn short_cases() -> Vec<Case> {
     cases_with(Needs::SHORT_TIMES, &config).await
 }
 
+/// A fresh Stream on each Store that gives `needs`, on a runtime whose Store has the fence off.
+async fn fence_off_cases() -> Vec<Case> {
+    let config = RuntimeConfig {
+        fence: Fence::Off,
+        ..Default::default()
+    };
+    cases_with(Needs::UNCHECKED, &config).await
+}
+
 /// A fresh Stream on each Store that gives `needs`, on a runtime with `config`.
 async fn cases_with(needs: Needs, config: &RuntimeConfig) -> Vec<Case> {
     super::support::runtimes(needs, config)
@@ -109,6 +119,20 @@ fn workflow(run: &str) -> Producer {
                 started_event_id: 3,
                 attempt: 1,
                 started_time: None,
+            }),
+        })),
+    }
+}
+
+/// The Producer of an Activity of run `r1`. A higher `attempt` is a higher epoch.
+fn activity(attempt: i32) -> Producer {
+    Producer {
+        id: "act:r1:a:s".to_string(),
+        kind: Some(Kind::WorkflowActivity(ActivityProducer {
+            run_id: "r1".to_string(),
+            epoch: Some(ActivityEpoch {
+                attempt_scheduled_time: Some(prost_types::Timestamp::default()),
+                attempt,
             }),
         })),
     }
@@ -884,6 +908,88 @@ async fn a_page_keeps_under_max_bytes_and_a_larger_record_comes_alone() {
     }
 }
 
+/// With the fence off, a Store takes an append of a lower epoch than the newest one of its
+/// Producer. A read gives the Records of both appends in the order of the writes, and each Record
+/// keeps the Producer with its own epoch.
+async fn a_store_with_the_fence_off_writes_a_lower_epoch() {
+    for case in fence_off_cases().await {
+        case.create().await.unwrap();
+        let newer = case
+            .append(activity(2), 1, vec![record("a")])
+            .await
+            .unwrap();
+        let older = case
+            .append(activity(1), 1, vec![record("b")])
+            .await
+            .unwrap();
+        assert!(older.first_offset > newer.last_offset);
+        let read = case.read(ReadRecordsRequest::default()).await.unwrap();
+        assert_eq!(texts(&read), ["a", "b"]);
+        let producers: Vec<_> = read.records.iter().map(|r| r.producer.clone()).collect();
+        assert_eq!(producers, [Some(activity(2)), Some(activity(1))]);
+    }
+}
+
+/// With the fence off, a batch of a lower epoch changes no state of its Producer. So the newest
+/// epoch keeps its dedupe, and its resend gets the offsets of its first write. A batch of a lower
+/// epoch has no dedupe, so its resend is written again.
+async fn a_store_with_the_fence_off_keeps_the_dedupe_of_the_newest_epoch() {
+    for case in fence_off_cases().await {
+        case.create().await.unwrap();
+        let first = case
+            .append(activity(2), 1, vec![record("a")])
+            .await
+            .unwrap();
+        case.append(activity(1), 1, vec![record("x")])
+            .await
+            .unwrap();
+        let resend = case
+            .append(activity(2), 1, vec![record("a")])
+            .await
+            .unwrap();
+        assert_eq!(
+            (&resend.first_offset, &resend.last_offset),
+            (&first.first_offset, &first.last_offset)
+        );
+        let read = case.read(ReadRecordsRequest::default()).await.unwrap();
+        assert_eq!(texts(&read), ["a", "x"]);
+        case.append(activity(2), 2, vec![record("b")])
+            .await
+            .unwrap();
+        case.append(activity(1), 1, vec![record("x")])
+            .await
+            .unwrap();
+        let read = case.read(ReadRecordsRequest::default()).await.unwrap();
+        assert_eq!(texts(&read), ["a", "x", "b", "x"]);
+    }
+}
+
+/// With the fence off, a close of a lower epoch than the newest one of its Producer closes the
+/// Stream. A later append fails as closed, also with the newest epoch.
+async fn a_store_with_the_fence_off_closes_for_a_lower_epoch() {
+    for case in fence_off_cases().await {
+        case.create().await.unwrap();
+        case.append(activity(2), 1, vec![record("a")])
+            .await
+            .unwrap();
+        case.close(activity(1)).await.unwrap();
+        assert_eq!(
+            case.describe().await.unwrap().status,
+            StreamStatus::Closed as i32
+        );
+        let error = case
+            .append(activity(2), 2, vec![record("b")])
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (error.code(), reason(&error).as_str()),
+            (Code::FailedPrecondition, "stream_closed")
+        );
+        let read = case.read(ReadRecordsRequest::default()).await.unwrap();
+        assert_eq!(texts(&read), ["a"]);
+    }
+}
+
 /// The cases of the suite, in file order.
 pub const CASES: &[super::Case] = &[
     case!(a_create_of_an_open_stream_fails_unless_it_uses_it_or_retries),
@@ -903,4 +1009,7 @@ pub const CASES: &[super::Case] = &[
     case!(a_read_of_a_closed_stream_with_no_record_left_answers_at_once),
     case!(a_waiting_read_wakes_with_done_on_a_close),
     case!(a_page_keeps_under_max_bytes_and_a_larger_record_comes_alone),
+    case!(a_store_with_the_fence_off_writes_a_lower_epoch),
+    case!(a_store_with_the_fence_off_keeps_the_dedupe_of_the_newest_epoch),
+    case!(a_store_with_the_fence_off_closes_for_a_lower_epoch),
 ];

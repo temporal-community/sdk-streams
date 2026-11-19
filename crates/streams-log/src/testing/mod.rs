@@ -9,7 +9,7 @@ pub mod store;
 
 pub use support::Needs;
 
-use crate::store::LogStore;
+use crate::store::{Fence, LogStore};
 use futures_util::{FutureExt, future::join_all};
 use std::{future::Future, panic::AssertUnwindSafe, pin::Pin, sync::Arc, time::Duration};
 use temporalio_streams::StreamRuntime;
@@ -40,6 +40,8 @@ pub struct RuntimeConfig {
     pub retention: Option<Duration>,
     /// How long an open Stream stays after the last write of any Producer.
     pub producer_idle_ttl: Option<Duration>,
+    /// What the Store does with a write of a lower epoch than the newest one of its Producer.
+    pub fence: Fence,
 }
 
 /// A Store that the suites run on, with the server under it.
