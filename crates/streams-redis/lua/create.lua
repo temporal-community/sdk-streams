@@ -6,11 +6,12 @@
 -- 2. The Retention, in ms
 -- 3. The Producer idle TTL, in ms, or an empty string for none
 -- 4. `1` to use an existing Stream
+-- 5. `1` when a `WAIT` comes after the script
 --
 -- Returns 1 when this create made the Stream or is a retry of the create that made it, and 0
 -- for a Stream that another create made.
 local meta = KEYS[1]
-local request, retention, idle, use_existing = ARGV[1], ARGV[2], ARGV[3], ARGV[4]
+local request, retention, idle, use_existing, wait = ARGV[1], ARGV[2], ARGV[3], ARGV[4], ARGV[5]
 
 local now = now_ms()
 local stream = load(meta)
@@ -30,9 +31,11 @@ if stream.closed then
   return refuse('CLOSED', 'The Stream is closed')
 end
 if stream.rid == request then
+  touch(meta, wait)
   return 1
 end
 if use_existing ~= '1' then
   return refuse('ALREADY_EXISTS', 'The Stream already exists')
 end
+touch(meta, wait)
 return 0

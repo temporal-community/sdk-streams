@@ -28,3 +28,11 @@ end
 
 -- The length of an attempt key, which starts the value of a Producer.
 local ATTEMPT = 40
+
+-- Writes `v` again when a `WAIT` comes after the script, in a call that found its work done. A
+-- `WAIT` covers only the last write of its own connection, and it then covers the first write.
+local function touch(meta, wait)
+  if wait == '1' then
+    redis.call('HSET', meta, 'v', FORMAT)
+  end
+end

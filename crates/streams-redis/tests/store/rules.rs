@@ -22,7 +22,7 @@ use temporalio_streams::{
     },
     record::StoreLimits,
 };
-use temporalio_streams_redis::{Fence, RedisStore, RedisStoreOptions};
+use temporalio_streams_redis::{Fence, RedisStore, RedisStoreOptions, WaitForReplicas};
 
 /// The batches that the Store remembers for a Producer. It's small, so that a seed passes its
 /// edge often.
@@ -40,6 +40,18 @@ async fn a_store_follows_the_rules_for_any_calls() {
 async fn a_store_follows_the_rules_on_a_cluster() {
     let cluster = Cluster::start().await;
     run_seeds(10, || cluster.options(), cluster.admin().await).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_store_follows_the_rules_when_it_waits_for_a_replica() {
+    let redis = Redis::start(&[]);
+    let _replica = redis.start_replica();
+    let options = || {
+        let mut options = standalone(redis.url());
+        options.wait = Some(WaitForReplicas::new(1));
+        options
+    };
+    run_seeds(5, options, redis.admin().await).await;
 }
 
 /// Runs the seeds of the generated calls on Stores with `options`, with the fence off and on.

@@ -176,3 +176,14 @@ While the slot moves, it polls every 100 ms.
 Redis replicates after it answers, so a failover can lose a write that a call got an answer
 for. A read from the offset of a lost write fails with `OFFSET_TOO_HIGH` until the Stream has
 Records up to it.
+
+With the `wait` option, each create, append and close sends `WAIT` after its script, in one
+pipeline on a connection of its own.
+
+- A write that too few replicas have after the timeout fails with `STORE_UNAVAILABLE`. The write
+  is in Redis, so a retry with its `request_id` writes nothing again.
+- `WAIT` covers the last write of its connection. So a call that finds its work done (a resend, a
+  close of a closed Stream, a create of a Stream that exists) writes `v` again before the
+  `WAIT`, and it succeeds only once the replicas have the first write.
+- A reader can get a Record before the `WAIT` of its append ends, and a failover can still lose
+  that Record.

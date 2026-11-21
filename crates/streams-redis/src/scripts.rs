@@ -68,4 +68,30 @@ impl ScriptCall {
             result => result,
         }
     }
+
+    /// Runs the call and then `WAIT`, and returns the answer of the script and the number of
+    /// replicas that have its write. Both go in one pipeline, since `WAIT` covers the last write
+    /// of its own connection, and a command of another call could come between them.
+    pub(crate) async fn run_and_wait(
+        &self,
+        conn: &mut impl ConnectionLike,
+        (replicas, timeout_ms): (usize, u64),
+    ) -> RedisResult<(Value, usize)> {
+        let mut pipe = redis::pipe();
+        // The answers come back as values, so a refusal of the script doesn't hide the `WAIT`.
+        pipe.ignore_errors().add_command(self.cmd.clone());
+        pipe.cmd("WAIT").arg(replicas).arg(timeout_ms);
+        let mut answers: (Value, Value) = pipe.query_async(conn).await?;
+        if let Value::ServerError(error) = &answers.0
+            && error.kind() == Some(ServerErrorKind::NoScript)
+        {
+            self.script.load_async(conn).await?;
+            answers = pipe.query_async(conn).await?;
+        }
+        let (answer, acknowledged) = answers;
+        Ok((
+            answer.extract_error()?,
+            redis::from_redis_value(acknowledged.extract_error()?)?,
+        ))
+    }
 }

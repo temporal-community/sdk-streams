@@ -82,6 +82,28 @@ impl RedisStore {
         T::from_redis_value(reply).map_err(|error| corrupt("an answer of a script", error))
     }
 
+    /// Runs a script that writes. With the `wait` option, the call succeeds only once enough
+    /// replicas have the write.
+    async fn write<T, R>(&self, call: &ScriptCall) -> Result<T, StreamError<Reason<R>>>
+    where
+        T: FromRedisValue,
+        R: WireReason,
+    {
+        let Some(wait) = self.settings.wait else {
+            return self.run(call).await;
+        };
+        let reply = self.conns().await?.write_and_wait(call, wait).await;
+        let (reply, acknowledged) = reply.map_err(|error| from_redis(&error))?;
+        let (replicas, timeout_ms) = wait;
+        if acknowledged < replicas {
+            return Err(StreamError::store_unavailable(format!(
+                "{acknowledged} of {replicas} replicas have the write after {timeout_ms} ms. A \
+                 failover can lose it, and a retry with its request_id doesn't write it again"
+            )));
+        }
+        T::from_redis_value(reply).map_err(|error| corrupt("an answer of a script", error))
+    }
+
     async fn create(
         &self,
         request: CreateStreamRequest,
@@ -93,8 +115,9 @@ impl RedisStore {
         call.arg(&request_key(b"", &request.request_id)[..])
             .arg(self.settings.retention_ms)
             .arg(idle.map(|ms| ms.to_string()).unwrap_or_default())
-            .arg(use_existing);
-        let created: i64 = self.run(&call).await?;
+            .arg(use_existing)
+            .arg(self.settings.wait.is_some());
+        let created: i64 = self.write(&call).await?;
         Ok(CreateStreamResponse {
             created: created == 1,
         })
@@ -116,11 +139,12 @@ impl RedisStore {
             .arg(&request_key(&attempt, &request.request_id)[..])
             .arg(self.settings.fence == Fence::On)
             .arg(self.settings.resend_window)
+            .arg(self.settings.wait.is_some())
             .arg(producer.encode_to_vec());
         for record in request.records {
             call.arg(record.body.unwrap_or_default().encode_to_vec());
         }
-        let (ms, first_seq, last_seq) = self.run(&call).await?;
+        let (ms, first_seq, last_seq) = self.write(&call).await?;
         let offset = |seq| EntryId { ms, seq }.offset();
         Ok(AppendRecordsResponse {
             first_offset: offset(first_seq),
@@ -135,8 +159,9 @@ impl RedisStore {
         let mut call = ScriptCall::write(&scripts::CLOSE, &keys);
         call.arg(field)
             .arg(&attempt[..])
-            .arg(self.settings.fence == Fence::On);
-        let _: i64 = self.run(&call).await?;
+            .arg(self.settings.fence == Fence::On)
+            .arg(self.settings.wait.is_some());
+        let _: i64 = self.write(&call).await?;
         Ok(CloseStreamResponse {})
     }
 

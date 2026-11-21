@@ -19,25 +19,30 @@ pub(crate) fn waiting(stream_id: &str, from_offset: &[u8], seconds: i64) -> Read
     request
 }
 
-/// Returns the number of clients that block in `XREAD` on the server.
-async fn blocked_reads(admin: &mut MultiplexedConnection) -> usize {
+/// Returns the number of clients that block in `command` on the server.
+async fn blocked(admin: &mut MultiplexedConnection, command: &str) -> usize {
     let clients: String = redis::cmd("CLIENT")
         .arg("LIST")
         .query_async(admin)
         .await
         .unwrap();
-    let blocked = |client: &&str| client.contains(" cmd=xread ") && client.contains(" flags=b");
+    let command = format!(" cmd={command} ");
+    let blocked = |client: &&str| client.contains(&command) && client.contains(" flags=b");
     clients.lines().filter(blocked).count()
 }
 
 /// Waits until `count` clients block in `XREAD`, so the next write of the test finds them there.
 pub(crate) async fn until_blocked(url: &str, count: usize) {
+    until_blocked_in(url, "xread", count).await;
+}
+
+pub(crate) async fn until_blocked_in(url: &str, command: &str, count: usize) {
     let mut admin = admin(url).await;
     let started = Instant::now();
-    while blocked_reads(&mut admin).await != count {
+    while blocked(&mut admin, command).await != count {
         assert!(
             started.elapsed() < Duration::from_secs(20),
-            "no read blocked"
+            "no call blocked"
         );
         tokio::time::sleep(Duration::from_millis(5)).await;
     }

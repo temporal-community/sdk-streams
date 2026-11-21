@@ -17,7 +17,7 @@ use temporalio_streams_redis::{RedisServers, RedisStoreOptions};
 
 const PREFIX: &str = "temporal-streams";
 
-async fn slot_of(node: &Redis, key: &str) -> u16 {
+pub(crate) async fn slot_of(node: &Redis, key: &str) -> u16 {
     let mut keyslot = redis::cmd("CLUSTER");
     keyslot.arg("KEYSLOT").arg(key);
     keyslot.query_async(&mut node.admin().await).await.unwrap()

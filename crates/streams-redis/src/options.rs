@@ -26,6 +26,27 @@ pub enum RedisServers {
     Cluster(Vec<String>),
 }
 
+/// The replicas that a write waits for, with the Redis command `WAIT`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WaitForReplicas {
+    /// The number of replicas that must have a write before its call succeeds.
+    pub replicas: usize,
+    /// How long a write waits for them. Keep it well below the `response_timeout` of the Store,
+    /// or a write that waits this long fails as a call with no response. Redis ends a wait at
+    /// its next timer tick, which can be 100 ms after this time.
+    pub timeout: Duration,
+}
+
+impl WaitForReplicas {
+    /// Returns a wait for `replicas` replicas with a timeout of 1 second.
+    pub fn new(replicas: usize) -> Self {
+        Self {
+            replicas,
+            timeout: Duration::from_secs(1),
+        }
+    }
+}
+
 /// The options of a [`RedisStore`](crate::RedisStore). No option has an upper bound, and
 /// [`RedisStore::new`](crate::RedisStore::new) refuses a zero or an empty value.
 // It has no `Debug`, since a URL can hold a password.
@@ -51,8 +72,15 @@ pub struct RedisStoreOptions {
     pub resend_window: usize,
     /// How long a call waits for Redis to respond, 5 seconds by default.
     pub response_timeout: Duration,
-    /// Maximum number of reads that block on one node of Redis at a time, 256 by default. Each
-    /// one has its own connection, and a read over the maximum polls once a second.
+    /// The replicas that each create, append and close waits for. It's `None` by default, and a
+    /// write then succeeds once its Redis node has it. Redis replicates after it answers, so a
+    /// failover can lose such a write. With a wait, a write that too few replicas have in time
+    /// fails with `STORE_UNAVAILABLE`, and a retry with its `request_id` writes nothing again.
+    pub wait: Option<WaitForReplicas>,
+    /// Maximum number of calls that block on Redis at a time, 256 by default. A read that waits
+    /// for a Record and a write that waits for its replicas each have a connection of their
+    /// own. The maximum holds for the reads of one node, and again for the writes. A read over
+    /// it polls once a second, and a write waits for a free connection.
     pub max_blocking_connections: usize,
 }
 
@@ -67,6 +95,7 @@ impl RedisStoreOptions {
             fence: Fence::Off,
             resend_window: 16,
             response_timeout: Duration::from_secs(5),
+            wait: None,
             max_blocking_connections: 256,
         }
     }
@@ -91,6 +120,13 @@ impl RedisStoreOptions {
         if self.max_blocking_connections == 0 {
             return invalid("max_blocking_connections must be 1 or more");
         }
+        if self.wait.is_some_and(|wait| wait.replicas == 0) {
+            return invalid("wait must be for 1 replica or more");
+        }
+        // `WAIT` with a timeout of zero waits with no end.
+        let wait = (self.wait)
+            .map(|wait| Ok((wait.replicas, millis("The timeout of wait", wait.timeout)?)))
+            .transpose()?;
         // The message leaves the URL out, since it can hold a password.
         let parse = |url: &String| {
             url.as_str().into_connection_info().map_err(|error| {
@@ -117,12 +153,14 @@ impl RedisStoreOptions {
             fence: self.fence,
             resend_window: self.resend_window,
             response_timeout: self.response_timeout,
+            wait,
             max_blocking_connections: self.max_blocking_connections,
         })
     }
 }
 
 /// The servers of a Store, with each URL parsed.
+#[derive(Clone)]
 pub(crate) enum Servers {
     Standalone(ConnectionInfo),
     Cluster(Vec<ConnectionInfo>),
@@ -137,6 +175,8 @@ pub(crate) struct Settings {
     pub(crate) fence: Fence,
     pub(crate) resend_window: usize,
     pub(crate) response_timeout: Duration,
+    /// The replicas that a write waits for, and for how many ms.
+    pub(crate) wait: Option<(usize, u64)>,
     pub(crate) max_blocking_connections: usize,
 }
 

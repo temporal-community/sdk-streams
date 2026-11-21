@@ -1,11 +1,12 @@
-//! The connections of the Store. A blocked `XREAD` stops every later command on its connection,
-//! so each read that waits takes a connection from a pool, and the calls that don't block share
-//! one.
+//! The connections of the Store. A blocked `XREAD` or `WAIT` stops every later command on its
+//! connection. So each read that waits, and each write that waits for its replicas, takes a
+//! connection from a pool, and the calls that don't block share one.
 
 use crate::{
     keys::StreamKeys,
     offset::EntryId,
     options::{Servers, Settings},
+    scripts::ScriptCall,
 };
 use parking_lot::Mutex;
 use redis::{
@@ -171,9 +172,31 @@ fn slot_ranges(reply: Vec<Vec<Value>>, seed_host: &str) -> RedisResult<Vec<SlotR
     ranges.collect()
 }
 
+/// Opens a connection of the kind that the calls share.
+async fn connect(servers: &Servers, response_timeout: Duration) -> RedisResult<Shared> {
+    match servers {
+        Servers::Standalone(server) => {
+            let config =
+                ConnectionManagerConfig::new().set_response_timeout(Some(response_timeout));
+            let client = Client::open(server.clone())?;
+            let conn = client.get_connection_manager_with_config(config).await?;
+            Ok(Shared::Single(conn))
+        }
+        Servers::Cluster(nodes) => {
+            let client = ClusterClient::builder(nodes.clone())
+                .response_timeout(response_timeout)
+                .build()?;
+            Ok(Shared::Cluster(client.get_async_connection().await?))
+        }
+    }
+}
+
 /// The connections of one Store.
 pub(crate) struct Connections {
     shared: Shared,
+    servers: Servers,
+    /// The connections of the writes that wait for their replicas.
+    writers: Pool<Shared>,
     /// The first URL of the options, whose credentials and TLS every node gets.
     seed: ConnectionInfo,
     /// What the Store knows of the slots of a cluster. A read that finds it empty asks again.
@@ -186,24 +209,14 @@ pub(crate) struct Connections {
 
 impl Connections {
     pub(crate) async fn open(settings: &Settings) -> RedisResult<Self> {
-        let (shared, seed) = match &settings.servers {
-            Servers::Standalone(server) => {
-                let config = ConnectionManagerConfig::new()
-                    .set_response_timeout(Some(settings.response_timeout));
-                let client = Client::open(server.clone())?;
-                let conn = client.get_connection_manager_with_config(config).await?;
-                (Shared::Single(conn), server)
-            }
-            Servers::Cluster(nodes) => {
-                let client = ClusterClient::builder(nodes.clone())
-                    .response_timeout(settings.response_timeout)
-                    .build()?;
-                let conn = client.get_async_connection().await?;
-                (Shared::Cluster(conn), &nodes[0])
-            }
+        let seed = match &settings.servers {
+            Servers::Standalone(server) => server,
+            Servers::Cluster(nodes) => &nodes[0],
         };
         Ok(Self {
-            shared,
+            shared: connect(&settings.servers, settings.response_timeout).await?,
+            servers: settings.servers.clone(),
+            writers: Pool::new(settings.max_blocking_connections),
             seed: seed.clone(),
             slots: Mutex::default(),
             readers: Mutex::default(),
@@ -215,6 +228,26 @@ impl Connections {
     /// Returns the connection of the calls that don't block.
     pub(crate) fn shared(&self) -> Shared {
         self.shared.clone()
+    }
+
+    /// Runs a script that writes, and then `WAIT` for `wait`, on a connection of its own. It
+    /// returns the answer of the script and the number of replicas that have its write.
+    pub(crate) async fn write_and_wait(
+        &self,
+        call: &ScriptCall,
+        wait: (usize, u64),
+    ) -> RedisResult<(Value, usize)> {
+        let open = || connect(&self.servers, self.response_timeout);
+        let lease = tokio::time::timeout(self.response_timeout, self.writers.lease(open)).await;
+        let busy = "No connection for a write that waits for its replicas got free in time";
+        let mut lease = lease.map_err(|_| RedisError::from(std::io::Error::other(busy)))??;
+        let answer = call.run_and_wait(&mut lease.conn, wait).await;
+        match &answer {
+            // An error with no code is not an answer of Redis, so the `WAIT` may still block.
+            Err(error) if error.code().is_none() => lease.close(),
+            _ => lease.give_back(),
+        }
+        answer
     }
 
     /// Waits until the Stream has an entry after `after`, until it closes, or until `deadline`.
