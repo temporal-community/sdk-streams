@@ -1,5 +1,7 @@
 [workspace]
-members = ["crates/streams-redis"]
+members = ["crates/streams-redis", "python"]
+# The native module of the Python package links Python, so only its own build makes it.
+default-members = ["crates/streams-redis"]
 resolver = "3"
 
 [workspace.package]
