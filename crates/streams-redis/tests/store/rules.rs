@@ -1,9 +1,9 @@
 //! The rules of a Stream, over generated calls. The test keeps what it sent and what was
 //! answered, states the rule of each call on that, and compares the whole answer.
 
-use crate::support::{Redis, Rng, keys, seeds, snapshot};
+use crate::support::{Cluster, Redis, Rng, keys, seeds, snapshot, standalone};
 use prost::encoding::message::encoded_len;
-use redis::aio::MultiplexedConnection;
+use redis::aio::ConnectionLike;
 use std::{
     collections::{HashMap, VecDeque},
     sync::Arc,
@@ -33,12 +33,29 @@ const STREAMS: [&str; 2] = ["a}{%é", "b"];
 #[tokio::test(flavor = "multi_thread")]
 async fn a_store_follows_the_rules_for_any_calls() {
     let redis = Redis::start(&[]);
+    run_seeds(40, || standalone(redis.url()), redis.admin().await).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_store_follows_the_rules_on_a_cluster() {
+    let cluster = Cluster::start().await;
+    run_seeds(10, || cluster.options(), cluster.admin().await).await;
+}
+
+/// Runs the seeds of the generated calls on Stores with `options`, with the fence off and on.
+/// `admin` reads the keys of a Stream and deletes its log.
+async fn run_seeds<C: ConnectionLike + Clone>(
+    count: u64,
+    options: impl Fn() -> RedisStoreOptions,
+    admin: C,
+) {
     for fence in [Fence::Off, Fence::On] {
-        for seed in seeds(40) {
-            let mut options = RedisStoreOptions::new(redis.url());
+        for seed in seeds(count) {
+            let mut options = options();
             options.key_prefix = format!("rules-{seed}-{fence:?}");
             options.fence = fence;
-            Run::new(&redis.url(), options, seed).await.run().await;
+            options.resend_window = WINDOW;
+            Run::new(options, admin.clone(), seed).run().await;
         }
     }
 }
@@ -110,23 +127,22 @@ enum Expected {
 }
 
 /// The run of one seed, with its Store, the Streams that the test knows, and the generator.
-struct Run {
+struct Run<C> {
     seed: u64,
     fence: Fence,
     prefix: String,
     /// The Store with no runtime in front, to see what the runtime changes of its answers.
     store: Arc<RedisStore>,
     runtime: StreamRuntime,
-    admin: MultiplexedConnection,
+    admin: C,
     rng: Rng,
     known: HashMap<String, Known>,
     /// The appends that the test sent, the newest last, for the resends.
     sent: Vec<AppendRecordsRequest>,
 }
 
-impl Run {
-    async fn new(url: &str, mut options: RedisStoreOptions, seed: u64) -> Self {
-        options.resend_window = WINDOW;
+impl<C: ConnectionLike> Run<C> {
+    fn new(options: RedisStoreOptions, admin: C, seed: u64) -> Self {
         let (fence, prefix) = (options.fence, options.key_prefix.clone());
         let store = Arc::new(RedisStore::new(options).unwrap());
         Self {
@@ -135,7 +151,7 @@ impl Run {
             prefix,
             runtime: StreamRuntime::new(store.clone(), StoreLimits::default()),
             store,
-            admin: crate::support::admin(url).await,
+            admin,
             rng: Rng::new(seed),
             known: STREAMS.map(|id| (id.to_string(), Known::default())).into(),
             sent: Vec::new(),

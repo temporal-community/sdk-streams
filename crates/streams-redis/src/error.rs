@@ -1,6 +1,6 @@
 //! The reason of each failed Redis call.
 
-use redis::RedisError;
+use redis::{ErrorKind, RedisError, ServerErrorKind};
 use temporalio_streams::{Reason, StreamError, WireReason, proto::StreamErrorReason};
 
 /// Returns the error of an operation for a failed Redis call.
@@ -50,6 +50,13 @@ pub(crate) fn outage(error: &RedisError) -> String {
     {
         return format!(
             "Redis doesn't know a command of the Store, which needs Redis 7.0: {error}"
+        );
+    }
+    // The cluster connection follows a redirect, so only a Store for one server gets one.
+    if let ErrorKind::Server(ServerErrorKind::Moved | ServerErrorKind::Ask) = error.kind() {
+        return format!(
+            "A node of a Redis Cluster redirected the call, so the Store needs \
+             `RedisServers::Cluster`: {error}"
         );
     }
     format!("Redis failed: {error}")

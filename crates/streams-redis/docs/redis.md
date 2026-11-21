@@ -17,6 +17,8 @@ A Stream has four keys. `<prefix>` is the `key_prefix` of the Store. `<id>` is t
 | `<prefix>:{<id>}:producers` | hash | One field for each Producer that wrote to the Stream |
 | `<prefix>:{<id>}:closed` | stream | One entry, which the close adds |
 
+- The keys have one hash tag, so a Redis Cluster keeps them in one slot and one script can use
+  them all.
 - A key has no Temporal namespace, so a Stream id is unique in one Redis and key prefix. Give
   each namespace its own prefix, or its own Redis.
 
@@ -157,6 +159,17 @@ Redis can lose `:log` and keep `:meta`, for example with an eviction policy. Use
   works.
 - A lost `:producers` or `:meta` is not detected. The Store then accepts an earlier attempt
   again, and it writes a resend a second time.
+
+## A Redis Cluster that moves a slot
+
+Each script declares every key that it uses, so Redis runs it only on a node that has all of
+them. While a slot moves, a script whose keys exist only in part gets `TRYAGAIN`. That is the
+case for a close, whose `:closed` key doesn't exist before it, and for the first append of a
+Stream. They fail with `STORE_UNAVAILABLE` until the move of their slot ends, and they write
+nothing. A Stream whose keys all exist is served while its slot moves.
+
+A read that waits blocks on the node of its Stream's slot, which it finds with `CLUSTER SLOTS`.
+While the slot moves, it polls every 100 ms.
 
 ## Replication
 

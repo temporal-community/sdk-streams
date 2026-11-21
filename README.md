@@ -9,8 +9,8 @@ Experimental.
 ## Using the Store
 
 ```rust
-let options = RedisStoreOptions::new("redis://localhost:6379");
-let store = RedisStore::new(options)?;
+let servers = RedisServers::Standalone("redis://localhost:6379".to_string());
+let store = RedisStore::new(RedisStoreOptions::new(servers))?;
 let runtime = StreamRuntime::new(Arc::new(store), StoreLimits::default());
 ```
 
@@ -19,16 +19,17 @@ before the Store gets it. The runtime also takes the limits of a batch, and the 
 
 | Option | Default | Use |
 |---|---|---|
-| `url` | | The `redis://` or `rediss://` URL of the server, with the credentials |
+| `servers` | | The URL of one server, or the URLs of some nodes of a Redis Cluster |
 | `key_prefix` | `temporal-streams` | The prefix of every key |
 | `retention` | 7 days | How long a Stream stays readable after its close |
 | `producer_idle_ttl` | none | How long an open Stream stays after its last append |
 | `fence` | `Fence::Off` | Whether a write of an earlier attempt of a Producer is refused |
 | `resend_window` | 16 | The batches of a Producer whose `request_id` the Store remembers |
 | `response_timeout` | 5 s | How long a call waits for Redis |
-| `max_blocking_connections` | 256 | The reads that can wait on Redis at a time |
+| `max_blocking_connections` | 256 | The reads that can wait on one node at a time |
 
-No option has an upper bound, and a zero or an empty value is refused. A Stream keeps the
+A URL starts with `redis://` or `rediss://` and has the credentials. No option has an upper
+bound, and a zero or an empty value is refused. A Stream keeps the
 `retention` and the `producer_idle_ttl` of the Store that created it.
 `crates/streams-redis/docs/redis.md` describes what the Store keeps in Redis.
 

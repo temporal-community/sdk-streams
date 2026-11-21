@@ -19,5 +19,5 @@ mod producer;
 mod scripts;
 mod store;
 
-pub use options::{Fence, RedisStoreOptions};
+pub use options::{Fence, RedisServers, RedisStoreOptions};
 pub use store::RedisStore;

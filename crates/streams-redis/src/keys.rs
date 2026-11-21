@@ -4,16 +4,23 @@
 /// and one script can use them all.
 pub(crate) struct StreamKeys {
     base: String,
+    tag: String,
 }
 
 impl StreamKeys {
     /// Returns the keys of the Stream `stream_id` under the key prefix `prefix`.
     pub(crate) fn new(prefix: &str, stream_id: &str) -> Self {
         // A `}` in the id would end the hash tag before the id ends, and `%` marks an escape.
-        let id = stream_id.replace('%', "%25").replace('}', "%7D");
+        let tag = stream_id.replace('%', "%25").replace('}', "%7D");
         Self {
-            base: format!("{prefix}:{{{id}}}"),
+            base: format!("{prefix}:{{{tag}}}"),
+            tag,
         }
+    }
+
+    /// Returns the slot of the keys in a Redis Cluster, which Redis computes from their hash tag.
+    pub(crate) fn slot(&self) -> u16 {
+        crc16::State::<crc16::XMODEM>::calculate(self.tag.as_bytes()) % 16384
     }
 
     /// Returns the key of the hash with the state of the Stream.

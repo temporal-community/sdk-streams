@@ -1,7 +1,7 @@
 //! When a Stream expires, and what an expired Stream answers.
 
 use crate::support::{
-    Redis, Rng, append, close, create, describe, keys, read, reason, runtime, seeds,
+    Redis, Rng, append, close, create, describe, keys, read, reason, runtime, seeds, standalone,
 };
 use redis::aio::MultiplexedConnection;
 use std::time::Duration;
@@ -9,7 +9,6 @@ use temporalio_streams::{
     StreamRuntime,
     proto::{CreateStreamRequest, StreamErrorReason, StreamIdConflictPolicy},
 };
-use temporalio_streams_redis::RedisStoreOptions;
 
 /// How long the meta key stays after its Stream expired, in ms.
 const TOMBSTONE: i64 = 30 * 24 * 60 * 60 * 1000;
@@ -52,7 +51,7 @@ async fn each_key_expires_when_its_rule_says() {
         let settings = [(); 2].map(|()| (rng.pick(&ttls), rng.chance(60).then(|| rng.pick(&ttls))));
         let stores: Vec<StreamRuntime> = (settings.iter())
             .map(|(retention, producer_idle_ttl)| {
-                let mut options = RedisStoreOptions::new(redis.url());
+                let mut options = standalone(redis.url());
                 options.key_prefix = prefix.clone();
                 options.retention = *retention;
                 options.producer_idle_ttl = *producer_idle_ttl;
@@ -132,7 +131,7 @@ async fn an_expired_stream_answers_expired() {
     let redis = Redis::start(&[]);
     let mut admin = redis.admin().await;
     let store = |retention, producer_idle_ttl| {
-        let mut options = RedisStoreOptions::new(redis.url());
+        let mut options = standalone(redis.url());
         options.retention = retention;
         options.producer_idle_ttl = producer_idle_ttl;
         runtime(options)

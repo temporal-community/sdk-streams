@@ -16,13 +16,23 @@ pub enum Fence {
     On,
 }
 
+/// Where the Redis of a Store is. A URL starts with `redis://` or `rediss://`, and it also sets
+/// the credentials and TLS.
+pub enum RedisServers {
+    /// One server, by its URL.
+    Standalone(String),
+    /// A Redis Cluster, by the URLs of some of its nodes. The Store finds the other nodes, and
+    /// it connects to every node with the credentials and TLS of the first URL.
+    Cluster(Vec<String>),
+}
+
 /// The options of a [`RedisStore`](crate::RedisStore). No option has an upper bound, and
 /// [`RedisStore::new`](crate::RedisStore::new) refuses a zero or an empty value.
-// It has no `Debug`, since the URL can hold a password.
+// It has no `Debug`, since a URL can hold a password.
 #[non_exhaustive]
 pub struct RedisStoreOptions {
-    /// The `redis://` or `rediss://` URL of the server, which also sets the credentials and TLS.
-    pub url: String,
+    /// Where the Redis is.
+    pub servers: RedisServers,
     /// The prefix of every key of the Store, `temporal-streams` by default. A key has no Temporal
     /// namespace, so a Stream id is unique in one Redis and key prefix. The prefix has only
     /// letters, digits and the characters `-._~:`, so that a key and an ACL key pattern have it
@@ -41,16 +51,16 @@ pub struct RedisStoreOptions {
     pub resend_window: usize,
     /// How long a call waits for Redis to respond, 5 seconds by default.
     pub response_timeout: Duration,
-    /// Maximum number of reads that block on Redis at a time, 256 by default. Each one has its
-    /// own connection, and a read over the maximum polls once a second.
+    /// Maximum number of reads that block on one node of Redis at a time, 256 by default. Each
+    /// one has its own connection, and a read over the maximum polls once a second.
     pub max_blocking_connections: usize,
 }
 
 impl RedisStoreOptions {
-    /// Returns the default options for the server at `url`.
-    pub fn new(url: impl Into<String>) -> Self {
+    /// Returns the default options for the Redis at `servers`.
+    pub fn new(servers: RedisServers) -> Self {
         Self {
-            url: url.into(),
+            servers,
             key_prefix: "temporal-streams".to_string(),
             retention: Duration::from_secs(7 * 24 * 60 * 60),
             producer_idle_ttl: None,
@@ -82,12 +92,23 @@ impl RedisStoreOptions {
             return invalid("max_blocking_connections must be 1 or more");
         }
         // The message leaves the URL out, since it can hold a password.
-        let server = self.url.as_str().into_connection_info().map_err(|error| {
-            let reason = error.detail().unwrap_or("it did not parse");
-            AnyError::invalid_argument(format!("The Redis URL is wrong: {reason}"))
-        })?;
+        let parse = |url: &String| {
+            url.as_str().into_connection_info().map_err(|error| {
+                let reason = error.detail().unwrap_or("it did not parse");
+                AnyError::invalid_argument(format!("A Redis URL is wrong: {reason}"))
+            })
+        };
+        let servers = match &self.servers {
+            RedisServers::Standalone(url) => Servers::Standalone(parse(url)?),
+            RedisServers::Cluster(urls) if urls.is_empty() => {
+                return invalid("servers must have the URL of one node or more");
+            }
+            RedisServers::Cluster(urls) => {
+                Servers::Cluster(urls.iter().map(parse).collect::<Result<_, _>>()?)
+            }
+        };
         Ok(Settings {
-            server,
+            servers,
             key_prefix: self.key_prefix,
             retention_ms: millis("retention", self.retention)?,
             producer_idle_ttl_ms: (self.producer_idle_ttl)
@@ -101,9 +122,15 @@ impl RedisStoreOptions {
     }
 }
 
+/// The servers of a Store, with each URL parsed.
+pub(crate) enum Servers {
+    Standalone(ConnectionInfo),
+    Cluster(Vec<ConnectionInfo>),
+}
+
 /// The options of a Store after [`RedisStoreOptions::check`].
 pub(crate) struct Settings {
-    pub(crate) server: ConnectionInfo,
+    pub(crate) servers: Servers,
     pub(crate) key_prefix: String,
     pub(crate) retention_ms: u64,
     pub(crate) producer_idle_ttl_ms: Option<u64>,

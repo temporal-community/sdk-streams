@@ -2,21 +2,21 @@
 //! wrong setup.
 
 use crate::support::{
-    Proxy, Redis, append, close, create, describe, free_port, keys, read, reason, runtime, snapshot,
+    Proxy, Redis, append, close, create, describe, free_port, keys, read, reason, runtime,
+    snapshot, standalone,
 };
 use std::{future::Future, time::Duration};
 use temporalio_streams::{
     AnyReason, Reason, StreamError,
     proto::{AppendRecordsRequest, CreateStreamRequest, CreateStreamResponse, StreamErrorReason},
 };
-use temporalio_streams_redis::RedisStoreOptions;
 use tokio::time::Instant;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_newer_format_refuses_every_call() {
     let redis = Redis::start(&[]);
     let mut admin = redis.admin().await;
-    let store = runtime(RedisStoreOptions::new(redis.url()));
+    let store = runtime(standalone(redis.url()));
     store.create_stream(create("s")).await.unwrap();
     store.append_records(append("s", &[b"x"])).await.unwrap();
     let [meta, ..] = keys("temporal-streams", "s");
@@ -41,7 +41,7 @@ async fn a_newer_format_refuses_every_call() {
 }
 
 /// Returns the first answer of `call` that is no outage, as a caller that retries gets it.
-async fn after_outage<T, R, F>(call: impl Fn() -> F) -> Result<T, StreamError<Reason<R>>>
+pub(crate) async fn after_outage<T, R, F>(call: impl Fn() -> F) -> Result<T, StreamError<Reason<R>>>
 where
     F: Future<Output = Result<T, StreamError<Reason<R>>>>,
 {
@@ -65,7 +65,7 @@ where
 async fn a_lost_reply_is_an_outage_and_its_retry_writes_nothing() {
     let redis = Redis::start(&[]);
     let proxy = Proxy::start(redis.port).await;
-    let store = runtime(RedisStoreOptions::new(proxy.url()));
+    let store = runtime(standalone(proxy.url()));
     let unavailable = StreamErrorReason::StoreUnavailable;
     // Redis has each script after these calls, so the next call of one runs it at its first try.
     store.create_stream(create("warm")).await.unwrap();
@@ -115,7 +115,7 @@ async fn a_lost_reply_is_an_outage_and_its_retry_writes_nothing() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_store_that_starts_before_redis_connects_later() {
     let port = free_port();
-    let store = runtime(RedisStoreOptions::new(format!("redis://127.0.0.1:{port}")));
+    let store = runtime(standalone(format!("redis://127.0.0.1:{port}")));
     let unavailable = StreamErrorReason::StoreUnavailable;
     assert_eq!(reason(store.create_stream(create("s")).await), unavailable);
     let _redis = Redis::start_on(port, &[]);
@@ -146,21 +146,21 @@ async fn a_wrong_setup_is_an_outage_that_says_its_cause() {
         .query_async(&mut admin)
         .await
         .unwrap();
-    let no_password = runtime(RedisStoreOptions::new(redis.url()));
+    let no_password = runtime(standalone(redis.url()));
     let message = outage(no_password.create_stream(create("s")).await.unwrap_err());
     assert!(
         message.to_lowercase().contains("authentication"),
         "{message}"
     );
 
-    let wrong_password = runtime(RedisStoreOptions::new(url(":wrong")));
+    let wrong_password = runtime(standalone(url(":wrong")));
     let message = outage(wrong_password.create_stream(create("s")).await.unwrap_err());
     assert!(
         message.to_lowercase().contains("authentication"),
         "{message}"
     );
 
-    let no_xadd = runtime(RedisStoreOptions::new(url("no-xadd:pw")));
+    let no_xadd = runtime(standalone(url("no-xadd:pw")));
     no_xadd.create_stream(create("s")).await.unwrap();
     let message = outage(
         no_xadd

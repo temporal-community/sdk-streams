@@ -1,17 +1,18 @@
 //! Reads that wait for a Record.
 
-use crate::support::{Redis, admin, append, client, close, create, read, record, runtime};
+use crate::support::{
+    Redis, admin, append, client, close, create, read, record, runtime, standalone,
+};
 use redis::aio::MultiplexedConnection;
 use std::{sync::Arc, time::Duration};
 use temporalio_streams::{
     StreamRuntime,
     proto::{ReadRecordsRequest, ReadRecordsResponse, StreamRecord},
 };
-use temporalio_streams_redis::RedisStoreOptions;
 use tokio::time::Instant;
 
 /// Returns a read that waits for up to `seconds`.
-fn waiting(stream_id: &str, from_offset: &[u8], seconds: i64) -> ReadRecordsRequest {
+pub(crate) fn waiting(stream_id: &str, from_offset: &[u8], seconds: i64) -> ReadRecordsRequest {
     let mut request = read(stream_id, from_offset);
     request.wait = Some(Default::default());
     request.wait.as_mut().unwrap().seconds = seconds;
@@ -42,7 +43,8 @@ pub(crate) async fn until_blocked(url: &str, count: usize) {
     }
 }
 
-fn page(offset: &[u8], data: &[u8]) -> ReadRecordsResponse {
+/// Returns a page with one Record of the test's client.
+pub(crate) fn page(offset: &[u8], data: &[u8]) -> ReadRecordsResponse {
     ReadRecordsResponse {
         records: vec![StreamRecord {
             producer: Some(client("client:test")),
@@ -57,7 +59,7 @@ fn page(offset: &[u8], data: &[u8]) -> ReadRecordsResponse {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_waiting_read_wakes_on_an_append_and_on_a_close() {
     let redis = Redis::start(&[]);
-    let store = Arc::new(runtime(RedisStoreOptions::new(redis.url())));
+    let store = Arc::new(runtime(standalone(redis.url())));
     store.create_stream(create("s")).await.unwrap();
     let spawn = |request| {
         let store = store.clone();
@@ -116,7 +118,7 @@ fn read_for_millis(stream_id: &str, millis: i32) -> ReadRecordsRequest {
 #[tokio::test(flavor = "multi_thread")]
 async fn reads_over_the_connection_limit_still_get_their_records() {
     let redis = Redis::start(&[]);
-    let mut options = RedisStoreOptions::new(redis.url());
+    let mut options = standalone(redis.url());
     options.max_blocking_connections = 1;
     let store: Arc<StreamRuntime> = Arc::new(runtime(options));
     store.create_stream(create("s")).await.unwrap();
@@ -164,7 +166,7 @@ async fn bytes_sent(admin: &mut MultiplexedConnection) -> usize {
 async fn a_read_with_a_byte_limit_takes_little_more_from_redis() {
     let redis = Redis::start(&[]);
     let mut admin = redis.admin().await;
-    let store = runtime(RedisStoreOptions::new(redis.url()));
+    let store = runtime(standalone(redis.url()));
     store.create_stream(create("s")).await.unwrap();
     // 300 Records of 2 KiB, which is 30 times the limit of the read.
     let body = [7; 2048];
