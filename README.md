@@ -6,6 +6,9 @@ Experimental.
 `StreamStore` trait of `temporalio-streams`, which is in
 [sdk-rust](https://github.com/temporalio/sdk-rust). It needs Redis 7.0 or later.
 
+`python/` is the package of the Store for the Temporal Python SDK, `temporalio-streams-redis` on
+PyPI, with `RedisStreamStore`. Its own README says how to use it.
+
 ## Using the Store
 
 ```rust
