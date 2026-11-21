@@ -2,6 +2,7 @@
 //! when it ends. `REDIS_SERVER` picks the binary, and `STREAMS_SEED` runs one seed of a generated
 //! test.
 
+mod cluster;
 mod faults;
 mod reads;
 mod rules;

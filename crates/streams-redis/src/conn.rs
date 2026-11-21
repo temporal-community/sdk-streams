@@ -3,14 +3,22 @@
 //! one.
 
 use crate::{
-    RedisUrl, error::RedisStoreResult, keys::StreamKeys, offset::EntryId, options::Settings,
+    RedisServers,
+    error::{RedisStoreError, RedisStoreResult},
+    keys::StreamKeys,
+    offset::EntryId,
+    options::Settings,
 };
 use parking_lot::Mutex;
 use redis::{
-    AsyncConnectionConfig, Client, Cmd, ErrorKind, RedisError, RedisResult, Value,
-    aio::{ConnectionManager, ConnectionManagerConfig, MultiplexedConnection},
+    AsyncConnectionConfig, Client, Cmd, ConnectionInfo, ErrorKind, FromRedisValue, ParsingError,
+    Pipeline, RedisError, RedisFuture, RedisResult, Value,
+    aio::{ConnectionLike, ConnectionManager, ConnectionManagerConfig, MultiplexedConnection},
+    cluster::ClusterClient,
+    cluster_async::ClusterConnection,
+    from_redis_value,
 };
-use std::{future::Future, num::NonZeroUsize, sync::Arc, time::Duration};
+use std::{collections::HashMap, future::Future, num::NonZeroUsize, sync::Arc, time::Duration};
 use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore},
     time::Instant,
@@ -21,7 +29,8 @@ use tokio::{
 const BUSY_POLL: Duration = Duration::from_secs(1);
 
 /// How long a read pauses after an `XREAD` that failed in a way that can pass, such as a dropped
-/// connection. Then it runs its script again, which fails the read if Redis is still down.
+/// connection or a slot that migrates. Then it runs its script again, which fails the read if
+/// Redis is still down.
 const RETRY_PAUSE: Duration = Duration::from_millis(100);
 
 /// A bounded set of connections, each for one call at a time.
@@ -178,6 +187,108 @@ impl<C> IdleLease<C> {
     }
 }
 
+/// The connection of the calls that don't block, to one server or to a Redis Cluster. Both
+/// reconnect by themselves, and the one of a cluster sends a call to the node of a redirect.
+#[derive(Clone)]
+pub(crate) enum Shared {
+    Single(ConnectionManager),
+    Cluster(ClusterConnection),
+}
+
+impl ConnectionLike for Shared {
+    fn req_packed_command<'a>(&'a mut self, cmd: &'a Cmd) -> RedisFuture<'a, Value> {
+        match self {
+            Shared::Single(conn) => conn.req_packed_command(cmd),
+            Shared::Cluster(conn) => conn.req_packed_command(cmd),
+        }
+    }
+
+    fn req_packed_commands<'a>(
+        &'a mut self,
+        pipeline: &'a Pipeline,
+        offset: usize,
+        count: usize,
+    ) -> RedisFuture<'a, Vec<Value>> {
+        match self {
+            Shared::Single(conn) => conn.req_packed_commands(pipeline, offset, count),
+            Shared::Cluster(conn) => conn.req_packed_commands(pipeline, offset, count),
+        }
+    }
+
+    fn get_db(&self) -> i64 {
+        match self {
+            Shared::Single(conn) => conn.get_db(),
+            Shared::Cluster(conn) => conn.get_db(),
+        }
+    }
+}
+
+/// A range of slots of a Redis Cluster, and its primary. The reply of `CLUSTER SLOTS` has an
+/// array for each range, with its first slot, its last slot, and then its nodes, the primary
+/// first. A node is an array of its host, its port and more.
+#[derive(Debug, PartialEq)]
+struct SlotRange {
+    first: u16,
+    last: u16,
+    /// The host of the primary. Redis gives none, or an empty one, for a node that the client
+    /// reaches at the host that it asked.
+    host: Option<String>,
+    port: u16,
+}
+
+impl FromRedisValue for SlotRange {
+    fn from_redis_value(value: Value) -> Result<Self, ParsingError> {
+        let range: Vec<Value> = from_redis_value(value)?;
+        let [first, last, primary, ..] = range.as_slice() else {
+            return Err("A range of CLUSTER SLOTS has too few fields"
+                .to_string()
+                .into());
+        };
+        let primary: Vec<Value> = FromRedisValue::from_redis_value_ref(primary)?;
+        let [host, port, ..] = primary.as_slice() else {
+            return Err("A node of CLUSTER SLOTS has too few fields"
+                .to_string()
+                .into());
+        };
+        let host: Option<String> = FromRedisValue::from_redis_value_ref(host)?;
+        Ok(Self {
+            first: FromRedisValue::from_redis_value_ref(first)?,
+            last: FromRedisValue::from_redis_value_ref(last)?,
+            host: host.filter(|host| !host.is_empty()),
+            port: FromRedisValue::from_redis_value_ref(port)?,
+        })
+    }
+}
+
+/// Opens a connection of the kind that the calls share.
+async fn connect(servers: &RedisServers, response_timeout: Duration) -> RedisResult<Shared> {
+    match servers {
+        RedisServers::Standalone(server) => {
+            // A connect that fails must fail its call fast, since the other calls of a Store
+            // with no connection wait behind it. The next call connects again.
+            let config = ConnectionManagerConfig::new()
+                .set_response_timeout(Some(response_timeout))
+                .set_number_of_retries(0);
+            let client = Client::open(server.info().clone())?;
+            let conn = client.get_connection_manager_with_config(config).await?;
+            Ok(Shared::Single(conn))
+        }
+        RedisServers::Cluster { first, rest } => {
+            let nodes = std::iter::once(first).chain(rest);
+            // The client tries a call again after `TRYAGAIN`, `CLUSTERDOWN` and `LOADING`. Its
+            // tries end before the response timeout, so a call that fails has the answer of Redis.
+            let pause = u64::try_from(response_timeout.as_millis() / 20).unwrap_or(u64::MAX);
+            let client = ClusterClient::builder(nodes.map(|node| node.info().clone()))
+                .response_timeout(response_timeout)
+                .retries(16)
+                .min_retry_wait(pause / 2)
+                .max_retry_wait(pause)
+                .build()?;
+            Ok(Shared::Cluster(client.get_async_connection().await?))
+        }
+    }
+}
+
 impl PooledCall<MultiplexedConnection> for Cmd {
     type Answer = Value;
 
@@ -188,32 +299,30 @@ impl PooledCall<MultiplexedConnection> for Cmd {
 
 /// The connections of one Store.
 pub(crate) struct Connections {
-    /// The connection of the calls that don't block, which reconnects by itself.
-    shared: ConnectionManager,
-    url: RedisUrl,
-    /// The connections of the reads that wait.
-    readers: Pool<MultiplexedConnection>,
+    shared: Shared,
+    servers: RedisServers,
+    /// What the Store knows of the slots of a cluster. A read that finds it empty asks again.
+    slots: Mutex<Vec<SlotRange>>,
+    /// The connections of the reads that wait, for each node.
+    readers: Mutex<HashMap<String, Arc<Pool<MultiplexedConnection>>>>,
+    max_blocking_connections: NonZeroUsize,
     response_timeout: Duration,
 }
 
 impl Connections {
     pub(crate) async fn open(settings: &Settings) -> RedisResult<Self> {
-        // A connect that fails must fail its call fast, since the other calls of a Store with no
-        // connection wait behind it. The next call connects again.
-        let config = ConnectionManagerConfig::new()
-            .set_response_timeout(Some(settings.response_timeout))
-            .set_number_of_retries(0);
-        let client = Client::open(settings.url.info().clone())?;
         Ok(Self {
-            shared: client.get_connection_manager_with_config(config).await?,
-            url: settings.url.clone(),
-            readers: Pool::new(settings.max_blocking_connections),
+            shared: connect(&settings.servers, settings.response_timeout).await?,
+            servers: settings.servers.clone(),
+            slots: Mutex::default(),
+            readers: Mutex::default(),
+            max_blocking_connections: settings.max_blocking_connections,
             response_timeout: settings.response_timeout,
         })
     }
 
     /// Returns the connection of the calls that don't block.
-    pub(crate) fn shared(&self) -> ConnectionManager {
+    pub(crate) fn shared(&self) -> Shared {
         self.shared.clone()
     }
 
@@ -229,6 +338,8 @@ impl Connections {
     ) -> RedisStoreResult<()> {
         match self.block(keys, after, deadline).await {
             Err(error) if error.can_pass() => {
+                // The node of the slot may be another one after the failure.
+                self.slots.lock().clear();
                 tokio::select! {
                     () = tokio::time::sleep(RETRY_PAUSE) => {}
                     () = until(deadline) => {}
@@ -245,10 +356,12 @@ impl Connections {
         after: EntryId,
         deadline: Option<Instant>,
     ) -> RedisStoreResult<()> {
+        let node = self.node(keys).await?;
+        let pool = self.pool(node.addr().to_string());
         let open = || async {
             // The read bounds its own wait, so the connection has no response timeout.
             let config = AsyncConnectionConfig::new().set_response_timeout(None);
-            let client = Client::open(self.url.info().clone())?;
+            let client = Client::open(node)?;
             client
                 .get_multiplexed_async_connection_with_config(&config)
                 .await
@@ -260,7 +373,7 @@ impl Connections {
             }
         };
         let xread = xread(keys, after, deadline);
-        let called = self.readers.call(give_up, open, &xread);
+        let called = pool.call(give_up, open, &xread);
         // A server that stopped without closing the connection never replies.
         let end = deadline.and_then(|deadline| deadline.checked_add(self.response_timeout));
         tokio::select! {
@@ -268,6 +381,36 @@ impl Connections {
             () = until(end) => {}
         }
         Ok(())
+    }
+
+    /// Returns the connections of the reads that wait on one node.
+    fn pool(&self, node: String) -> Arc<Pool<MultiplexedConnection>> {
+        let new = || Arc::new(Pool::new(self.max_blocking_connections));
+        self.readers.lock().entry(node).or_insert_with(new).clone()
+    }
+
+    /// Returns the node that a read of the Stream blocks on. It's the one server, or the node of
+    /// a cluster that serves the slot of the Stream's keys.
+    async fn node(&self, keys: &StreamKeys) -> RedisStoreResult<ConnectionInfo> {
+        let first = match &self.servers {
+            RedisServers::Standalone(server) => return Ok(server.info().clone()),
+            RedisServers::Cluster { first, .. } => first,
+        };
+        let slot = keys.slot();
+        let serves = |range: &&SlotRange| range.first <= slot && slot <= range.last;
+        let node = |range: &SlotRange| first.node(range.host.clone(), range.port);
+        let known = self.slots.lock().iter().find(serves).map(node);
+        if let Some(node) = known {
+            return Ok(node);
+        }
+        let mut slots = redis::cmd("CLUSTER");
+        let ranges: Vec<SlotRange> = slots.arg("SLOTS").query_async(&mut self.shared()).await?;
+        let node = ranges.iter().find(serves).map(node);
+        *self.slots.lock() = ranges;
+        node.ok_or_else(|| {
+            let message = "No node of the cluster serves the slot of the Stream";
+            RedisStoreError::Unavailable(message.to_string())
+        })
     }
 }
 
@@ -372,5 +515,32 @@ mod tests {
         assert!(matches!(called, Ok(Called::Answered(9))));
         assert_eq!(*closed_until_9.1.lock(), [8, 9]);
         assert_eq!(*pool.idle.lock(), [9]);
+    }
+
+    #[test]
+    fn cluster_slots_gives_each_range_its_primary() {
+        // Three ranges with a host, an empty host and no host, and a replica after the first
+        // primary.
+        let reply = redis::parse_redis_value(
+            b"*3\r\n*4\r\n:0\r\n:5460\r\n*3\r\n$8\r\n10.0.0.2\r\n:7001\r\n$1\r\na\r\n\
+              *3\r\n$8\r\n10.0.0.5\r\n:7004\r\n$1\r\nb\r\n\
+              *3\r\n:5461\r\n:10922\r\n*3\r\n$0\r\n\r\n:7002\r\n$1\r\nc\r\n\
+              *3\r\n:10923\r\n:16383\r\n*3\r\n$-1\r\n:7003\r\n$1\r\nd\r\n",
+        );
+        let range = |first, last, host: Option<&str>, port| SlotRange {
+            first,
+            last,
+            host: host.map(str::to_string),
+            port,
+        };
+        let ranges: Vec<SlotRange> = from_redis_value(reply.unwrap()).unwrap();
+        let expected = [
+            range(0, 5460, Some("10.0.0.2"), 7001),
+            range(5461, 10922, None, 7002),
+            range(10923, 16383, None, 7003),
+        ];
+        assert_eq!(ranges, expected);
+        let short = redis::parse_redis_value(b"*1\r\n*2\r\n:0\r\n:1\r\n").unwrap();
+        assert!(from_redis_value::<Vec<SlotRange>>(short).is_err());
     }
 }
