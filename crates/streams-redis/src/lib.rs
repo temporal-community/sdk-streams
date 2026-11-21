@@ -6,4 +6,18 @@
     clippy::cast_possible_truncation
 )]
 
-//! The experimental Redis Store of Temporal Streams.
+//! The experimental Redis Store of Temporal Streams. [`RedisStore`] implements the
+//! [`StreamStore`](temporalio_streams::StreamStore) trait of `temporalio-streams` on Redis, and
+//! `docs/redis.md` describes what it stores.
+
+mod conn;
+mod error;
+mod keys;
+mod offset;
+mod options;
+mod producer;
+mod scripts;
+mod store;
+
+pub use options::{Fence, RedisStoreOptions};
+pub use store::RedisStore;
