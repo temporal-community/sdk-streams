@@ -55,7 +55,7 @@ jobs:
             "https://packages.redis.io/deb $(lsb_release -cs) main" \
             | sudo tee /etc/apt/sources.list.d/redis.list
           sudo apt-get update && sudo apt-get install -y redis
-      - run: cargo test --workspace -- --include-ignored
+      - run: cargo test -- --include-ignored
 
   test-redis-7-0:
     name: tests on Redis 7.0
@@ -73,7 +73,42 @@ jobs:
           docker create --name redis-7-0 redis:7.0
           docker cp redis-7-0:/usr/local/bin/redis-server "$RUNNER_TEMP/redis-server"
           echo "REDIS_SERVER=$RUNNER_TEMP/redis-server" >> "$GITHUB_ENV"
-      - run: cargo test --workspace -- --include-ignored
+      - run: cargo test -- --include-ignored
+
+  python:
+    name: Python package
+    runs-on: ubuntu-latest
+    env:
+      # The SDK that has Streams, until a release of it does.
+      TEMPORALIO: temporalio @ git+https://github.com/moetemp/sdk-python@moe/redo/streams-python
+    defaults:
+      run:
+        working-directory: python
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v6
+      - run: scripts/patch-sdk-rust.sh
+        working-directory: .
+      # The tests start their own `redis-server` processes.
+      - name: Install Redis from the Redis apt repo
+        run: |
+          curl -fsSL https://packages.redis.io/gpg \
+            | sudo gpg --dearmor -o /usr/share/keyrings/redis-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/redis-archive-keyring.gpg]" \
+            "https://packages.redis.io/deb $(lsb_release -cs) main" \
+            | sudo tee /etc/apt/sources.list.d/redis.list
+          sudo apt-get update && sudo apt-get install -y redis
+      - run: uv venv && uv pip install --group dev "$TEMPORALIO"
+      - run: uv run --no-sync maturin develop
+      - run: uv run --no-sync ruff check .
+      - run: uv run --no-sync ruff format --check .
+      - run: uv run --no-sync pyright
+      - run: uv run --no-sync pytest
 
   fips:
     name: FIPS build takes no ring
@@ -89,6 +124,6 @@ jobs:
       - run: cargo build --workspace --no-default-features --features fips
       # Normal and build edges only, since the tests' own dependencies may depend on `ring`.
       - run: |
-          tree=$(cargo tree -e normal,build --no-default-features --features fips \
+          tree=$(cargo tree --workspace -e normal,build --no-default-features --features fips \
             -i ring --target all)
           if [ -n "$tree" ]; then echo "$tree"; exit 1; fi
