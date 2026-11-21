@@ -7,14 +7,15 @@
 -- 3. The request key of the batch (16 bytes)
 -- 4. `1` when the Store fences
 -- 5. The number of batches that the Store remembers for a Producer
--- 6. The encoded Producer
--- 7. The encoded body of each Record, one argument each. A batch has one Record or more.
+-- 6. `1` when a `WAIT` comes after the script
+-- 7. The encoded Producer
+-- 8. The encoded body of each Record, one argument each. A batch has one Record or more.
 --
 -- Returns the `<ms>` of the batch's Records, and the `<seq>` of the first one and of the last one.
 local meta, log, producers = KEYS[1], KEYS[2], KEYS[3]
 local field, attempt, request = ARGV[1], ARGV[2], ARGV[3]
-local fence, window, producer = ARGV[4], tonumber(ARGV[5]), ARGV[6]
-local FIRST_RECORD = 7
+local fence, window, wait, producer = ARGV[4], tonumber(ARGV[5]), ARGV[6], ARGV[7]
+local FIRST_RECORD = 8
 -- A remembered batch is its request key and the three numbers of its answer, 8 bytes each.
 local REQUEST, BATCH = 16, 40
 
@@ -30,6 +31,7 @@ local newest_attempt, batches = string.sub(state, 1, ATTEMPT), string.sub(state,
 for at = 1, #batches, BATCH do
   if string.sub(batches, at, at + REQUEST - 1) == request then
     local batch_ms, first_seq, last_seq = struct.unpack('>I8I8I8', batches, at + REQUEST)
+    touch(meta, wait)
     return {batch_ms, first_seq, last_seq}
   end
 end
