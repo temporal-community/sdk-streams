@@ -14,6 +14,9 @@ pub enum RedisStoreError {
     /// Redis failed a call, or a script of the Store refused it.
     #[error(transparent)]
     Redis(#[from] RedisError),
+    /// Redis can't take a call for the moment, so a later try may succeed.
+    #[error("{0}")]
+    Unavailable(String),
 }
 
 pub(crate) type RedisStoreResult<T> = Result<T, RedisStoreError>;
@@ -24,6 +27,7 @@ impl RedisStoreError {
         match self {
             Self::Invalid(_) => false,
             Self::Redis(error) => !matches!(error.retry_method(), redis::RetryMethod::NoRetry),
+            Self::Unavailable(_) => true,
         }
     }
 }
@@ -42,6 +46,7 @@ impl<R: WireReason> From<RedisStoreError> for StreamError<Reason<R>> {
     fn from(error: RedisStoreError) -> Self {
         let error = match error {
             RedisStoreError::Invalid(message) => return Self::invalid_argument(message),
+            RedisStoreError::Unavailable(message) => return Self::store_unavailable(message),
             RedisStoreError::Redis(error) => error,
         };
         let detail = error.detail().unwrap_or_default();
@@ -94,6 +99,12 @@ fn outage(error: &RedisError) -> String {
         {
             format!("Redis doesn't know a command of the Store, which needs Redis 7.0: {error}")
         }
+        // The cluster connection goes to the node of a redirect, so only a Store for one server
+        // gets one.
+        ErrorKind::Server(ServerErrorKind::Moved | ServerErrorKind::Ask) => format!(
+            "A node of a Redis Cluster redirected the call, so the Store needs \
+             `RedisServers::Cluster`: {error}"
+        ),
         // An answer of Redis keeps its code as Redis writes it, which is what its docs have.
         _ => match (error.code(), error.detail()) {
             (Some(code), Some(detail)) => format!("Redis failed: {code} {detail}"),
@@ -157,6 +168,7 @@ mod tests {
             "ERR Script killed by user with SCRIPT KILL... script: 4b32, on @user_script:2.",
             "OOM command not allowed when used memory > 'maxmemory'. script: 4b32, on \
              @user_script:169.",
+            "MOVED 866 127.0.0.1:7001",
         ];
         for text in outages {
             let error = AppendError::from(reply(text));

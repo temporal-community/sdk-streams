@@ -38,6 +38,8 @@ A Stream has four keys. `<prefix>` is the `key_prefix` of the Store. `<id>` is t
 | `<prefix>:{<id>}:producers` | hash | One field for each Producer that wrote to the Stream |
 | `<prefix>:{<id>}:closed` | stream | One entry, which the close adds |
 
+- The keys have one hash tag, so a Redis Cluster keeps them in one slot and one script can use
+  them all.
 - A key has no Temporal namespace, so a Stream id is unique in one Redis and key prefix. Give
   each namespace its own prefix, or its own Redis.
 
@@ -118,6 +120,10 @@ first. A batch has these big-endian fields.
   on or off. A close doesn't change the field.
 - The Store keeps the field of a Producer for as long as the Stream exists. No call removes
   one, so nothing bounds the number of fields of a Stream.
+- The cluster client can send the bytes of one call a second time, after a dropped connection.
+  The second send has the request key of the first, so it's a resend while the Store remembers
+  that key. With `resend_window` other batches of the Producer between the two sends, the
+  batch is written twice.
 
 ## What a Stream costs
 
@@ -195,13 +201,29 @@ Redis can lose `:log` and keep `:meta`, for example with an eviction policy. Use
 - A lost `:producers` or `:meta` is not detected. The Store then accepts an earlier attempt
   again, and it writes a resend a second time.
 
+## A Redis Cluster that migrates a slot
+
+Each script declares every key that it uses, so Redis runs it only on a node that has all of
+them. While a slot migrates, a script whose keys exist only in part gets `TRYAGAIN`. These calls
+fail with `STORE_UNAVAILABLE` until the migration of their slot ends, and they write nothing.
+
+- A close, whose `:closed` key doesn't exist before it
+- The first append of a Stream, whose `:log` and `:producers` keys don't exist before it
+- A read of a Stream with no Record, whose `:log` key doesn't exist. That is every reader that
+  waits for the first Record of a new Stream.
+
+A Stream whose keys all exist is served while its slot migrates.
+
+A read that waits blocks on the node of its Stream's slot, which it finds with `CLUSTER SLOTS`.
+While the slot migrates, it polls every 100 ms.
+
 ## Connections
 
 One Store has these connections, and `maxclients` of Redis must allow them for all Stores.
 
-- One connection for the calls that don't block
+- One connection for the calls that don't block. On a cluster it's one to each primary.
 - One for each read that waits at the same time, up to `max_blocking_connections` (256 by
-  default)
+  default) to each node.
 
 A connection of a read stays open for the next read. The Store closes none while
 it lives, so a Store keeps as many as its busiest moment needed. A server that closes idle

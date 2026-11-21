@@ -1,6 +1,9 @@
 //! The Redis servers that the tests start, the calls of a Store, and a seeded generator.
 
-use redis::aio::{ConnectionLike, MultiplexedConnection};
+use redis::{
+    aio::{ConnectionLike, MultiplexedConnection},
+    cluster_async::ClusterConnection,
+};
 use std::{
     collections::BTreeMap,
     net::TcpStream,
@@ -22,7 +25,7 @@ use temporalio_streams::{
     },
     record::StoreLimits,
 };
-use temporalio_streams_redis::{RedisStore, RedisStoreOptions};
+use temporalio_streams_redis::{RedisServers, RedisStore, RedisStoreOptions};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// A `redis-server` process of one test. The drop stops it, also when the test panics.
@@ -120,7 +123,7 @@ pub(crate) async fn admin(url: &str) -> MultiplexedConnection {
 
 /// Returns the default options of a Store for the server at `url`.
 pub(crate) fn standalone(url: impl AsRef<str>) -> RedisStoreOptions {
-    RedisStoreOptions::new(url.as_ref().parse().unwrap())
+    RedisStoreOptions::new(RedisServers::Standalone(url.as_ref().parse().unwrap()))
 }
 
 /// Returns the Store of `options` behind the runtime, as every caller uses it.
@@ -350,5 +353,123 @@ async fn relay(client: tokio::net::TcpStream, target: u16, lose: Arc<AtomicBool>
     tokio::select! {
         () = requests => {}
         () = replies => {}
+    }
+}
+
+/// A Redis Cluster of three primaries. Each node announces the port of a proxy of the test, so a
+/// client reaches every node through one, and a test can lose a reply of any node.
+pub(crate) struct Cluster {
+    pub(crate) nodes: Vec<Redis>,
+    proxies: Vec<Proxy>,
+}
+
+/// The slots of a node of the test cluster, of which the last node has two more.
+const NODE_SLOTS: u16 = 5461;
+
+impl Cluster {
+    pub(crate) async fn start() -> Self {
+        let lose = Arc::<AtomicBool>::default();
+        let mut cluster = Self {
+            nodes: Vec::new(),
+            proxies: Vec::new(),
+        };
+        for at in 0..3 {
+            let (port, bus) = (free_port(), free_port().to_string());
+            let proxy = Proxy::start_with(port, lose.clone()).await;
+            let announced = proxy.port.to_string();
+            let node = Redis::start_on(
+                port,
+                &[
+                    "--cluster-enabled",
+                    "yes",
+                    "--cluster-port",
+                    &bus,
+                    // The other nodes and the clients learn these two from the node.
+                    "--cluster-announce-port",
+                    &announced,
+                    "--cluster-announce-bus-port",
+                    &bus,
+                ],
+            );
+            let first = at * NODE_SLOTS;
+            let last = if at == 2 {
+                16383
+            } else {
+                first + NODE_SLOTS - 1
+            };
+            let mut admin = node.admin().await;
+            let mut slots = redis::cmd("CLUSTER");
+            slots.arg("ADDSLOTSRANGE").arg(first).arg(last);
+            let _: () = slots.query_async(&mut admin).await.unwrap();
+            if let Some(known) = cluster.nodes.first() {
+                let mut meet = redis::cmd("CLUSTER");
+                meet.arg("MEET").arg("127.0.0.1").arg(port).arg(&bus);
+                let _: () = meet.query_async(&mut known.admin().await).await.unwrap();
+            }
+            cluster.nodes.push(node);
+            cluster.proxies.push(proxy);
+        }
+        let started = Instant::now();
+        while !cluster.ready().await {
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "the cluster didn't form"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        cluster
+    }
+
+    /// Returns whether every node serves the whole cluster and announces the proxies.
+    async fn ready(&self) -> bool {
+        for node in &self.nodes {
+            let mut admin = node.admin().await;
+            let info: String = redis::cmd("CLUSTER")
+                .arg("INFO")
+                .query_async(&mut admin)
+                .await
+                .unwrap();
+            let nodes: String = redis::cmd("CLUSTER")
+                .arg("NODES")
+                .query_async(&mut admin)
+                .await
+                .unwrap();
+            let announced = |proxy: &Proxy| nodes.contains(&format!(":{}@", proxy.port));
+            let whole =
+                info.contains("cluster_state:ok") && info.contains("cluster_slots_ok:16384");
+            if !whole || !self.proxies.iter().all(announced) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Returns the default options of a Store for the cluster, by the URL of one node.
+    pub(crate) fn options(&self) -> RedisStoreOptions {
+        RedisStoreOptions::new(RedisServers::Cluster {
+            first: self.proxies[0].url().parse().unwrap(),
+            rest: Vec::new(),
+        })
+    }
+
+    /// Returns a connection that sends each plain command of a test to the node of its key.
+    pub(crate) async fn admin(&self) -> ClusterConnection {
+        let client = redis::cluster::ClusterClient::new(vec![self.proxies[0].url()]).unwrap();
+        client.get_async_connection().await.unwrap()
+    }
+
+    /// Returns the node that serves a slot.
+    pub(crate) fn node_of(&self, slot: u16) -> &Redis {
+        &self.nodes[usize::from(slot / NODE_SLOTS).min(2)]
+    }
+
+    /// Makes the proxy of the next script call close its connection in place of the reply.
+    pub(crate) fn lose_next_reply(&self) {
+        self.proxies[0].lose_next_reply();
+    }
+
+    /// Returns whether a proxy lost the reply that `lose_next_reply` asked for.
+    pub(crate) fn lost_the_reply(&self) -> bool {
+        !self.proxies[0].lose.load(Ordering::SeqCst)
     }
 }

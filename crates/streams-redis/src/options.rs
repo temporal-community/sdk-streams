@@ -54,6 +54,30 @@ impl fmt::Debug for RedisUrl {
     }
 }
 
+/// Where the Redis of a Store is.
+#[derive(Clone, Debug)]
+pub enum RedisServers {
+    /// One server.
+    Standalone(RedisUrl),
+    /// A Redis Cluster, by some of its nodes. The Store finds the other nodes, and it connects to
+    /// every node with the credentials and TLS of the first one.
+    Cluster {
+        /// The first node.
+        first: RedisUrl,
+        /// The other nodes.
+        rest: Vec<RedisUrl>,
+    },
+}
+
+impl RedisServers {
+    /// Returns the server, or the first node of a cluster.
+    pub(crate) fn first(&self) -> &RedisUrl {
+        match self {
+            Self::Standalone(first) | Self::Cluster { first, .. } => first,
+        }
+    }
+}
+
 /// The prefix of every key of the Store, so that Streams can share a Redis with other data. It
 /// has only letters, digits and the characters `-._~:`, so that a key and an ACL key pattern have
 /// it as written.
@@ -117,8 +141,8 @@ const DEFAULT_BLOCKING_CONNECTIONS: NonZeroUsize = match NonZeroUsize::new(256) 
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct RedisStoreOptions {
-    /// The Redis server.
-    pub url: RedisUrl,
+    /// Where the Redis is.
+    pub servers: RedisServers,
     /// The prefix of every key of the Store, `temporal-streams` by default. A key has no Temporal
     /// namespace, so a Stream id is unique in one Redis and key prefix.
     pub key_prefix: KeyPrefix,
@@ -136,17 +160,17 @@ pub struct RedisStoreOptions {
     pub resend_window: NonZeroUsize,
     /// How long a call waits for Redis to respond, 5 seconds by default and more than zero.
     pub response_timeout: Duration,
-    /// Maximum number of reads that block on Redis at a time, 256 by default. A read that waits
-    /// for a Record has a connection of its own, and a read over the maximum polls once a
-    /// second.
+    /// Maximum number of reads that block on one Redis node at a time, 256 by default. A read
+    /// that waits for a Record has a connection of its own, and a read over the maximum polls
+    /// once a second.
     pub max_blocking_connections: NonZeroUsize,
 }
 
 impl RedisStoreOptions {
-    /// Returns the default options for the Redis server at `url`.
-    pub fn new(url: RedisUrl) -> Self {
+    /// Returns the default options for the Redis at `servers`.
+    pub fn new(servers: RedisServers) -> Self {
         Self {
-            url,
+            servers,
             key_prefix: KeyPrefix::default(),
             retention: Duration::from_secs(7 * 24 * 60 * 60),
             producer_idle_ttl: None,
@@ -191,7 +215,7 @@ impl ToRedisArgs for Millis {
 
 /// The options of a Store in the form that its calls use.
 pub(crate) struct Settings {
-    pub(crate) url: RedisUrl,
+    pub(crate) servers: RedisServers,
     pub(crate) key_prefix: KeyPrefix,
     pub(crate) retention: Millis,
     pub(crate) producer_idle_ttl: Option<Millis>,
@@ -217,7 +241,7 @@ impl TryFrom<RedisStoreOptions> for Settings {
         }
         let idle = options.producer_idle_ttl;
         Ok(Self {
-            url: options.url,
+            servers: options.servers,
             key_prefix: options.key_prefix,
             retention: millis("retention", options.retention)?,
             producer_idle_ttl: idle
@@ -237,12 +261,19 @@ mod tests {
 
     #[test]
     fn the_debug_form_of_the_options_has_no_credentials() {
-        let url = "rediss://user:p4ss@a.example:6380/0".parse().unwrap();
-        let debug = format!("{:?}", RedisStoreOptions::new(url));
+        let url = |host: &str| format!("rediss://user:p4ss@{host}:6380/0").parse().unwrap();
+        let cluster = RedisServers::Cluster {
+            first: url("a.example"),
+            rest: vec![url("b.example")],
+        };
+        let debug = format!("{:?}", RedisStoreOptions::new(cluster));
         assert!(
             !debug.contains("user") && !debug.contains("p4ss"),
             "{debug}"
         );
-        assert!(debug.contains("a.example:6380"), "{debug}");
+        assert!(
+            debug.contains("a.example:6380") && debug.contains("b.example:6380"),
+            "{debug}"
+        );
     }
 }
