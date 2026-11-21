@@ -1,7 +1,7 @@
 //! The options of the Redis Store. Each type holds only values that the Store can use.
 
 use crate::error::{RedisStoreError, RedisStoreResult};
-use redis::{ConnectionInfo, IntoConnectionInfo, RedisWrite, ToRedisArgs};
+use redis::{ConnectionAddr, ConnectionInfo, IntoConnectionInfo, RedisWrite, ToRedisArgs};
 use std::{fmt, num::NonZeroUsize, str::FromStr, time::Duration};
 
 /// Whether the Store refuses a write from an earlier attempt of a Producer once a later attempt of
@@ -44,6 +44,73 @@ impl fmt::Debug for RedisUrl {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "RedisUrl({})", self.0.addr())
     }
+}
+
+/// A node of a Redis Cluster, from its URL. The Store reaches the other nodes by a host and a
+/// port, so the URL of a Unix socket is refused.
+#[derive(Clone, Debug)]
+pub struct ClusterNodeUrl(RedisUrl);
+
+impl ClusterNodeUrl {
+    pub(crate) fn info(&self) -> &ConnectionInfo {
+        self.0.info()
+    }
+
+    /// Returns the node at `host` and `port`, with the credentials and TLS of this one. A node
+    /// that Redis gives no host for is at the host of this one.
+    pub(crate) fn node(&self, host: Option<String>, port: u16) -> ConnectionInfo {
+        let mut addr = self.info().addr().clone();
+        // The address is one of these two, as `try_from` checked.
+        if let ConnectionAddr::Tcp(at, at_port)
+        | ConnectionAddr::TcpTls {
+            host: at,
+            port: at_port,
+            ..
+        } = &mut addr
+        {
+            if let Some(host) = host {
+                *at = host;
+            }
+            *at_port = port;
+        }
+        self.info().clone().set_addr(addr)
+    }
+}
+
+impl TryFrom<RedisUrl> for ClusterNodeUrl {
+    type Error = RedisStoreError;
+
+    fn try_from(url: RedisUrl) -> RedisStoreResult<Self> {
+        match url.info().addr() {
+            ConnectionAddr::Tcp(..) | ConnectionAddr::TcpTls { .. } => Ok(Self(url)),
+            _ => Err(RedisStoreError::Invalid(
+                "The URL of a cluster node must have a host".to_string(),
+            )),
+        }
+    }
+}
+
+impl FromStr for ClusterNodeUrl {
+    type Err = RedisStoreError;
+
+    fn from_str(url: &str) -> RedisStoreResult<Self> {
+        url.parse::<RedisUrl>()?.try_into()
+    }
+}
+
+/// Where the Redis of a Store is.
+#[derive(Clone, Debug)]
+pub enum RedisServers {
+    /// One server.
+    Standalone(RedisUrl),
+    /// A Redis Cluster, by some of its nodes. The Store finds the other nodes, and it connects to
+    /// every node with the credentials and TLS of the first one.
+    Cluster {
+        /// The first node.
+        first: ClusterNodeUrl,
+        /// The other nodes.
+        rest: Vec<ClusterNodeUrl>,
+    },
 }
 
 /// The prefix of every key of the Store, so that Streams can share a Redis with other data. It
@@ -109,8 +176,8 @@ const DEFAULT_BLOCKING_CONNECTIONS: NonZeroUsize = match NonZeroUsize::new(256) 
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct RedisStoreOptions {
-    /// The Redis server.
-    pub url: RedisUrl,
+    /// Where the Redis is.
+    pub servers: RedisServers,
     /// The prefix of every key of the Store, `temporal-streams` by default. A key has no Temporal
     /// namespace, so a Stream id is unique in one Redis and key prefix.
     pub key_prefix: KeyPrefix,
@@ -128,17 +195,17 @@ pub struct RedisStoreOptions {
     pub resend_window: NonZeroUsize,
     /// How long a call waits for Redis to respond, 5 seconds by default and more than zero.
     pub response_timeout: Duration,
-    /// Maximum number of reads that block on Redis at a time, 256 by default. A read that waits
-    /// for a Record has a connection of its own, and a read over the maximum polls once a
-    /// second.
+    /// Maximum number of reads that block on one Redis node at a time, 256 by default. A read
+    /// that waits for a Record has a connection of its own, and a read over the maximum polls
+    /// once a second.
     pub max_blocking_connections: NonZeroUsize,
 }
 
 impl RedisStoreOptions {
-    /// Returns the default options for the Redis server at `url`.
-    pub fn new(url: RedisUrl) -> Self {
+    /// Returns the default options for the Redis at `servers`.
+    pub fn new(servers: RedisServers) -> Self {
         Self {
-            url,
+            servers,
             key_prefix: KeyPrefix::default(),
             retention: Duration::from_secs(7 * 24 * 60 * 60),
             producer_idle_ttl: None,
@@ -183,7 +250,7 @@ impl ToRedisArgs for Millis {
 
 /// The options of a Store in the form that its calls use.
 pub(crate) struct Settings {
-    pub(crate) url: RedisUrl,
+    pub(crate) servers: RedisServers,
     pub(crate) key_prefix: KeyPrefix,
     pub(crate) retention: Millis,
     pub(crate) producer_idle_ttl: Option<Millis>,
@@ -209,7 +276,7 @@ impl TryFrom<RedisStoreOptions> for Settings {
         }
         let idle = options.producer_idle_ttl;
         Ok(Self {
-            url: options.url,
+            servers: options.servers,
             key_prefix: options.key_prefix,
             retention: millis("retention", options.retention)?,
             producer_idle_ttl: idle
@@ -229,12 +296,19 @@ mod tests {
 
     #[test]
     fn the_debug_form_of_the_options_has_no_credentials() {
-        let url = "rediss://user:p4ss@a.example:6380/0".parse().unwrap();
-        let debug = format!("{:?}", RedisStoreOptions::new(url));
+        let url = |host: &str| format!("rediss://user:p4ss@{host}:6380/0").parse().unwrap();
+        let cluster = RedisServers::Cluster {
+            first: url("a.example"),
+            rest: vec![url("b.example")],
+        };
+        let debug = format!("{:?}", RedisStoreOptions::new(cluster));
         assert!(
             !debug.contains("user") && !debug.contains("p4ss"),
             "{debug}"
         );
-        assert!(debug.contains("a.example:6380"), "{debug}");
+        assert!(
+            debug.contains("a.example:6380") && debug.contains("b.example:6380"),
+            "{debug}"
+        );
     }
 }

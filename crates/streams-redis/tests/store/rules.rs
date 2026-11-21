@@ -1,7 +1,7 @@
 //! The rules of a Stream, over generated calls. The test keeps what it sent and what was
 //! answered, states the rule of each call on that, and compares the whole answer.
 
-use crate::support::{Redis, Rng, client, keys, seeds, snapshot, standalone};
+use crate::support::{Cluster, Redis, Rng, client, keys, seeds, snapshot, standalone};
 use prost::{Message, encoding::message::encoded_len};
 use redis::aio::ConnectionLike;
 use std::{
@@ -35,6 +35,13 @@ const STREAMS: [&str; 2] = ["a}{%é", "b"];
 async fn a_store_follows_the_rules_for_any_calls() {
     let redis = Redis::start(&[]);
     run_seeds(80, || standalone(redis.url()), redis.admin().await).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Redis"]
+async fn a_store_follows_the_rules_on_a_cluster() {
+    let cluster = Cluster::start().await;
+    run_seeds(20, || cluster.options(), cluster.admin().await).await;
 }
 
 /// Runs the seeds of the generated calls on Stores with `options`. `admin` reads the keys of a
