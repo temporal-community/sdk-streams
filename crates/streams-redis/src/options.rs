@@ -162,6 +162,28 @@ impl FromStr for KeyPrefix {
     }
 }
 
+/// The replicas that a write waits for, with the Redis command `WAIT`.
+#[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
+pub struct WaitForReplicas {
+    /// The number of replicas that must have a write before its call succeeds.
+    pub replicas: NonZeroUsize,
+    /// How long a write waits for them, at least 1 ms. Keep it well below the `response_timeout`
+    /// of the Store, or a write that waits this long fails as a call with no response. Redis
+    /// ends a wait at its next timer tick, which can be 100 ms after this time.
+    pub timeout: Duration,
+}
+
+impl WaitForReplicas {
+    /// Returns a wait for `replicas` replicas with a timeout of 1 second.
+    pub fn new(replicas: NonZeroUsize) -> Self {
+        Self {
+            replicas,
+            timeout: Duration::from_secs(1),
+        }
+    }
+}
+
 const DEFAULT_RESEND_WINDOW: NonZeroUsize = match NonZeroUsize::new(16) {
     Some(window) => window,
     None => panic!("the default is above zero"),
@@ -195,9 +217,15 @@ pub struct RedisStoreOptions {
     pub resend_window: NonZeroUsize,
     /// How long a call waits for Redis to respond, 5 seconds by default and more than zero.
     pub response_timeout: Duration,
-    /// Maximum number of reads that block on one Redis node at a time, 256 by default. A read
-    /// that waits for a Record has a connection of its own, and a read over the maximum polls
-    /// once a second.
+    /// The replicas that each create, append and close waits for. It's `None` by default, and a
+    /// write then succeeds once its Redis node has it. Redis replicates after it answers, so a
+    /// failover can lose such a write. With a wait, a write that too few replicas have in time
+    /// fails with `STORE_UNAVAILABLE`, and a retry with its `request_id` writes nothing again.
+    pub wait: Option<WaitForReplicas>,
+    /// Maximum number of calls that block on Redis at a time, 256 by default. A read that waits
+    /// for a Record and a write that waits for its replicas each have a connection of their
+    /// own. The maximum holds for the reads of one node, and again for the writes. A read over
+    /// it polls once a second, and a write waits for a free connection.
     pub max_blocking_connections: NonZeroUsize,
 }
 
@@ -212,12 +240,13 @@ impl RedisStoreOptions {
             fence: Fence::Off,
             resend_window: DEFAULT_RESEND_WINDOW,
             response_timeout: Duration::from_secs(5),
+            wait: None,
             max_blocking_connections: DEFAULT_BLOCKING_CONNECTIONS,
         }
     }
 }
 
-/// A time of 1 ms or more, in ms, as a script takes one.
+/// A time of 1 ms or more, in ms, as a script and `WAIT` take one.
 #[derive(Clone, Copy)]
 pub(crate) struct Millis(u64);
 
@@ -225,6 +254,10 @@ impl Millis {
     /// Maximum time that a script gets. A script adds a TTL to the time, and a Lua number holds
     /// an integer exactly only up to 2^53. A longer time counts as this one, 142,000 years.
     const MAX: u64 = 1 << 52;
+
+    pub(crate) fn get(self) -> u64 {
+        self.0
+    }
 }
 
 /// The error of a time below 1 ms, which a [`Millis`] can't hold.
@@ -248,6 +281,13 @@ impl ToRedisArgs for Millis {
     }
 }
 
+/// The replicas that a write waits for, as `WAIT` takes them.
+#[derive(Clone, Copy)]
+pub(crate) struct Wait {
+    pub(crate) replicas: NonZeroUsize,
+    pub(crate) timeout: Millis,
+}
+
 /// The options of a Store in the form that its calls use.
 pub(crate) struct Settings {
     pub(crate) servers: RedisServers,
@@ -257,6 +297,7 @@ pub(crate) struct Settings {
     pub(crate) fence: Fence,
     pub(crate) resend_window: NonZeroUsize,
     pub(crate) response_timeout: Duration,
+    pub(crate) wait: Option<Wait>,
     pub(crate) max_blocking_connections: NonZeroUsize,
 }
 
@@ -275,6 +316,14 @@ impl TryFrom<RedisStoreOptions> for Settings {
             ));
         }
         let idle = options.producer_idle_ttl;
+        // `WAIT` with a timeout of zero waits with no end.
+        let wait = options.wait.map(|wait| {
+            let timeout = millis("The timeout of wait", wait.timeout)?;
+            Ok::<_, RedisStoreError>(Wait {
+                replicas: wait.replicas,
+                timeout,
+            })
+        });
         Ok(Self {
             servers: options.servers,
             key_prefix: options.key_prefix,
@@ -285,6 +334,7 @@ impl TryFrom<RedisStoreOptions> for Settings {
             fence: options.fence,
             resend_window: options.resend_window,
             response_timeout: options.response_timeout,
+            wait: wait.transpose()?,
             max_blocking_connections: options.max_blocking_connections,
         })
     }

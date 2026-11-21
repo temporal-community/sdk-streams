@@ -20,5 +20,7 @@ mod scripts;
 mod store;
 
 pub use error::RedisStoreError;
-pub use options::{ClusterNodeUrl, Fence, KeyPrefix, RedisServers, RedisStoreOptions, RedisUrl};
+pub use options::{
+    ClusterNodeUrl, Fence, KeyPrefix, RedisServers, RedisStoreOptions, RedisUrl, WaitForReplicas,
+};
 pub use store::RedisStore;

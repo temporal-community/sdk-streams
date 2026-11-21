@@ -17,7 +17,7 @@ pub enum RedisStoreError {
     /// Redis answered a script of the Store with a value that the Store can't convert.
     #[error("The Store can't read an answer of Redis: {0}")]
     UnreadableAnswer(#[from] ParsingError),
-    /// Redis can't take a call for the moment, so a later try may succeed.
+    /// Redis or its replicas didn't take a call in time, so a later try may succeed.
     #[error("{0}")]
     Unavailable(String),
 }

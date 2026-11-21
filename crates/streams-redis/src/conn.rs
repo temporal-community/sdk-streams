@@ -1,13 +1,14 @@
-//! The connections of the Store. A blocked `XREAD` stops every later command on its connection.
-//! So each read that waits takes a connection from a pool, and the calls that don't block share
-//! one.
+//! The connections of the Store. A blocked `XREAD` or `WAIT` stops every later command on its
+//! connection. So each read that waits, and each write that waits for its replicas, takes a
+//! connection from a pool, and the calls that don't block share one.
 
 use crate::{
     RedisServers,
     error::{RedisStoreError, RedisStoreResult},
     keys::StreamKeys,
     offset::EntryId,
-    options::Settings,
+    options::{Settings, Wait},
+    scripts::ScriptCall,
 };
 use parking_lot::Mutex;
 use redis::{
@@ -49,9 +50,17 @@ enum Leased<C> {
     Busy,
 }
 
+/// Whether a call writes. A [`Pool`] runs only a read a second time, since Redis may have run a
+/// write whose connection failed.
+pub(crate) enum CallKind {
+    Write,
+    Read,
+}
+
 /// A call that a [`Pool`] runs on one of its connections.
 pub(crate) trait PooledCall<C> {
     type Answer;
+    const KIND: CallKind;
 
     fn run(&self, conn: &mut C) -> impl Future<Output = RedisResult<Self::Answer>> + Send;
 }
@@ -95,9 +104,9 @@ impl<C> Pool<C> {
         })
     }
 
-    /// Runs `call` on a connection of the pool, which `open` makes when none is idle. A
-    /// connection that was idle, and that the server has closed, gets one more try on a new
-    /// one. So `call` must be safe to run twice.
+    /// Runs `call` on a connection of the pool, which `open` makes when none is idle. A read on
+    /// a connection that was idle, and that the server has closed, gets one more try on a new
+    /// one. A write fails there, and its caller sends it again with its request id.
     pub(crate) async fn call<P, O>(
         &self,
         give_up: impl Future<Output = ()>,
@@ -113,9 +122,9 @@ impl<C> Pool<C> {
             Leased::Free(permit) => permit,
             Leased::Idle(mut lease) => {
                 let result = call.run(&mut lease.0.conn).await;
-                match lease.settle(&result) {
-                    Settled::Done => return result.map(Called::Answered),
-                    Settled::Stale(permit) => permit,
+                match (lease.settle(&result), P::KIND) {
+                    (Settled::Stale(permit), CallKind::Read) => permit,
+                    (Settled::Stale(_) | Settled::Done, _) => return result.map(Called::Answered),
                 }
             }
         };
@@ -289,11 +298,30 @@ async fn connect(servers: &RedisServers, response_timeout: Duration) -> RedisRes
     }
 }
 
-impl PooledCall<MultiplexedConnection> for Cmd {
+/// A script that writes, and the `WAIT` after it.
+struct WriteAndWait<'a> {
+    call: &'a ScriptCall,
+    wait: Wait,
+}
+
+impl PooledCall<Shared> for WriteAndWait<'_> {
+    type Answer = (Value, usize);
+    const KIND: CallKind = CallKind::Write;
+
+    async fn run(&self, conn: &mut Shared) -> RedisResult<Self::Answer> {
+        self.call.run_and_wait(conn, self.wait).await
+    }
+}
+
+/// The `XREAD` of a read that waits for an entry.
+struct Xread(Cmd);
+
+impl PooledCall<MultiplexedConnection> for Xread {
     type Answer = Value;
+    const KIND: CallKind = CallKind::Read;
 
     async fn run(&self, conn: &mut MultiplexedConnection) -> RedisResult<Value> {
-        self.query_async(conn).await
+        self.0.query_async(conn).await
     }
 }
 
@@ -301,6 +329,8 @@ impl PooledCall<MultiplexedConnection> for Cmd {
 pub(crate) struct Connections {
     shared: Shared,
     servers: RedisServers,
+    /// The connections of the writes that wait for their replicas.
+    writers: Pool<Shared>,
     /// What the Store knows of the slots of a cluster. A read that finds it empty asks again.
     slots: Mutex<Vec<SlotRange>>,
     /// The connections of the reads that wait, for each node.
@@ -314,6 +344,7 @@ impl Connections {
         Ok(Self {
             shared: connect(&settings.servers, settings.response_timeout).await?,
             servers: settings.servers.clone(),
+            writers: Pool::new(settings.max_blocking_connections),
             slots: Mutex::default(),
             readers: Mutex::default(),
             max_blocking_connections: settings.max_blocking_connections,
@@ -324,6 +355,27 @@ impl Connections {
     /// Returns the connection of the calls that don't block.
     pub(crate) fn shared(&self) -> Shared {
         self.shared.clone()
+    }
+
+    /// Runs a script that writes, and then `WAIT` for `wait`, on a connection of its own. It
+    /// returns the answer of the script and the number of replicas that have its write.
+    pub(crate) async fn write_and_wait<T: FromRedisValue>(
+        &self,
+        call: &ScriptCall,
+        wait: Wait,
+    ) -> RedisStoreResult<(T, usize)> {
+        let give_up = tokio::time::sleep(self.response_timeout);
+        let open = || connect(&self.servers, self.response_timeout);
+        let write = WriteAndWait { call, wait };
+        match self.writers.call(give_up, open, &write).await? {
+            Called::Answered((answer, acknowledged)) => {
+                Ok((from_redis_value(answer)?, acknowledged))
+            }
+            Called::Busy => Err(RedisStoreError::Unavailable(
+                "No connection for a write that waits for its replicas got free in time"
+                    .to_string(),
+            )),
+        }
     }
 
     /// Waits until the Stream has an entry after `after`, until it closes, or until `deadline`.
@@ -424,7 +476,7 @@ async fn until(deadline: Option<Instant>) {
 
 /// Returns the `XREAD` that blocks until the log has an entry after `after`, until the Stream
 /// closes, or until `deadline`.
-fn xread(keys: &StreamKeys, after: EntryId, deadline: Option<Instant>) -> Cmd {
+fn xread(keys: &StreamKeys, after: EntryId, deadline: Option<Instant>) -> Xread {
     // `BLOCK 0` waits with no end, as a read with no deadline does. A read at its deadline
     // blocks for 1 ms.
     let block = deadline.map_or(0, |deadline| {
@@ -443,7 +495,7 @@ fn xread(keys: &StreamKeys, after: EntryId, deadline: Option<Instant>) -> Cmd {
         .arg(after)
         // The key of a close has an entry only once the Stream is closed.
         .arg(EntryId::ZERO);
-    xread
+    Xread(xread)
 }
 
 #[cfg(test)]
@@ -460,6 +512,7 @@ mod tests {
 
     impl<F: Fn(u8) -> RedisResult<u8> + Sync> PooledCall<u8> for Fake<F> {
         type Answer = u8;
+        const KIND: CallKind = CallKind::Read;
 
         async fn run(&self, conn: &mut u8) -> RedisResult<u8> {
             self.1.lock().push(*conn);
@@ -503,8 +556,8 @@ mod tests {
         let times_out = fake(|_| Err(timeout.clone()));
         assert!(pool.call(pending(), open(5), &times_out).await.is_err());
         assert_eq!(conn_of(open(6)).await, 6);
-        // A connection that the server closed while it was idle gets one more try on a new one,
-        // and the pool drops the other idle ones too.
+        // A read on a connection that the server closed while it was idle gets one more try on a
+        // new one, and the pool drops the other idle ones too.
         pool.idle.lock().extend([7, 8]);
         let closed = RedisError::from(io::Error::from(io::ErrorKind::BrokenPipe));
         let closed_until_9 = fake(|conn| match conn {
