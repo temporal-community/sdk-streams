@@ -4,7 +4,7 @@
 use crate::{
     Fence,
     offset::EntryId,
-    options::Millis,
+    options::{Millis, Wait},
     producer::{AttemptKey, RequestKey},
 };
 use prost::Message;
@@ -85,6 +85,33 @@ impl ScriptCall {
             result => result,
         }
     }
+
+    /// Runs the call and then `WAIT`, and returns the answer of the script and the number of
+    /// replicas that have its write. Both go in one pipeline, since `WAIT` covers the last write
+    /// of its own connection, and a command of another call could come between them.
+    pub(crate) async fn run_and_wait(
+        &self,
+        conn: &mut impl ConnectionLike,
+        wait: Wait,
+    ) -> RedisResult<(Value, usize)> {
+        let mut pipe = redis::pipe();
+        // A pipeline that fails gives one error with no code. With the answers as values, a
+        // refusal of the script keeps its code.
+        pipe.ignore_errors().add_command(self.cmd.clone());
+        pipe.cmd("WAIT").arg(wait.replicas.get()).arg(wait.timeout);
+        let mut answers: (Value, Value) = pipe.query_async(conn).await?;
+        if let Value::ServerError(error) = &answers.0
+            && error.kind() == Some(ServerErrorKind::NoScript)
+        {
+            self.script.load_async(conn).await?;
+            answers = pipe.query_async(conn).await?;
+        }
+        let (answer, acknowledged) = answers;
+        Ok((
+            answer.extract_error()?,
+            from_redis_value(acknowledged.extract_error()?)?,
+        ))
+    }
 }
 
 impl ToRedisArgs for Fence {
@@ -105,6 +132,26 @@ impl ToRedisArgs for Existing {
     }
 }
 
+/// Whether a `WAIT` comes after a script that writes. A call that finds its work done then
+/// writes once more, since `WAIT` waits only for a write of its own connection.
+#[derive(Clone, Copy)]
+pub(crate) enum AfterWrite {
+    Answer,
+    Wait,
+}
+
+impl From<Option<Wait>> for AfterWrite {
+    fn from(wait: Option<Wait>) -> Self {
+        wait.map_or(Self::Answer, |_| Self::Wait)
+    }
+}
+
+impl ToRedisArgs for AfterWrite {
+    fn write_redis_args<W: ?Sized + RedisWrite>(&self, out: &mut W) {
+        matches!(self, AfterWrite::Wait).write_redis_args(out);
+    }
+}
+
 /// The arguments of a script that takes none.
 pub(crate) struct NoArgs;
 
@@ -117,6 +164,7 @@ pub(crate) struct CreateArgs {
     pub(crate) request: RequestKey,
     pub(crate) retention: Millis,
     pub(crate) existing: Existing,
+    pub(crate) then: AfterWrite,
     pub(crate) producer_idle_ttl: Option<Millis>,
 }
 
@@ -125,6 +173,7 @@ impl ToRedisArgs for CreateArgs {
         out.write_arg(&self.request);
         self.retention.write_redis_args(out);
         self.existing.write_redis_args(out);
+        self.then.write_redis_args(out);
         // A Stream with no idle TTL has no last argument.
         self.producer_idle_ttl.write_redis_args(out);
     }
@@ -137,6 +186,7 @@ pub(crate) struct AppendArgs<'a> {
     pub(crate) request: RequestKey,
     pub(crate) fence: Fence,
     pub(crate) window: NonZeroUsize,
+    pub(crate) then: AfterWrite,
     pub(crate) producer: &'a Producer,
     pub(crate) bodies: Vec<Vec<u8>>,
 }
@@ -152,6 +202,7 @@ impl ToRedisArgs for AppendArgs<'_> {
         u32::try_from(self.window.get())
             .unwrap_or(u32::MAX)
             .write_redis_args(out);
+        self.then.write_redis_args(out);
         out.write_arg(&self.producer.encode_to_vec());
         self.bodies.write_redis_args(out);
     }
@@ -162,6 +213,7 @@ pub(crate) struct CloseArgs<'a> {
     pub(crate) field: &'a [u8],
     pub(crate) attempt: AttemptKey,
     pub(crate) fence: Fence,
+    pub(crate) then: AfterWrite,
 }
 
 impl ToRedisArgs for CloseArgs<'_> {
@@ -169,6 +221,7 @@ impl ToRedisArgs for CloseArgs<'_> {
         out.write_arg(self.field);
         out.write_arg(&self.attempt);
         self.fence.write_redis_args(out);
+        self.then.write_redis_args(out);
     }
 }
 

@@ -66,6 +66,8 @@ impl Redis {
             .args(["--port", &port.to_string(), "--bind", "127.0.0.1"])
             .args(["--save", "", "--appendonly", "no", "--dir"])
             .arg(&dir)
+            // A server waits this long for more replicas before it sends its data to the first.
+            .args(["--repl-diskless-sync-delay", "0"])
             .args(args)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -107,6 +109,53 @@ impl Redis {
     /// Returns a connection for the plain commands of a test.
     pub(crate) async fn admin(&self) -> MultiplexedConnection {
         admin(&self.url()).await
+    }
+
+    /// Starts a replica of this server, and returns it once the server has it online.
+    pub(crate) fn start_replica(&self) -> Redis {
+        let replica = Redis::start(&["--replicaof", "127.0.0.1", &self.port.to_string()]);
+        self.until_replicated();
+        replica
+    }
+
+    /// Waits until a replica has every write of this server. The server shows a replica as
+    /// online while the replica still loads its first copy, and a write then waits for it.
+    fn until_replicated(&self) {
+        let mut conn = redis::Client::open(self.url())
+            .unwrap()
+            .get_connection()
+            .unwrap();
+        // A write that needs no key, so that it also runs on any node of a cluster.
+        let mut probe = redis::pipe();
+        probe.cmd("FUNCTION").arg("FLUSH").ignore();
+        probe.cmd("WAIT").arg(1).arg(1000);
+        let started = Instant::now();
+        while probe.query::<(usize,)>(&mut conn).unwrap().0 < 1 {
+            assert!(
+                started.elapsed() < Duration::from_secs(30),
+                "no replica has the writes of its server"
+            );
+        }
+    }
+
+    /// Stops the process without ending it, so a replica acknowledges nothing until `resume`.
+    pub(crate) fn pause(&self) {
+        self.signal("-STOP");
+    }
+
+    pub(crate) fn resume(&self) {
+        self.signal("-CONT");
+    }
+
+    fn signal(&self, signal: &str) {
+        let pid = self.child.id().to_string();
+        assert!(
+            Command::new("kill")
+                .args([signal, &pid])
+                .status()
+                .unwrap()
+                .success()
+        );
     }
 }
 
@@ -362,6 +411,8 @@ async fn relay(client: tokio::net::TcpStream, target: u16, lose: Arc<AtomicBool>
 /// client reaches every node through one, and a test can lose a reply of any node.
 pub(crate) struct Cluster {
     pub(crate) nodes: Vec<Redis>,
+    /// One replica of each node, in the order of the nodes, or none.
+    pub(crate) replicas: Vec<Redis>,
     proxies: Vec<Proxy>,
 }
 
@@ -373,6 +424,7 @@ impl Cluster {
         let lose = Arc::<AtomicBool>::default();
         let mut cluster = Self {
             nodes: Vec::new(),
+            replicas: Vec::new(),
             proxies: Vec::new(),
         };
         for at in 0..3 {
@@ -418,6 +470,37 @@ impl Cluster {
                 "the cluster didn't form"
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        cluster
+    }
+
+    /// Starts the cluster, and gives each node a replica.
+    pub(crate) async fn start_with_replicas() -> Self {
+        let mut cluster = Self::start().await;
+        for node in &cluster.nodes {
+            let (port, bus) = (free_port(), free_port().to_string());
+            let cluster_args = ["--cluster-enabled", "yes", "--cluster-port", &bus];
+            let replica = Redis::start_on(port, &cluster_args);
+            let mut meet = redis::cmd("CLUSTER");
+            meet.arg("MEET").arg("127.0.0.1").arg(port).arg(&bus);
+            let _: () = meet.query_async(&mut node.admin().await).await.unwrap();
+            let mut my_id = redis::cmd("CLUSTER");
+            let id: String =
+                (my_id.arg("MYID").query_async(&mut node.admin().await).await).unwrap();
+            // The replica knows the node only once the two have met.
+            let mut admin = replica.admin().await;
+            let started = Instant::now();
+            let mut replicate = redis::cmd("CLUSTER");
+            replicate.arg("REPLICATE").arg(&id);
+            while replicate.query_async::<()>(&mut admin).await.is_err() {
+                assert!(
+                    started.elapsed() < Duration::from_secs(60),
+                    "the replica didn't join"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            node.until_replicated();
+            cluster.replicas.push(replica);
         }
         cluster
     }

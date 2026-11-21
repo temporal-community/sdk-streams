@@ -21,6 +21,10 @@ On this page, an id is the id of an entry of a Redis stream, `<ms>-<seq>`.
   the script. After a failover, a new primary whose clock is behind can give a Record an id at
   or below an offset that a reader already has, and one whose clock is ahead by more than a TTL
   expires Streams early.
+- **Replicas, with the `wait` option.** With no `wait` a failover loses the writes that the new
+  primary doesn't have ("Replication" below). With `wait`, a write succeeds only once `replicas`
+  replicas have it. Only a number equal to all replicas of a node rules out that a failover
+  picks a replica without the write.
 - **`maxclients`** above the connections of all Stores ("Connections" below).
 - **TLS.** A `rediss://` URL connects with TLS and verifies the server against the root
   certificates of the system. A private CA works only through the `SSL_CERT_FILE` variable of
@@ -237,8 +241,11 @@ One Store has these connections, and `maxclients` of Redis must allow them for a
 - One connection for the calls that don't block. On a cluster it's one to each primary.
 - One for each read that waits at the same time, up to `max_blocking_connections` (256 by
   default) to each node.
+- With the `wait` option, one for each write at the same time, up to
+  `max_blocking_connections` again. On a cluster each of them is a cluster connection, which
+  connects to every primary.
 
-A connection of a read stays open for the next read. The Store closes none while
+A connection of a read or of a write stays open for the next call. The Store closes none while
 it lives, so a Store keeps as many as its busiest moment needed.
 
 A server, or a load balancer in front of it, can close a connection that is idle. The next call
@@ -253,3 +260,14 @@ connects again by itself, and it can send a call a second time ("The Producers" 
 Redis replicates after it answers, so a failover can lose a write that a call got an answer
 for. A read from the offset of a lost write fails with `OFFSET_TOO_HIGH` until the Stream has
 Records up to it.
+
+With the `wait` option, each create, append and close sends `WAIT` after its script, in one
+pipeline on a connection of its own.
+
+- A write that too few replicas have after the timeout fails with `STORE_UNAVAILABLE`. The write
+  is in Redis, so a retry with its `request_id` writes nothing again.
+- `WAIT` covers the last write of its connection. So a call that finds its work done (a resend, a
+  close of a closed Stream, a create of a Stream that exists) writes `v` again before the
+  `WAIT`, and it succeeds only once the replicas have the first write.
+- A reader can get a Record before the `WAIT` of its append ends, and a failover can still lose
+  that Record.

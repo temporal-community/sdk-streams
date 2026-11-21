@@ -72,6 +72,24 @@ impl RedisStore {
         Ok(T::from_redis_value(call.run(&mut conn).await?)?)
     }
 
+    /// Runs a script that writes. With the `wait` option, the call succeeds only once enough
+    /// replicas have the write.
+    async fn write<T: FromRedisValue>(&self, call: &ScriptCall) -> RedisStoreResult<T> {
+        let Some(wait) = self.settings.wait else {
+            return self.run(call).await;
+        };
+        let (answer, acknowledged) = self.conns().await?.write_and_wait(call, wait).await?;
+        if acknowledged < wait.replicas.get() {
+            return Err(RedisStoreError::Unavailable(format!(
+                "{acknowledged} of {} replicas have the write after {} ms. A failover can lose \
+                 it, and a retry with its request_id doesn't write it again",
+                wait.replicas,
+                wait.timeout.get()
+            )));
+        }
+        Ok(answer)
+    }
+
     async fn create(
         &self,
         request: CreateStreamRequest,
@@ -90,11 +108,12 @@ impl RedisStore {
             request: request_key(b"", &request.request_id),
             retention: self.settings.retention,
             existing,
+            then: self.settings.wait.into(),
             producer_idle_ttl: self.settings.producer_idle_ttl,
         };
         let keys = self.keys(&request.stream_id);
         let call = ScriptCall::write(&scripts::CREATE, &[keys.meta()], args);
-        let created = self.run(&call).await?;
+        let created = self.write(&call).await?;
         Ok(CreateStreamResponse {
             created: matches!(created, Created::Made),
         })
@@ -118,13 +137,14 @@ impl RedisStore {
             request: request_key(&attempt, &request.request_id),
             fence: self.settings.fence,
             window: self.settings.resend_window,
+            then: self.settings.wait.into(),
             producer: &producer,
             bodies: bodies.collect::<Result<_, _>>()?,
         };
         let keys = self.keys(&request.stream_id);
         let keys = [keys.meta(), keys.log(), keys.producers()];
         let call = ScriptCall::write(&scripts::APPEND, &keys, args);
-        let appended: Appended = self.run(&call).await?;
+        let appended: Appended = self.write(&call).await?;
         Ok(AppendRecordsResponse {
             first_offset: appended.first.offset(),
             last_offset: appended.last.offset(),
@@ -137,11 +157,12 @@ impl RedisStore {
             field: &field,
             attempt,
             fence: self.settings.fence,
+            then: self.settings.wait.into(),
         };
         let keys = self.keys(&request.stream_id);
         let keys = [keys.meta(), keys.log(), keys.producers(), keys.closed()];
         let Closed = self
-            .run(&ScriptCall::write(&scripts::CLOSE, &keys, args))
+            .write(&ScriptCall::write(&scripts::CLOSE, &keys, args))
             .await?;
         Ok(CloseStreamResponse {})
     }

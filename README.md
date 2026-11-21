@@ -26,7 +26,8 @@ before the Store gets it. The runtime also has the limits of a batch, and the St
 | `fence` | `Fence::Off` | Whether a write of an earlier attempt of a Producer is refused |
 | `resend_window` | 16 | The batches of a Producer whose `request_id` the Store remembers |
 | `response_timeout` | 5 s | How long a call waits for Redis |
-| `max_blocking_connections` | 256 | The reads that can wait on one node at a time |
+| `wait` | none | The replicas that each write waits for, with `WAIT`, and for how long |
+| `max_blocking_connections` | 256 | The reads and the writes that can block at a time |
 
 A URL starts with `redis://` or `rediss://` and has the credentials. `rediss://` connects with
 TLS and verifies the server against the root certificates of the system. A private CA works only
