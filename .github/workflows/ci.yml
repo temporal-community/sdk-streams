@@ -46,7 +46,34 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       - uses: Swatinem/rust-cache@v2
       - run: scripts/patch-sdk-rust.sh
-      - run: cargo test --workspace
+      # The tests start their own `redis-server` processes.
+      - name: Install Redis from the Redis apt repo
+        run: |
+          curl -fsSL https://packages.redis.io/gpg \
+            | sudo gpg --dearmor -o /usr/share/keyrings/redis-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/redis-archive-keyring.gpg]" \
+            "https://packages.redis.io/deb $(lsb_release -cs) main" \
+            | sudo tee /etc/apt/sources.list.d/redis.list
+          sudo apt-get update && sudo apt-get install -y redis
+      - run: cargo test --workspace -- --include-ignored
+
+  test-redis-7-0:
+    name: tests on Redis 7.0
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: Swatinem/rust-cache@v2
+      - run: scripts/patch-sdk-rust.sh
+      # The oldest Redis that the Store works on. The image has the binary.
+      - run: |
+          docker create --name redis-7-0 redis:7.0
+          docker cp redis-7-0:/usr/local/bin/redis-server "$RUNNER_TEMP/redis-server"
+          echo "REDIS_SERVER=$RUNNER_TEMP/redis-server" >> "$GITHUB_ENV"
+      - run: cargo test --workspace -- --include-ignored
 
   fips:
     name: FIPS build takes no ring
