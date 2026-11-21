@@ -9,8 +9,8 @@ Experimental.
 ## Using the Store
 
 ```rust
-let options = RedisStoreOptions::new("redis://localhost:6379".parse()?);
-let store = RedisStore::new(options)?;
+let servers = RedisServers::Standalone("redis://localhost:6379".parse()?);
+let store = RedisStore::new(RedisStoreOptions::new(servers))?;
 let runtime = StreamRuntime::new(Arc::new(store), StoreLimits::default());
 ```
 
@@ -20,14 +20,14 @@ config of the SDK that calls the Store. The Store has none.
 
 | Option | Default | Use |
 |---|---|---|
-| `url` | | The server, from its URL |
+| `servers` | | One server, or some nodes of a Redis Cluster, each from its URL |
 | `key_prefix` | `temporal-streams` | The prefix of every key |
 | `retention` | 7 days | How long a Stream stays readable after its close |
 | `producer_idle_ttl` | none | How long an open Stream stays after its last append |
 | `fence` | `Fence::Off` | Whether a write of an earlier attempt of a Producer is refused |
 | `resend_window` | 16 | The batches of a Producer whose `request_id` the Store remembers |
 | `response_timeout` | 5 s | How long a call waits for Redis |
-| `max_blocking_connections` | 256 | The reads that can wait on Redis at a time |
+| `max_blocking_connections` | 256 | The reads that can wait on one node at a time |
 
 A URL starts with `redis://` or `rediss://` and has the credentials. `rediss://` connects with
 TLS and verifies the server against the root certificates of the system. A private CA works only

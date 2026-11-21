@@ -17,6 +17,9 @@ pub enum RedisStoreError {
     /// Redis answered a script of the Store with a value that the Store can't convert.
     #[error("The Store can't read an answer of Redis: {0}")]
     UnreadableAnswer(#[from] ParsingError),
+    /// Redis can't take a call for the moment, so a later try may succeed.
+    #[error("{0}")]
+    Unavailable(String),
 }
 
 pub(crate) type RedisStoreResult<T> = Result<T, RedisStoreError>;
@@ -27,6 +30,7 @@ impl RedisStoreError {
         match self {
             Self::Invalid(_) | Self::UnreadableAnswer(_) => false,
             Self::Redis(error) => !matches!(error.retry_method(), redis::RetryMethod::NoRetry),
+            Self::Unavailable(_) => true,
         }
     }
 }
@@ -46,6 +50,7 @@ impl<R: WireReason> From<RedisStoreError> for StreamError<Reason<R>> {
     fn from(error: RedisStoreError) -> Self {
         let error = match error {
             RedisStoreError::Invalid(message) => return Self::invalid_argument(message),
+            RedisStoreError::Unavailable(message) => return Self::store_unavailable(message),
             RedisStoreError::UnreadableAnswer(_) => return Self::store_corrupt(error.to_string()),
             RedisStoreError::Redis(error) => error,
         };
@@ -99,6 +104,12 @@ fn outage(error: &RedisError) -> String {
         // are no reply of Redis.
         ErrorKind::Parse => format!(
             "The server didn't answer as Redis does, so its URL may be of another service: {error}"
+        ),
+        // The cluster connection goes to the node of a redirect, so only a Store for one server
+        // gets one.
+        ErrorKind::Server(ServerErrorKind::Moved | ServerErrorKind::Ask) => format!(
+            "A node of a Redis Cluster redirected the call, so the Store needs \
+             `RedisServers::Cluster`: {error}"
         ),
         // The message has the code as Redis writes it, and not the library's name for it.
         _ => match (error.code(), error.detail()) {
@@ -163,6 +174,7 @@ mod tests {
             "ERR Script killed by user with SCRIPT KILL... script: 4b32, on @user_script:2.",
             "OOM command not allowed when used memory > 'maxmemory'. script: 4b32, on \
              @user_script:169.",
+            "MOVED 866 127.0.0.1:7001",
         ];
         for text in outages {
             let error = AppendError::from(reply(text));
