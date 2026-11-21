@@ -75,13 +75,63 @@ async fn a_cluster_resend_of_one_call_writes_once() {
     assert_eq!(all.last_offset, appended.last_offset);
 }
 
-async fn cluster_command(node: &Redis, args: &[&str]) {
+async fn cluster_command(node: &Redis, args: &[&str]) -> String {
     let mut command = redis::cmd("CLUSTER");
-    let _: () = command
-        .arg(args)
-        .query_async(&mut node.admin().await)
-        .await
-        .unwrap();
+    let answer = command.arg(args).query_async(&mut node.admin().await).await;
+    answer.unwrap()
+}
+
+/// A slot of the test cluster that moves from the node that has it to another one.
+pub(crate) struct Migration<'a> {
+    cluster: &'a Cluster,
+    slot: String,
+    pub(crate) source: &'a Redis,
+    pub(crate) target: &'a Redis,
+    target_id: String,
+}
+
+impl<'a> Migration<'a> {
+    /// Starts to move the slot of `key`. Every key of the slot is still on its node.
+    pub(crate) async fn start(cluster: &'a Cluster, key: &str) -> Self {
+        let slot = slot_of(&cluster.nodes[0], key).await;
+        let source = cluster.node_of(slot);
+        let other = |node: &&Redis| node.port != source.port;
+        let target = cluster.nodes.iter().find(other).unwrap();
+        let source_id = cluster_command(source, &["MYID"]).await;
+        let target_id = cluster_command(target, &["MYID"]).await;
+        let slot = slot.to_string();
+        cluster_command(target, &["SETSLOT", &slot, "IMPORTING", &source_id]).await;
+        cluster_command(source, &["SETSLOT", &slot, "MIGRATING", &target_id]).await;
+        Self {
+            cluster,
+            slot,
+            source,
+            target,
+            target_id,
+        }
+    }
+
+    /// Moves `keys` to the new node, as a resharding does with each key of the slot.
+    pub(crate) async fn move_keys(&self, keys: &[&String]) {
+        let _: () = redis::cmd("MIGRATE")
+            .arg("127.0.0.1")
+            .arg(self.target.port)
+            .arg("")
+            .arg(0)
+            .arg(5000)
+            .arg("KEYS")
+            .arg(keys)
+            .query_async(&mut self.source.admin().await)
+            .await
+            .unwrap();
+    }
+
+    /// Ends the move, so the new node serves the slot.
+    pub(crate) async fn finish(self) {
+        for node in &self.cluster.nodes {
+            cluster_command(node, &["SETSLOT", &self.slot, "NODE", &self.target_id]).await;
+        }
+    }
 }
 
 /// Returns the keys that a node has, whatever slot they are in.
@@ -107,25 +157,8 @@ async fn a_stream_is_served_while_its_slot_migrates() {
     store.append_records(append("s", &[b"a"])).await.unwrap();
 
     let [meta, log, producers, closed] = keys(PREFIX, "s");
-    let slot = slot_of(&cluster.nodes[0], &meta).await;
-    let source = cluster.node_of(slot);
-    let target = cluster
-        .nodes
-        .iter()
-        .find(|node| node.port != source.port)
-        .unwrap();
-    let id_of = async |node: &Redis| -> String {
-        let mut my_id = redis::cmd("CLUSTER");
-        my_id
-            .arg("MYID")
-            .query_async(&mut node.admin().await)
-            .await
-            .unwrap()
-    };
-    let (source_id, target_id) = (id_of(source).await, id_of(target).await);
-    let slot = slot.to_string();
-    cluster_command(target, &["SETSLOT", &slot, "IMPORTING", &source_id]).await;
-    cluster_command(source, &["SETSLOT", &slot, "MIGRATING", &target_id]).await;
+    let migration = Migration::start(&cluster, &meta).await;
+    let (source, target) = (migration.source, migration.target);
 
     // A close makes the `closed` key, so its keys exist only in part while the slot moves, on
     // either node. Redis refuses to run it, and nothing of it is written.
@@ -142,17 +175,7 @@ async fn a_stream_is_served_while_its_slot_migrates() {
     store.append_records(append("s", &[b"b"])).await.unwrap();
     refused_close().await;
 
-    let _: () = redis::cmd("MIGRATE")
-        .arg("127.0.0.1")
-        .arg(target.port)
-        .arg("")
-        .arg(0)
-        .arg(5000)
-        .arg("KEYS")
-        .arg(&[&meta, &log, &producers])
-        .query_async(&mut source.admin().await)
-        .await
-        .unwrap();
+    migration.move_keys(&[&meta, &log, &producers]).await;
     // The target has every key, and the source redirects each call to it.
     let third = store.append_records(append("s", &[b"c"])).await.unwrap();
     let all = store.read_records(read("s", &[])).await.unwrap();
@@ -169,9 +192,7 @@ async fn a_stream_is_served_while_its_slot_migrates() {
     );
     refused_close().await;
 
-    for node in &cluster.nodes {
-        cluster_command(node, &["SETSLOT", &slot, "NODE", &target_id]).await;
-    }
+    migration.finish().await;
     crate::faults::after_outage(|| store.close_stream(close("s")))
         .await
         .unwrap();

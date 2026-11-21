@@ -519,6 +519,11 @@ impl Cluster {
         RedisStoreOptions::new(RedisServers::Cluster(vec![self.proxies[0].url()]))
     }
 
+    /// Returns the port of the node that a Store of the test gets as its one URL.
+    pub(crate) fn seed_port(&self) -> u16 {
+        self.proxies[0].port
+    }
+
     /// Returns a connection that sends each plain command of a test to the node of its key.
     pub(crate) async fn admin(&self) -> ClusterConnection {
         let client = redis::cluster::ClusterClient::new(vec![self.proxies[0].url()]).unwrap();

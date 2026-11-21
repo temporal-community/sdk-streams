@@ -160,6 +160,25 @@ Redis can lose `:log` and keep `:meta`, for example with an eviction policy. Use
 - A lost `:producers` or `:meta` is not detected. The Store then accepts an earlier attempt
   again, and it writes a resend a second time.
 
+## Access
+
+Redis checks the ACL of a script call, and of each command that the script runs. A Redis user
+has one role or both. `tests/store/acl.rs` runs each role with exactly these lists.
+
+- A Producer creates, appends and closes. Its user needs the keys `~<prefix>:*` and the commands
+  `+evalsha +script|load +time +hmget +hget +hset +pexpireat +xadd +xrange`. With the `wait`
+  option it also needs `+wait`.
+- A Reader reads and describes. Its user needs the keys `%R~<prefix>:*` and the commands
+  `+evalsha_ro +script|load +time +hmget +xrange`. A read that waits also needs `+xread`.
+- On a Redis Cluster, each user also needs `+cluster|slots +asking` on every node.
+
+A user that lacks a command of its list fails a call with `STORE_UNAVAILABLE`. The script can
+stop after its first write, and that write stays. So give a user the whole list of its role.
+
+Redis has no finer access than these. A user with write access can write as any Producer. A key
+pattern gives a user every Stream of a prefix, since a key has no namespace, so users that must
+not share Streams need separate prefixes.
+
 ## A Redis Cluster that moves a slot
 
 Each script declares every key that it uses, so Redis runs it only on a node that has all of
