@@ -20,5 +20,5 @@ mod scripts;
 mod store;
 
 pub use error::RedisStoreError;
-pub use options::{Fence, KeyPrefix, RedisServers, RedisStoreOptions, RedisUrl};
+pub use options::{Fence, KeyPrefix, RedisServers, RedisStoreOptions, RedisUrl, WaitForReplicas};
 pub use store::RedisStore;

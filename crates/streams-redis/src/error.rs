@@ -14,7 +14,7 @@ pub enum RedisStoreError {
     /// Redis failed a call, or a script of the Store refused it.
     #[error(transparent)]
     Redis(#[from] RedisError),
-    /// Redis can't take a call for the moment, so a later try may succeed.
+    /// Redis or its replicas didn't take a call in time, so a later try may succeed.
     #[error("{0}")]
     Unavailable(String),
 }

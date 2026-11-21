@@ -1,13 +1,14 @@
-//! The connections of the Store. A blocked `XREAD` stops every later command on its connection.
-//! So each read that waits takes a connection from a pool, and the calls that don't block share
-//! one.
+//! The connections of the Store. A blocked `XREAD` or `WAIT` stops every later command on its
+//! connection. So each read that waits, and each write that waits for its replicas, takes a
+//! connection from a pool, and the calls that don't block share one.
 
 use crate::{
     RedisServers,
     error::{RedisStoreError, RedisStoreResult},
     keys::StreamKeys,
     offset::EntryId,
-    options::Settings,
+    options::{Settings, Wait},
+    scripts::ScriptCall,
 };
 use parking_lot::Mutex;
 use redis::{
@@ -289,6 +290,21 @@ async fn connect(servers: &RedisServers, response_timeout: Duration) -> RedisRes
     }
 }
 
+/// A script that writes, and the `WAIT` after it.
+struct WriteAndWait<'a> {
+    call: &'a ScriptCall,
+    wait: Wait,
+}
+
+impl PooledCall<Shared> for WriteAndWait<'_> {
+    type Answer = (Value, usize);
+
+    // A second run of the script finds the request key of the first, so it writes nothing.
+    async fn run(&self, conn: &mut Shared) -> RedisResult<Self::Answer> {
+        self.call.run_and_wait(conn, self.wait).await
+    }
+}
+
 impl PooledCall<MultiplexedConnection> for Cmd {
     type Answer = Value;
 
@@ -313,6 +329,8 @@ pub(crate) enum Waited {
 pub(crate) struct Connections {
     shared: Shared,
     servers: RedisServers,
+    /// The connections of the writes that wait for their replicas.
+    writers: Pool<Shared>,
     /// What the Store knows of the slots of a cluster. A read that finds it empty asks again.
     slots: Mutex<Vec<SlotRange>>,
     /// The connections of the reads that wait, for each node.
@@ -326,6 +344,7 @@ impl Connections {
         Ok(Self {
             shared: connect(&settings.servers, settings.response_timeout).await?,
             servers: settings.servers.clone(),
+            writers: Pool::new(settings.max_blocking_connections),
             slots: Mutex::default(),
             readers: Mutex::default(),
             max_blocking_connections: settings.max_blocking_connections,
@@ -336,6 +355,28 @@ impl Connections {
     /// Returns the connection of the calls that don't block.
     pub(crate) fn shared(&self) -> Shared {
         self.shared.clone()
+    }
+
+    /// Runs a script that writes, and then `WAIT` for `wait`, on a connection of its own. It
+    /// returns the answer of the script and the number of replicas that have its write.
+    pub(crate) async fn write_and_wait<T: FromRedisValue>(
+        &self,
+        call: &ScriptCall,
+        wait: Wait,
+    ) -> RedisStoreResult<(T, usize)> {
+        let give_up = tokio::time::sleep(self.response_timeout);
+        let open = || connect(&self.servers, self.response_timeout);
+        let write = WriteAndWait { call, wait };
+        match self.writers.call(give_up, open, &write).await? {
+            Called::Answered((answer, acknowledged)) => Ok((
+                from_redis_value(answer).map_err(RedisError::from)?,
+                acknowledged,
+            )),
+            Called::Busy => Err(RedisStoreError::Unavailable(
+                "No connection for a write that waits for its replicas got free in time"
+                    .to_string(),
+            )),
+        }
     }
 
     /// Waits until the Stream has an entry after `after`, until it closes, or until `deadline`.

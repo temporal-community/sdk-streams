@@ -8,3 +8,4 @@ mod reads;
 mod rules;
 mod support;
 mod time;
+mod wait;
