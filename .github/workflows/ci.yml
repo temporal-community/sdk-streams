@@ -11,6 +11,9 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # The branch that has `temporalio-streams`, until a release of sdk-rust has the crate.
+  SDK_RUST_GIT: https://github.com/moetemp/sdk-rust
+  SDK_RUST_REF: moe/redo/streams
 
 jobs:
   lint:
@@ -33,7 +36,7 @@ jobs:
           -- -D warnings
 
   test:
-    name: unit tests
+    name: tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -62,44 +65,3 @@ jobs:
           tree=$(cargo tree -e normal,build --no-default-features --features fips \
             -i ring --target all)
           if [ -n "$tree" ]; then echo "$tree"; exit 1; fi
-
-  redis:
-    name: Redis Store tests (standalone and cluster)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.94.0
-      - uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - uses: Swatinem/rust-cache@v2
-      - run: scripts/patch-sdk-rust.sh
-      - name: Install Redis from the Redis apt repo
-        run: |
-          curl -fsSL https://packages.redis.io/gpg \
-            | sudo gpg --dearmor -o /usr/share/keyrings/redis-archive-keyring.gpg
-          echo "deb [signed-by=/usr/share/keyrings/redis-archive-keyring.gpg]" \
-            "https://packages.redis.io/deb $(lsb_release -cs) main" \
-            | sudo tee /etc/apt/sources.list.d/redis.list
-          sudo apt-get update && sudo apt-get install -y redis
-      - run: crates/streams-redis/scripts/redis-test-servers.sh >> "$GITHUB_ENV"
-      - run: cargo test -p temporalio-streams-redis -- --include-ignored --test-threads=8
-
-  redis-7-0:
-    name: Redis 7.0 Store tests (standalone and cluster)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.94.0
-      - uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - uses: Swatinem/rust-cache@v2
-      - run: scripts/patch-sdk-rust.sh
-      # The script runs the servers in docker and needs only `redis-cli` on the host.
-      - run: sudo apt-get update && sudo apt-get install -y redis-tools
-      # The oldest Redis that `connect` accepts.
-      - run: crates/streams-redis/scripts/redis-test-servers.sh >> "$GITHUB_ENV"
-        env:
-          STREAMS_REDIS_IMAGE: redis:7.0
-      - run: cargo test -p temporalio-streams-redis -- --include-ignored --test-threads=8

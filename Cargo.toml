@@ -8,12 +8,9 @@ license-file = "LICENSE.txt"
 
 [workspace.dependencies]
 prost = "0.14"
-# The well-known types the sdk-rust crates use, under the name the generated code expects.
-prost-types = { version = "0.7", package = "prost-wkt-types" }
-tonic-prost-build = "0.14.6"
 # A lang bridge patches both to the copies in its `sdk-core` submodule, so that each type exists
 # once.
-temporalio-common = { version = "1.1", default-features = false }
+temporalio-common = { version = "1.2", default-features = false }
 temporalio-streams = "0.1"
 
 [workspace.lints.rust]
