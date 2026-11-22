@@ -5,12 +5,13 @@ use redis::{
     cluster_async::ClusterConnection,
 };
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
+    fs::File,
     net::TcpStream,
-    path::PathBuf,
-    process::{Child, Command, Stdio},
+    path::{Path, PathBuf},
+    process::{Child, Command},
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicBool, AtomicU32, Ordering},
     },
     time::{Duration, Instant},
@@ -51,6 +52,28 @@ pub(crate) fn free_port() -> u16 {
     }
 }
 
+/// Returns the last lines of what a server printed, which say why it ended.
+fn last_lines(output: &Path) -> String {
+    let output = std::fs::read_to_string(output).unwrap_or_default();
+    let lines: Vec<&str> = output.lines().collect();
+    lines[lines.len().saturating_sub(10)..].join("\n")
+}
+
+/// Returns whether the `redis-server` of the tests knows `cluster-bus-port-protected-mode`. Patch
+/// releases got the option, so a plain server of the tests answers, once for a test process.
+fn knows_bus_protection() -> bool {
+    static KNOWN: OnceLock<bool> = OnceLock::new();
+    *KNOWN.get_or_init(|| {
+        let server = Redis::start(&[]);
+        let client = redis::Client::open(server.url()).unwrap();
+        let mut option = redis::cmd("CONFIG");
+        option.arg("GET").arg("cluster-bus-port-protected-mode");
+        let found: HashMap<String, String> =
+            option.query(&mut client.get_connection().unwrap()).unwrap();
+        !found.is_empty()
+    })
+}
+
 impl Redis {
     /// Starts a server on a free port, with `args` after the test's own.
     pub(crate) fn start(args: &[&str]) -> Self {
@@ -62,6 +85,9 @@ impl Redis {
         assert!(![6379, 6399, 7299].contains(&port));
         let dir = std::env::temp_dir().join(format!("streams-redis-{}-{port}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
+        // A file takes the output, since a pipe that nobody reads blocks the server once it's full.
+        let output = dir.join("output.log");
+        let file = File::create(&output).unwrap();
         let binary = std::env::var("REDIS_SERVER").unwrap_or("redis-server".to_string());
         let child = Command::new(binary)
             .args(["--port", &port.to_string(), "--bind", "127.0.0.1"])
@@ -70,8 +96,8 @@ impl Redis {
             // A server waits this long for more replicas before it sends its data to the first.
             .args(["--repl-diskless-sync-delay", "0"])
             .args(args)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(file.try_clone().unwrap())
+            .stderr(file)
             .spawn()
             .expect("the tests need `redis-server` in the PATH, or its path in REDIS_SERVER");
         let mut redis = Self { port, child, dir };
@@ -83,7 +109,8 @@ impl Redis {
             let ended = redis.child.try_wait().unwrap();
             assert!(
                 ended.is_none(),
-                "redis-server ended at its start: {ended:?}"
+                "redis-server ended at its start: {ended:?}\n{}",
+                last_lines(&output)
             );
             assert!(
                 started.elapsed() < Duration::from_secs(20),
@@ -95,6 +122,18 @@ impl Redis {
         let own = format!("process_id:{}\r\n", redis.child.id());
         assert!(info.contains(&own), "another server has the port");
         redis
+    }
+
+    /// Starts a node of a cluster, with its cluster bus on the port `bus` and `args` after that.
+    fn start_node(port: u16, bus: &str, args: &[&str]) -> Self {
+        let mut node = vec!["--cluster-enabled", "yes", "--cluster-port", bus];
+        // Redis 8.12 starts a node with no TLS only with this waiver. It asks to confirm that the
+        // bus is closed to other hosts, and each node of a test listens on 127.0.0.1 only.
+        if knows_bus_protection() {
+            node.extend(["--cluster-bus-port-protected-mode", "no"]);
+        }
+        node.extend(args);
+        Self::start_on(port, &node)
     }
 
     /// Returns the `INFO server` of the server at the port, once it takes connections.
@@ -432,20 +471,10 @@ impl Cluster {
             let (port, bus) = (free_port(), free_port().to_string());
             let proxy = Proxy::start_with(port, lose.clone()).await;
             let announced = proxy.port.to_string();
-            let node = Redis::start_on(
-                port,
-                &[
-                    "--cluster-enabled",
-                    "yes",
-                    "--cluster-port",
-                    &bus,
-                    // The other nodes and the clients learn these two from the node.
-                    "--cluster-announce-port",
-                    &announced,
-                    "--cluster-announce-bus-port",
-                    &bus,
-                ],
-            );
+            // The other nodes and the clients learn these two from the node.
+            let announce = ["--cluster-announce-port", &announced];
+            let announce_bus = ["--cluster-announce-bus-port", bus.as_str()];
+            let node = Redis::start_node(port, &bus, &[announce, announce_bus].concat());
             let first = at * NODE_SLOTS;
             let last = if at == 2 {
                 16383
@@ -480,8 +509,7 @@ impl Cluster {
         let mut cluster = Self::start().await;
         for node in &cluster.nodes {
             let (port, bus) = (free_port(), free_port().to_string());
-            let cluster_args = ["--cluster-enabled", "yes", "--cluster-port", &bus];
-            let replica = Redis::start_on(port, &cluster_args);
+            let replica = Redis::start_node(port, &bus, &[]);
             let mut meet = redis::cmd("CLUSTER");
             meet.arg("MEET").arg("127.0.0.1").arg(port).arg(&bus);
             let _: () = meet.query_async(&mut node.admin().await).await.unwrap();
