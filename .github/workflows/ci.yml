@@ -11,9 +11,9 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # The branch that has `temporalio-streams`, until a release of sdk-rust has the crate.
-  SDK_RUST_GIT: https://github.com/moetemp/sdk-rust
-  SDK_RUST_REF: moe/redo/streams
+  # The branch of sdk-rust that adds `temporalio-streams`, until a release has the crate.
+  SDK_RUST_GIT: https://github.com/temporalio/sdk-rust
+  SDK_RUST_REF: moe/streams-crate-types
 
 jobs:
   lint:
@@ -80,7 +80,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       # The SDK that has Streams, until a release of it does.
-      TEMPORALIO: temporalio @ git+https://github.com/moetemp/sdk-python@moe/redo/streams-python
+      TEMPORALIO: temporalio @ git+https://github.com/temporalio/sdk-python@moe/streams-api
     defaults:
       run:
         working-directory: python
