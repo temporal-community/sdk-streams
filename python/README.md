@@ -80,5 +80,6 @@ uv run --no-sync maturin develop
 uv run --no-sync pytest
 ```
 
-The tests start their own `redis-server` processes, from the `PATH` or from `REDIS_SERVER`. They
-need no Temporal server.
+The tests start their own `redis-server` processes, from the `PATH` or from `REDIS_SERVER`.
+`tests/test_worker.py` also starts a local Temporal server with
+`WorkflowEnvironment.start_local()`, which downloads the Temporal CLI on its first run.
