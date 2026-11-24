@@ -18,11 +18,12 @@ use std::{
 };
 use temporalio_common::protos::temporal::api::common::v1::Payload;
 use temporalio_streams::{
-    StreamError, StreamRuntime,
+    AppendError, CreateError, StreamError, StreamRuntime,
     proto::{
-        AppendRecord, AppendRecordsRequest, ClientProducer, CloseStreamRequest,
-        CreateStreamRequest, DescribeStreamRequest, Producer, ReadRecordsRequest,
-        StreamErrorReason, StreamIdConflictPolicy, producer::Kind,
+        AppendRecord, AppendRecordsRequest, AppendRecordsResponse, ClientProducer,
+        CloseStreamRequest, CreateStreamRequest, CreateStreamResponse, DescribeStreamRequest,
+        Producer, ReadRecordsRequest, StreamErrorReason, StreamIdConflictPolicy, StreamRef,
+        producer::Kind,
     },
     record::StoreLimits,
 };
@@ -223,6 +224,36 @@ pub(crate) fn runtime(options: RedisStoreOptions) -> StreamRuntime {
     StreamRuntime::new(Arc::new(store), StoreLimits::default())
 }
 
+/// A create and an append with an empty request id, so neither is a retry or a resend of another
+/// call.
+pub(crate) trait NoRequestId {
+    async fn create_no_id(
+        &self,
+        request: CreateStreamRequest,
+    ) -> Result<CreateStreamResponse, CreateError>;
+
+    async fn append_no_id(
+        &self,
+        request: AppendRecordsRequest,
+    ) -> Result<AppendRecordsResponse, AppendError>;
+}
+
+impl NoRequestId for StreamRuntime {
+    async fn create_no_id(
+        &self,
+        request: CreateStreamRequest,
+    ) -> Result<CreateStreamResponse, CreateError> {
+        self.create_stream(request, String::new()).await
+    }
+
+    async fn append_no_id(
+        &self,
+        request: AppendRecordsRequest,
+    ) -> Result<AppendRecordsResponse, AppendError> {
+        self.append_records(request, String::new()).await
+    }
+}
+
 /// Returns the four keys of a Stream, as `docs/redis.md` gives them.
 pub(crate) fn keys(prefix: &str, stream_id: &str) -> [String; 4] {
     let id = stream_id.replace('%', "%25").replace('}', "%7D");
@@ -292,34 +323,48 @@ pub(crate) fn record(data: &[u8]) -> AppendRecord {
     }
 }
 
+/// Returns the ref of the Stream `stream_id`, with no Store name.
+pub(crate) fn stream_ref(stream_id: &str) -> Option<StreamRef> {
+    Some(StreamRef {
+        id: stream_id.to_string(),
+        store: String::new(),
+    })
+}
+
 pub(crate) fn create(stream_id: &str) -> CreateStreamRequest {
     CreateStreamRequest {
-        stream_id: stream_id.to_string(),
+        stream_ref: stream_ref(stream_id),
         id_conflict_policy: StreamIdConflictPolicy::Fail as i32,
-        request_id: String::new(),
     }
 }
 
-/// Returns an append of `records` by a client, with a `request_id` that no other call has.
+/// Returns the answer of a create that made its Stream, which has the ref of the request.
+pub(crate) fn made(request: &CreateStreamRequest) -> CreateStreamResponse {
+    CreateStreamResponse {
+        r#ref: request.stream_ref.clone(),
+        created: true,
+    }
+}
+
+/// Returns an append of `records` by a client.
 pub(crate) fn append(stream_id: &str, records: &[&[u8]]) -> AppendRecordsRequest {
     AppendRecordsRequest {
-        stream_id: stream_id.to_string(),
+        r#ref: stream_ref(stream_id),
         producer: Some(client("client:test")),
-        request_id: String::new(),
         records: records.iter().map(|data| record(data)).collect(),
     }
 }
 
 pub(crate) fn close(stream_id: &str) -> CloseStreamRequest {
     CloseStreamRequest {
-        stream_id: stream_id.to_string(),
+        r#ref: stream_ref(stream_id),
         producer: Some(client("client:test")),
     }
 }
 
 pub(crate) fn read(stream_id: &str, from_offset: &[u8]) -> ReadRecordsRequest {
     ReadRecordsRequest {
-        stream_id: stream_id.to_string(),
+        r#ref: stream_ref(stream_id),
         from_offset: from_offset.to_vec(),
         ..Default::default()
     }
@@ -327,7 +372,7 @@ pub(crate) fn read(stream_id: &str, from_offset: &[u8]) -> ReadRecordsRequest {
 
 pub(crate) fn describe(stream_id: &str) -> DescribeStreamRequest {
     DescribeStreamRequest {
-        stream_id: stream_id.to_string(),
+        r#ref: stream_ref(stream_id),
     }
 }
 

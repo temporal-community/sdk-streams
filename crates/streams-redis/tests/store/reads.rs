@@ -1,7 +1,7 @@
 //! Reads that wait for a Record.
 
 use crate::support::{
-    Redis, admin, append, client, close, create, read, record, runtime, standalone,
+    NoRequestId, Redis, admin, append, client, close, create, read, record, runtime, standalone,
 };
 use redis::aio::MultiplexedConnection;
 use std::{num::NonZeroUsize, sync::Arc, time::Duration};
@@ -66,7 +66,7 @@ pub(crate) fn page(offset: &[u8], data: &[u8]) -> ReadRecordsResponse {
 async fn a_waiting_read_wakes_on_an_append_and_on_a_close() {
     let redis = Redis::start(&[]);
     let store = Arc::new(runtime(standalone(redis.url())));
-    store.create_stream(create("s")).await.unwrap();
+    store.create_no_id(create("s")).await.unwrap();
     let spawn = |request| {
         let store = store.clone();
         tokio::spawn(async move { store.read_records(request).await })
@@ -74,7 +74,7 @@ async fn a_waiting_read_wakes_on_an_append_and_on_a_close() {
 
     let read = spawn(waiting("s", &[], 60));
     until_blocked(&redis.url(), 1).await;
-    let first = store.append_records(append("s", &[b"a"])).await.unwrap();
+    let first = store.append_no_id(append("s", &[b"a"])).await.unwrap();
     assert_eq!(read.await.unwrap(), Ok(page(&first.first_offset, b"a")));
 
     // An append that comes at any moment of a read wakes it, also before the read blocks.
@@ -84,7 +84,7 @@ async fn a_waiting_read_wakes_on_an_append_and_on_a_close() {
         if round % 2 == 0 {
             tokio::task::yield_now().await;
         }
-        let appended = store.append_records(append("s", &[b"b"])).await.unwrap();
+        let appended = store.append_no_id(append("s", &[b"b"])).await.unwrap();
         assert_eq!(read.await.unwrap(), Ok(page(&appended.first_offset, b"b")));
         from = appended.last_offset;
     }
@@ -100,7 +100,7 @@ async fn a_waiting_read_wakes_on_an_append_and_on_a_close() {
     assert_eq!(read.await.unwrap(), Ok(done));
 
     // With nothing to wake it, a read ends at its deadline with an empty page.
-    store.create_stream(create("quiet")).await.unwrap();
+    store.create_no_id(create("quiet")).await.unwrap();
     let mut request = read_for_millis("quiet", 300);
     let started = Instant::now();
     let empty = store.read_records(request.clone()).await.unwrap();
@@ -134,7 +134,7 @@ async fn reads_over_the_connection_limit_still_get_their_records() {
     let mut options = standalone(redis.url());
     options.max_blocking_connections = NonZeroUsize::MIN;
     let store: Arc<StreamRuntime> = Arc::new(runtime(options));
-    store.create_stream(create("s")).await.unwrap();
+    store.create_no_id(create("s")).await.unwrap();
     let spawn = |request| {
         let store = store.clone();
         tokio::spawn(async move { store.read_records(request).await })
@@ -142,7 +142,7 @@ async fn reads_over_the_connection_limit_still_get_their_records() {
 
     let readers = [spawn(waiting("s", &[], 60)), spawn(waiting("s", &[], 60))];
     until_blocked(&redis.url(), 1).await;
-    let appended = store.append_records(append("s", &[b"a"])).await.unwrap();
+    let appended = store.append_no_id(append("s", &[b"a"])).await.unwrap();
     for reader in readers {
         assert_eq!(
             reader.await.unwrap(),
@@ -158,7 +158,7 @@ async fn reads_over_the_connection_limit_still_get_their_records() {
     until_blocked(&redis.url(), 0).await;
     let read = spawn(waiting("s", &appended.last_offset, 60));
     until_blocked(&redis.url(), 1).await;
-    let next = store.append_records(append("s", &[b"b"])).await.unwrap();
+    let next = store.append_no_id(append("s", &[b"b"])).await.unwrap();
     assert_eq!(read.await.unwrap(), Ok(page(&next.first_offset, b"b")));
 }
 
@@ -168,14 +168,11 @@ async fn a_read_with_no_limits_gets_a_page_of_the_default_size() {
     let redis = Redis::start(&[]);
     let store = runtime(standalone(redis.url()));
     // 1,100 Records in batches that end inside a page and inside a range of the read script.
-    store.create_stream(create("many")).await.unwrap();
+    store.create_no_id(create("many")).await.unwrap();
     for batch in 0..11_u8 {
         let body = [batch];
         let records = [&body[..]; 100];
-        store
-            .append_records(append("many", &records))
-            .await
-            .unwrap();
+        store.append_no_id(append("many", &records)).await.unwrap();
     }
     let first = store.read_records(read("many", &[])).await.unwrap();
     let rest = store.read_records(read("many", &first.last_offset));
@@ -188,11 +185,11 @@ async fn a_read_with_no_limits_gets_a_page_of_the_default_size() {
     }
 
     // Five Records of 1 MiB, of which three fit in the 4 MiB of a page.
-    store.create_stream(create("large")).await.unwrap();
+    store.create_no_id(create("large")).await.unwrap();
     let body = vec![7; 1024 * 1024];
     for _ in 0..5 {
         let batch = append("large", &[&body]);
-        store.append_records(batch).await.unwrap();
+        store.append_no_id(batch).await.unwrap();
     }
     let page = store.read_records(read("large", &[])).await.unwrap();
     assert_eq!(page.records.len(), 3);
@@ -217,12 +214,12 @@ async fn a_read_with_a_byte_limit_takes_little_more_from_redis() {
     let redis = Redis::start(&[]);
     let mut admin = redis.admin().await;
     let store = runtime(standalone(redis.url()));
-    store.create_stream(create("s")).await.unwrap();
+    store.create_no_id(create("s")).await.unwrap();
     // 300 Records of 2 KiB, which is 30 times the limit of the read.
     let body = [7; 2048];
     for _ in 0..3 {
         let batch = append("s", &[&body[..]; 100]);
-        store.append_records(batch).await.unwrap();
+        store.append_no_id(batch).await.unwrap();
     }
     let limit = 20 * 1024;
     let mut request = read("s", &[]);

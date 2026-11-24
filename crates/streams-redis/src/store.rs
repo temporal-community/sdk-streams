@@ -23,7 +23,7 @@ use temporalio_streams::{
     proto::{
         AppendRecordsRequest, AppendRecordsResponse, CloseStreamRequest, CloseStreamResponse,
         CreateStreamRequest, CreateStreamResponse, DescribeStreamRequest, DescribeStreamResponse,
-        ReadRecordsRequest, ReadRecordsResponse, StreamIdConflictPolicy, StreamRecord,
+        ReadRecordsRequest, ReadRecordsResponse, StreamIdConflictPolicy, StreamRecord, StreamRef,
         StreamStatus,
     },
 };
@@ -63,8 +63,13 @@ impl RedisStore {
         Ok(self.conns.get_or_try_init(open).await?)
     }
 
-    fn keys(&self, stream_id: &str) -> StreamKeys {
-        StreamKeys::new(&self.settings.key_prefix, stream_id)
+    /// Returns the keys of the Stream of a ref, whose `id` is the Stream id. The `store` of the
+    /// ref is for an SDK, so the Store ignores it.
+    fn keys(&self, stream_ref: Option<&StreamRef>) -> RedisStoreResult<StreamKeys> {
+        // The runtime refuses a request with no ref, so only a direct call of the Store fails here.
+        let stream_ref = stream_ref
+            .ok_or_else(|| RedisStoreError::Invalid("The request has no ref".to_string()))?;
+        Ok(StreamKeys::new(&self.settings.key_prefix, &stream_ref.id))
     }
 
     async fn run<T: FromRedisValue>(&self, call: &ScriptCall) -> RedisStoreResult<T> {
@@ -82,7 +87,7 @@ impl RedisStore {
         if acknowledged < wait.replicas.get() {
             return Err(RedisStoreError::Unavailable(format!(
                 "{acknowledged} of {} replicas have the write after {} ms. A failover can lose \
-                 it, and a retry with its request_id doesn't write it again",
+                 it, and a retry with its request id doesn't write it again",
                 wait.replicas,
                 wait.timeout.get()
             )));
@@ -93,6 +98,7 @@ impl RedisStore {
     async fn create(
         &self,
         request: CreateStreamRequest,
+        request_id: String,
     ) -> Result<CreateStreamResponse, CreateError> {
         let existing = match StreamIdConflictPolicy::try_from(request.id_conflict_policy) {
             Ok(StreamIdConflictPolicy::UseExisting) => Existing::Use,
@@ -105,16 +111,17 @@ impl RedisStore {
             }
         };
         let args = CreateArgs {
-            request: request_key(b"", &request.request_id),
+            request: request_key(b"", &request_id),
             retention: self.settings.retention,
             existing,
             then: self.settings.wait.into(),
             producer_idle_ttl: self.settings.producer_idle_ttl,
         };
-        let keys = self.keys(&request.stream_id);
+        let keys = self.keys(request.stream_ref.as_ref())?;
         let call = ScriptCall::write(&scripts::CREATE, &[keys.meta()], args);
         let created = self.write(&call).await?;
         Ok(CreateStreamResponse {
+            r#ref: request.stream_ref,
             created: matches!(created, Created::Made),
         })
     }
@@ -122,6 +129,7 @@ impl RedisStore {
     async fn append(
         &self,
         request: AppendRecordsRequest,
+        request_id: String,
     ) -> Result<AppendRecordsResponse, AppendError> {
         let producer = request.producer.unwrap_or_default();
         let (field, attempt) = producer_keys(&producer)?;
@@ -134,14 +142,14 @@ impl RedisStore {
         let args = AppendArgs {
             field: &field,
             attempt,
-            request: request_key(&attempt, &request.request_id),
+            request: request_key(&attempt, &request_id),
             fence: self.settings.fence,
             window: self.settings.resend_window,
             then: self.settings.wait.into(),
             producer: &producer,
             bodies: bodies.collect::<Result<_, _>>()?,
         };
-        let keys = self.keys(&request.stream_id);
+        let keys = self.keys(request.r#ref.as_ref())?;
         let keys = [keys.meta(), keys.log(), keys.producers()];
         let call = ScriptCall::write(&scripts::APPEND, &keys, args);
         let appended: Appended = self.write(&call).await?;
@@ -159,7 +167,7 @@ impl RedisStore {
             fence: self.settings.fence,
             then: self.settings.wait.into(),
         };
-        let keys = self.keys(&request.stream_id);
+        let keys = self.keys(request.r#ref.as_ref())?;
         let keys = [keys.meta(), keys.log(), keys.producers(), keys.closed()];
         let Closed = self
             .write(&ScriptCall::write(&scripts::CLOSE, &keys, args))
@@ -188,7 +196,7 @@ impl RedisStore {
         let wait = wait.map_err(|_| negative("wait"))?;
         // A wait that an `Instant` can't hold has no deadline.
         let deadline = Instant::now().checked_add(wait);
-        let keys = self.keys(&request.stream_id);
+        let keys = self.keys(request.r#ref.as_ref())?;
         let args = ReadArgs {
             from,
             max_records,
@@ -215,7 +223,7 @@ impl RedisStore {
         &self,
         request: DescribeStreamRequest,
     ) -> Result<DescribeStreamResponse, DescribeError> {
-        let keys = self.keys(&request.stream_id);
+        let keys = self.keys(request.r#ref.as_ref())?;
         let call = ScriptCall::read(&scripts::DESCRIBE, &[keys.meta()], NoArgs);
         let (status, newest): Described = self.run(&call).await?;
         let status = match status {
@@ -270,15 +278,17 @@ impl StreamStore for RedisStore {
     fn create_stream(
         &self,
         request: CreateStreamRequest,
+        request_id: String,
     ) -> BoxFuture<'_, Result<CreateStreamResponse, CreateError>> {
-        Box::pin(self.create(request))
+        Box::pin(self.create(request, request_id))
     }
 
     fn append_records(
         &self,
         request: AppendRecordsRequest,
+        request_id: String,
     ) -> BoxFuture<'_, Result<AppendRecordsResponse, AppendError>> {
-        Box::pin(self.append(request))
+        Box::pin(self.append(request, request_id))
     }
 
     fn read_records(

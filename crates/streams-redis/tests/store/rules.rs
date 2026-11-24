@@ -18,7 +18,7 @@ use temporalio_streams::{
         CloseStreamRequest, CloseStreamResponse, CreateStreamRequest, CreateStreamResponse,
         DescribeStreamRequest, DescribeStreamResponse, LocalActivityAttempt, LocalActivityProducer,
         Producer, ReadRecordsRequest, ReadRecordsResponse, StandaloneActivityProducer,
-        StreamErrorReason, StreamIdConflictPolicy, StreamRecord, StreamStatus,
+        StreamErrorReason, StreamIdConflictPolicy, StreamRecord, StreamRef, StreamStatus,
         WorkflowActivityProducer, WorkflowProducer, WorkflowTaskAttempt, producer::Kind,
     },
     record::StoreLimits,
@@ -107,8 +107,10 @@ impl Known {
 
 #[derive(Debug)]
 enum Call {
-    Create(CreateStreamRequest),
-    Append(AppendRecordsRequest),
+    /// A create, and its request id.
+    Create(CreateStreamRequest, String),
+    /// An append, and its request id.
+    Append(AppendRecordsRequest, String),
     Close(CloseStreamRequest),
     Read(ReadRecordsRequest),
     Describe(DescribeStreamRequest),
@@ -156,8 +158,8 @@ struct Run<C> {
     admin: C,
     rng: Rng,
     known: HashMap<String, Known>,
-    /// The appends that the test sent, the newest last, for the resends.
-    sent: Vec<AppendRecordsRequest>,
+    /// The appends that the test sent with their request ids, the newest last, for the resends.
+    sent: Vec<(AppendRecordsRequest, String)>,
 }
 
 impl<C: ConnectionLike> Run<C> {
@@ -222,18 +224,28 @@ impl<C: ConnectionLike> Run<C> {
 
     fn next_call(&mut self) -> Call {
         let stream_id = self.rng.pick(&STREAMS).to_string();
+        // A Store ignores the `store` of a ref, and a create returns the ref as the request had it.
+        let stream_ref = Some(StreamRef {
+            id: stream_id.clone(),
+            store: self.rng.pick(&["", "redis"]).to_string(),
+        });
         match self.rng.below(100) {
-            0..10 => Call::Create(CreateStreamRequest {
-                stream_id,
-                id_conflict_policy: self.rng.below(3) as i32,
-                request_id: self.rng.pick(&["", "c1", "c2"]).to_string(),
-            }),
-            10..57 => Call::Append(self.next_append(stream_id)),
+            0..10 => Call::Create(
+                CreateStreamRequest {
+                    stream_ref,
+                    id_conflict_policy: self.rng.below(3) as i32,
+                },
+                self.rng.pick(&["", "c1", "c2"]).to_string(),
+            ),
+            10..57 => {
+                let (request, request_id) = self.next_append(stream_ref);
+                Call::Append(request, request_id)
+            }
             57..59 => Call::Close(CloseStreamRequest {
-                stream_id,
+                r#ref: stream_ref,
                 producer: Some(producer(&mut self.rng)),
             }),
-            59..66 => Call::Describe(DescribeStreamRequest { stream_id }),
+            59..66 => Call::Describe(DescribeStreamRequest { r#ref: stream_ref }),
             66..68 => Call::LoseLog(stream_id),
             68..70 => Call::StepClockBack(stream_id),
             _ => {
@@ -256,15 +268,15 @@ impl<C: ConnectionLike> Run<C> {
                     max_records: self.rng.below(6) as i32,
                     max_bytes: max_bytes as i64,
                     wait: None,
-                    stream_id,
+                    r#ref: stream_ref,
                 })
             }
         }
     }
 
-    /// Returns a new batch, or one that has the Producer and the `request_id` of an earlier one.
-    /// Its Records are new either way, since a resend doesn't compare them.
-    fn next_append(&mut self, stream_id: String) -> AppendRecordsRequest {
+    /// Returns a new batch and its request id, or the Producer and the request id of an earlier
+    /// batch. Its Records are new either way, since a resend doesn't compare them.
+    fn next_append(&mut self, stream_ref: Option<StreamRef>) -> (AppendRecordsRequest, String) {
         let records = (0..1 + self.rng.below(3)).map(|_| AppendRecord {
             body: Some(Payload {
                 metadata: (0..self.rng.below(3))
@@ -276,19 +288,21 @@ impl<C: ConnectionLike> Run<C> {
         });
         let records = records.collect();
         let recent = &self.sent[self.sent.len().saturating_sub(8)..];
-        let request = match recent.is_empty() || self.rng.chance(60) {
-            true => AppendRecordsRequest {
-                stream_id,
-                producer: Some(producer(&mut self.rng)),
-                request_id: match self.rng.chance(30) {
+        let append = match recent.is_empty() || self.rng.chance(60) {
+            true => (
+                AppendRecordsRequest {
+                    r#ref: stream_ref,
+                    producer: Some(producer(&mut self.rng)),
+                    records,
+                },
+                match self.rng.chance(30) {
                     true => String::new(),
                     false => format!("r{}", self.sent.len()),
                 },
-                records,
-            },
+            ),
             false => {
-                let mut again = self.rng.pick(recent);
-                // The same Producer and `request_id` from another attempt is no resend.
+                let (mut again, request_id) = self.rng.pick(recent);
+                // The same Producer and request id from another attempt is no resend.
                 if self.rng.chance(15) {
                     let (writer, _) = writer_of(again.producer.as_ref().unwrap());
                     again.producer = Some(loop {
@@ -298,11 +312,11 @@ impl<C: ConnectionLike> Run<C> {
                         }
                     });
                 }
-                AppendRecordsRequest { records, ..again }
+                (AppendRecordsRequest { records, ..again }, request_id)
             }
         };
-        self.sent.push(request.clone());
-        request
+        self.sent.push(append.clone());
+        append
     }
 
     fn next_from(&mut self, stream_id: &str) -> Vec<u8> {
@@ -335,12 +349,12 @@ impl<C: ConnectionLike> Run<C> {
 
     /// Makes the fault of a call that is one, and returns the Stream of any other call.
     async fn apply_fault(&mut self, call: &Call) -> Option<String> {
-        let stream_id = match call {
-            Call::Create(request) => &request.stream_id,
-            Call::Append(request) => &request.stream_id,
-            Call::Close(request) => &request.stream_id,
-            Call::Read(request) => &request.stream_id,
-            Call::Describe(request) => &request.stream_id,
+        let stream_ref = match call {
+            Call::Create(request, _) => &request.stream_ref,
+            Call::Append(request, _) => &request.r#ref,
+            Call::Close(request) => &request.r#ref,
+            Call::Read(request) => &request.r#ref,
+            Call::Describe(request) => &request.r#ref,
             Call::LoseLog(stream_id) => {
                 let known = self.known.get_mut(stream_id).unwrap();
                 let [_, log, ..] = keys(&self.prefix, stream_id);
@@ -379,7 +393,7 @@ impl<C: ConnectionLike> Run<C> {
                 return None;
             }
         };
-        Some(stream_id.clone())
+        Some(id_of(stream_ref.as_ref()).to_string())
     }
 
     /// States the rules of a call on what the test knows, and records what the call changes.
@@ -387,17 +401,25 @@ impl<C: ConnectionLike> Run<C> {
         let refused = |reason| Expected::Unchanged(Answer::Refused(reason));
         let fences = fence == Fence::On;
         match call {
-            Call::Create(request) => {
-                let known = self.known.get_mut(&request.stream_id).unwrap();
-                let created = |created| Answer::Created(CreateStreamResponse { created });
+            Call::Create(request, request_id) => {
+                let known = self
+                    .known
+                    .get_mut(id_of(request.stream_ref.as_ref()))
+                    .unwrap();
+                let created = |created| {
+                    Answer::Created(CreateStreamResponse {
+                        r#ref: request.stream_ref.clone(),
+                        created,
+                    })
+                };
                 let Some(created_by) = &known.created_by else {
-                    known.created_by = Some(request.request_id.clone());
+                    known.created_by = Some(request_id.clone());
                     return Expected::Written(created(true));
                 };
                 let use_existing = StreamIdConflictPolicy::UseExisting as i32;
                 if known.closed {
                     refused(StreamErrorReason::Closed)
-                } else if !request.request_id.is_empty() && request.request_id == *created_by {
+                } else if !request_id.is_empty() && request_id == created_by {
                     Expected::Unchanged(created(true))
                 } else if request.id_conflict_policy != use_existing {
                     refused(StreamErrorReason::AlreadyExists)
@@ -405,16 +427,16 @@ impl<C: ConnectionLike> Run<C> {
                     Expected::Unchanged(created(false))
                 }
             }
-            Call::Append(request) => {
-                let known = &self.known[&request.stream_id];
+            Call::Append(request, request_id) => {
+                let known = &self.known[id_of(request.r#ref.as_ref())];
                 if known.created_by.is_none() {
                     return refused(StreamErrorReason::NotFound);
                 }
                 let (writer, attempt) = writer_of(request.producer.as_ref().unwrap());
                 let writer = known.writers.get(&writer);
                 let resent = writer.into_iter().flat_map(|w| &w.batches).find(|batch| {
-                    !request.request_id.is_empty()
-                        && batch.request_id == request.request_id
+                    !request_id.is_empty()
+                        && batch.request_id == *request_id
                         && batch.attempt == attempt
                 });
                 if let Some(batch) = resent {
@@ -430,7 +452,7 @@ impl<C: ConnectionLike> Run<C> {
                 Expected::NewBatch
             }
             Call::Close(request) => {
-                let known = self.known.get_mut(&request.stream_id).unwrap();
+                let known = self.known.get_mut(id_of(request.r#ref.as_ref())).unwrap();
                 if known.created_by.is_none() {
                     return refused(StreamErrorReason::NotFound);
                 }
@@ -447,7 +469,7 @@ impl<C: ConnectionLike> Run<C> {
                 Expected::Written(closed)
             }
             Call::Describe(request) => {
-                let known = &self.known[&request.stream_id];
+                let known = &self.known[id_of(request.r#ref.as_ref())];
                 if known.created_by.is_none() {
                     return refused(StreamErrorReason::NotFound);
                 }
@@ -461,7 +483,7 @@ impl<C: ConnectionLike> Run<C> {
                 }))
             }
             Call::Read(request) => {
-                let known = &self.known[&request.stream_id];
+                let known = &self.known[id_of(request.r#ref.as_ref())];
                 let from = &request.from_offset;
                 if !from.is_empty() && from.len() != 16 {
                     return refused(StreamErrorReason::InvalidArgument);
@@ -490,12 +512,16 @@ impl<C: ConnectionLike> Run<C> {
         }
         let runtime = &via.runtime;
         match call {
-            Call::Create(request) => answer(
-                runtime.create_stream(request.clone()).await,
+            Call::Create(request, request_id) => answer(
+                runtime
+                    .create_stream(request.clone(), request_id.clone())
+                    .await,
                 Answer::Created,
             ),
-            Call::Append(request) => answer(
-                runtime.append_records(request.clone()).await,
+            Call::Append(request, request_id) => answer(
+                runtime
+                    .append_records(request.clone(), request_id.clone())
+                    .await,
                 Answer::Appended,
             ),
             Call::Close(request) => {
@@ -521,10 +547,11 @@ impl<C: ConnectionLike> Run<C> {
     /// Checks the answer of a batch that a Store with `window` had to write, and records the
     /// batch.
     fn accept(&mut self, call: &Call, window: usize, answer: Answer, context: &str) {
-        let (Call::Append(request), Answer::Appended(appended)) = (call, &answer) else {
+        let (Call::Append(request, request_id), Answer::Appended(appended)) = (call, &answer)
+        else {
             panic!("the Store didn't write the batch: {answer:?}. {context}");
         };
-        let known = self.known.get_mut(&request.stream_id).unwrap();
+        let known = self.known.get_mut(id_of(request.r#ref.as_ref())).unwrap();
         let producer = request.producer.as_ref().unwrap();
         let first = &appended.first_offset;
         assert!(first.len() == 16 && *first > known.newest(), "{context}");
@@ -543,7 +570,7 @@ impl<C: ConnectionLike> Run<C> {
         writer.newest_attempt = writer.newest_attempt.max(Some(attempt));
         writer.batches.push_front(Batch {
             attempt,
-            request_id: request.request_id.clone(),
+            request_id: request_id.clone(),
             answer: appended.clone(),
         });
         // The Store that appends cuts the list at its own window.
@@ -561,7 +588,7 @@ impl<C: ConnectionLike> Run<C> {
         let mut records = Vec::new();
         loop {
             let request = ReadRecordsRequest {
-                stream_id: stream_id.to_string(),
+                r#ref: crate::support::stream_ref(stream_id),
                 from_offset: from,
                 max_records: self.rng.below(5) as i32,
                 ..Default::default()
@@ -610,6 +637,11 @@ fn page(known: &Known, request: &ReadRecordsRequest) -> ReadRecordsResponse {
         last_offset,
         records,
     }
+}
+
+/// Returns the Stream id of the ref of a request. Every request of the test has a ref.
+fn id_of(stream_ref: Option<&StreamRef>) -> &str {
+    &stream_ref.unwrap().id
 }
 
 /// What identifies a Producer, as the proto field number of its kind and the ids of that kind.

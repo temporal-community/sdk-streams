@@ -1,7 +1,8 @@
 //! When a Stream expires, and what an expired Stream answers.
 
 use crate::support::{
-    Redis, Rng, append, close, create, describe, keys, read, reason, runtime, seeds, standalone,
+    NoRequestId, Redis, Rng, append, close, create, describe, keys, read, reason, runtime, seeds,
+    standalone,
 };
 use redis::aio::MultiplexedConnection;
 use std::time::Duration;
@@ -76,12 +77,12 @@ async fn each_key_expires_when_its_rule_says() {
             let before = time_ms(&mut admin).await;
             let wrote = match (step, rng.below(10)) {
                 (0, _) => {
-                    store.create_stream(create("s")).await.unwrap();
+                    store.create_no_id(create("s")).await.unwrap();
                     true
                 }
                 (_, 0..5) if !closed => {
                     let records: Vec<&[u8]> = vec![b"x"; 1 + rng.below(2)];
-                    store.append_records(append("s", &records)).await.unwrap();
+                    store.append_no_id(append("s", &records)).await.unwrap();
                     true
                 }
                 (_, 5..7) => {
@@ -94,7 +95,7 @@ async fn each_key_expires_when_its_rule_says() {
                         ..create("s")
                     };
                     // A closed Stream refuses the create, and neither answer is a write.
-                    let _ = store.create_stream(again).await;
+                    let _ = store.create_no_id(again).await;
                     false
                 }
                 _ => {
@@ -142,17 +143,17 @@ async fn an_expired_stream_answers_expired() {
     let long = Duration::from_secs(3600);
     // A closed Stream past its Retention, and an open one past its Producer idle TTL.
     let closed = store(short, None);
-    closed.create_stream(create("closed")).await.unwrap();
+    closed.create_no_id(create("closed")).await.unwrap();
     closed.close_stream(close("closed")).await.unwrap();
     let idle = store(long, Some(short));
-    idle.create_stream(create("idle")).await.unwrap();
+    idle.create_no_id(create("idle")).await.unwrap();
     while time_ms(&mut admin).await <= latest_expiry(&mut admin).await {
         tokio::time::sleep(short).await;
     }
     let expired = StreamErrorReason::Expired;
     for (stream, store) in [("closed", &closed), ("idle", &idle)] {
         assert_eq!(
-            reason(store.append_records(append(stream, &[b"y"])).await),
+            reason(store.append_no_id(append(stream, &[b"y"])).await),
             expired
         );
         assert_eq!(reason(store.close_stream(close(stream)).await), expired);
@@ -173,7 +174,7 @@ async fn an_expired_stream_answers_expired() {
                 id_conflict_policy: policy as i32,
                 ..create(stream)
             };
-            assert_eq!(reason(store.create_stream(again).await), expired);
+            assert_eq!(reason(store.create_no_id(again).await), expired);
         }
     }
 }

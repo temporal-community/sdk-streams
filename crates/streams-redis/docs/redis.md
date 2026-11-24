@@ -68,8 +68,8 @@ Each value is text, except `rid`.
 - A Store refuses every call of a Stream with a higher `v` than it knows, with
   `FORMAT_TOO_NEW`.
 - The request key of a call is the first 16 bytes of a SHA-256. For a create it covers the
-  `request_id`, and for an append the attempt key and the `request_id`. A call with no
-  `request_id` gets 16 random bytes.
+  request id, and for an append the attempt key and the request id. A call with an empty
+  request id gets 16 random bytes.
 
 ## The log
 
@@ -271,7 +271,7 @@ it lives, so a Store keeps as many as its busiest moment needed.
 A server, or a load balancer in front of it, can close a connection that is idle. The next call
 on that connection fails with `STORE_UNAVAILABLE`, and the call after it connects again. The
 Store can't know if Redis ran a write whose connection failed, so the Store itself never sends
-a write a second time. A retry with the `request_id` of the write writes it once. Only the wait
+a write a second time. A retry with the request id of the write writes it once. Only the wait
 of a read for a Record runs again by itself, on a new connection. The client of a Redis Cluster
 connects again by itself, and it can send a call a second time ("The Producers" above).
 
@@ -285,7 +285,7 @@ With the `wait` option, each create, append and close sends `WAIT` after its scr
 pipeline on a connection of its own.
 
 - A write that too few replicas have after the timeout fails with `STORE_UNAVAILABLE`. The write
-  is in Redis, so a retry with its `request_id` writes nothing again.
+  is in Redis, so a retry with its request id writes nothing again.
 - `WAIT` covers the last write of its connection. So a call that finds its work done (a resend, a
   close of a closed Stream, a create of a Stream that exists) writes `v` again before the
   `WAIT`, and it succeeds only once the replicas have the first write.

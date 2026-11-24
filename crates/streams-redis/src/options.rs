@@ -212,15 +212,15 @@ pub struct RedisStoreOptions {
     pub producer_idle_ttl: Option<Duration>,
     /// Whether the Store fences. It doesn't by default.
     pub fence: Fence,
-    /// The number of batches of each Producer of a Stream whose `request_id` the Store remembers,
-    /// 16 by default. An append of the same attempt with a remembered `request_id` is a resend.
+    /// The number of batches of each Producer of a Stream whose request id the Store remembers,
+    /// 16 by default. An append of the same attempt with a remembered request id is a resend.
     pub resend_window: NonZeroUsize,
     /// How long a call waits for Redis to respond, 5 seconds by default and more than zero.
     pub response_timeout: Duration,
     /// The replicas that each create, append and close waits for. It's `None` by default, and a
     /// write then succeeds once its Redis node has it. Redis replicates after it answers, so a
     /// failover can lose such a write. With a wait, a write that too few replicas have in time
-    /// fails with `STORE_UNAVAILABLE`, and a retry with its `request_id` writes nothing again.
+    /// fails with `STORE_UNAVAILABLE`, and a retry with its request id writes nothing again.
     pub wait: Option<WaitForReplicas>,
     /// Maximum number of calls that block on Redis at a time, 256 by default. A read that waits
     /// for a Record and a write that waits for its replicas each have a connection of their

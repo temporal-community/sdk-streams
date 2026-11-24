@@ -2,14 +2,11 @@
 //! wrong setup.
 
 use crate::support::{
-    Proxy, Redis, append, close, create, describe, free_port, keys, read, reason, runtime,
-    snapshot, standalone,
+    NoRequestId, Proxy, Redis, append, close, create, describe, free_port, keys, made, read,
+    reason, runtime, snapshot, standalone,
 };
 use std::{future::Future, time::Duration};
-use temporalio_streams::{
-    AnyReason, Reason, StreamError,
-    proto::{AppendRecordsRequest, CreateStreamRequest, CreateStreamResponse, StreamErrorReason},
-};
+use temporalio_streams::{AnyReason, StreamError, proto::StreamErrorReason};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
@@ -22,8 +19,8 @@ async fn a_newer_format_refuses_every_call() {
     let redis = Redis::start(&[]);
     let mut admin = redis.admin().await;
     let store = runtime(standalone(redis.url()));
-    store.create_stream(create("s")).await.unwrap();
-    store.append_records(append("s", &[b"x"])).await.unwrap();
+    store.create_no_id(create("s")).await.unwrap();
+    store.append_no_id(append("s", &[b"x"])).await.unwrap();
     let [meta, ..] = keys("temporal-streams", "s");
     let mut newer = redis::cmd("HSET");
     let _: i64 = (newer
@@ -36,8 +33,8 @@ async fn a_newer_format_refuses_every_call() {
     let before = snapshot(&mut admin, "temporal-streams", "s").await;
     // The Stream may hold what this Store can't read, so no call answers from it.
     let refusal = StreamErrorReason::FormatTooNew;
-    assert_eq!(reason(store.create_stream(create("s")).await), refusal);
-    let appended = store.append_records(append("s", &[b"y"])).await;
+    assert_eq!(reason(store.create_no_id(create("s")).await), refusal);
+    let appended = store.append_no_id(append("s", &[b"y"])).await;
     assert_eq!(reason(appended), refusal);
     assert_eq!(reason(store.read_records(read("s", &[])).await), refusal);
     assert_eq!(reason(store.describe_stream(describe("s")).await), refusal);
@@ -46,14 +43,15 @@ async fn a_newer_format_refuses_every_call() {
 }
 
 /// Returns the first answer of `call` that is no outage, as a caller that retries gets it.
-pub(crate) async fn after_outage<T, R, F>(call: impl Fn() -> F) -> Result<T, StreamError<Reason<R>>>
+pub(crate) async fn after_outage<T, R, F>(call: impl Fn() -> F) -> Result<T, StreamError<R>>
 where
-    F: Future<Output = Result<T, StreamError<Reason<R>>>>,
+    R: From<AnyReason> + PartialEq,
+    F: Future<Output = Result<T, StreamError<R>>>,
 {
     let started = Instant::now();
     loop {
         match call().await {
-            Err(error) if matches!(error.reason, Reason::Any(AnyReason::StoreUnavailable)) => {
+            Err(error) if error.reason == R::from(AnyReason::StoreUnavailable) => {
                 assert!(
                     started.elapsed() < Duration::from_secs(20),
                     "{}",
@@ -74,32 +72,34 @@ async fn a_lost_reply_is_an_outage_and_its_retry_writes_nothing() {
     let store = runtime(standalone(proxy.url()));
     let unavailable = StreamErrorReason::StoreUnavailable;
     // Redis has each script after these calls, so the next call of one runs it at its first try.
-    store.create_stream(create("warm")).await.unwrap();
-    store.append_records(append("warm", &[b"x"])).await.unwrap();
+    store.create_no_id(create("warm")).await.unwrap();
+    store.append_no_id(append("warm", &[b"x"])).await.unwrap();
     store.close_stream(close("warm")).await.unwrap();
 
-    let request = CreateStreamRequest {
-        request_id: "create-1".to_string(),
-        ..create("s")
-    };
+    let (request, request_id) = (create("s"), "create-1".to_string());
     proxy.lose_next_reply();
     assert_eq!(
-        reason(store.create_stream(request.clone()).await),
+        reason(
+            store
+                .create_stream(request.clone(), request_id.clone())
+                .await
+        ),
         unavailable
     );
-    let created = after_outage(|| store.create_stream(request.clone())).await;
-    assert_eq!(created, Ok(CreateStreamResponse { created: true }));
+    let created = after_outage(|| store.create_stream(request.clone(), request_id.clone())).await;
+    assert_eq!(created, Ok(made(&request)));
 
-    let request = AppendRecordsRequest {
-        request_id: "append-1".to_string(),
-        ..append("s", &[b"a", b"b"])
-    };
+    let (request, request_id) = (append("s", &[b"a", b"b"]), "append-1".to_string());
     proxy.lose_next_reply();
     assert_eq!(
-        reason(store.append_records(request.clone()).await),
+        reason(
+            store
+                .append_records(request.clone(), request_id.clone())
+                .await
+        ),
         unavailable
     );
-    let appended = after_outage(|| store.append_records(request.clone()))
+    let appended = after_outage(|| store.append_records(request.clone(), request_id.clone()))
         .await
         .unwrap();
     let page = store.read_records(read("s", &[])).await.unwrap();
@@ -124,15 +124,15 @@ async fn a_store_that_starts_before_redis_connects_later() {
     let port = free_port();
     let store = runtime(standalone(format!("redis://127.0.0.1:{port}")));
     let unavailable = StreamErrorReason::StoreUnavailable;
-    assert_eq!(reason(store.create_stream(create("s")).await), unavailable);
+    assert_eq!(reason(store.create_no_id(create("s")).await), unavailable);
     let _redis = Redis::start_on(port, &[]);
-    let created = store.create_stream(create("s")).await;
-    assert_eq!(created, Ok(CreateStreamResponse { created: true }));
+    let created = store.create_no_id(create("s")).await;
+    assert_eq!(created, Ok(made(&create("s"))));
 }
 
 /// Returns the message of an outage, or panics for an error with another reason.
-fn outage<R>(error: StreamError<Reason<R>>) -> String {
-    let unavailable = matches!(error.reason, Reason::Any(AnyReason::StoreUnavailable));
+fn outage<R: From<AnyReason> + PartialEq>(error: StreamError<R>) -> String {
+    let unavailable = error.reason == R::from(AnyReason::StoreUnavailable);
     assert!(unavailable, "{}", error.message);
     error.message
 }
@@ -159,24 +159,24 @@ async fn a_wrong_setup_is_an_outage_that_says_its_cause() {
     password.arg("SET").arg("requirepass").arg("secret");
     let _: () = password.query_async(&mut admin).await.unwrap();
     let no_password = runtime(standalone(redis.url()));
-    let message = outage(no_password.create_stream(create("s")).await.unwrap_err());
+    let message = outage(no_password.create_no_id(create("s")).await.unwrap_err());
     assert!(
         message.to_lowercase().contains("authentication"),
         "{message}"
     );
 
     let wrong_password = runtime(standalone(url(":wrong")));
-    let message = outage(wrong_password.create_stream(create("s")).await.unwrap_err());
+    let message = outage(wrong_password.create_no_id(create("s")).await.unwrap_err());
     assert!(
         message.to_lowercase().contains("authentication"),
         "{message}"
     );
 
     let no_xadd = runtime(standalone(url("no-xadd:pw")));
-    no_xadd.create_stream(create("s")).await.unwrap();
+    no_xadd.create_no_id(create("s")).await.unwrap();
     let message = outage(
         no_xadd
-            .append_records(append("s", &[b"x"]))
+            .append_no_id(append("s", &[b"x"]))
             .await
             .unwrap_err(),
     );
@@ -199,6 +199,6 @@ async fn a_wrong_setup_is_an_outage_that_says_its_cause() {
         }
     });
     let not_redis = runtime(standalone(not_redis));
-    let message = outage(not_redis.create_stream(create("s")).await.unwrap_err());
+    let message = outage(not_redis.create_no_id(create("s")).await.unwrap_err());
     assert!(message.contains("another service"), "{message}");
 }

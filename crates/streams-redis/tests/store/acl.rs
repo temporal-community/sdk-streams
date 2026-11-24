@@ -4,7 +4,9 @@
 use crate::{
     cluster::Migration,
     reads::{page, until_blocked, waiting},
-    support::{Cluster, Redis, append, close, create, describe, keys, read, reason, runtime},
+    support::{
+        Cluster, NoRequestId, Redis, append, close, create, describe, keys, read, reason, runtime,
+    },
 };
 use redis::aio::ConnectionLike;
 use std::{collections::BTreeSet, num::NonZeroUsize, sync::Arc};
@@ -100,12 +102,12 @@ fn store(servers: RedisServers, wait: Option<WaitForReplicas>) -> Arc<StreamRunt
 
 /// Runs every call of the two roles on a Stream, each with the Store of its role.
 async fn run_roles(producer: &StreamRuntime, reader: &Arc<StreamRuntime>, blocks_on: &str) {
-    producer.create_stream(create("s")).await.unwrap();
+    producer.create_no_id(create("s")).await.unwrap();
     let request = waiting("s", &[], 60);
     let waiting_reader = reader.clone();
     let read_ahead = tokio::spawn(async move { waiting_reader.read_records(request).await });
     until_blocked(blocks_on, 1).await;
-    let first = producer.append_records(append("s", &[b"a"])).await.unwrap();
+    let first = producer.append_no_id(append("s", &[b"a"])).await.unwrap();
     assert_eq!(
         read_ahead.await.unwrap(),
         Ok(page(&first.first_offset, b"a"))
@@ -142,7 +144,7 @@ async fn a_user_with_the_documented_access_runs_its_role() {
     let read_only = store("read-only", None);
     let unavailable = StreamErrorReason::StoreUnavailable;
     assert_eq!(
-        reason(read_only.create_stream(create("other")).await),
+        reason(read_only.create_no_id(create("other")).await),
         unavailable
     );
     let [meta, ..] = keys(PREFIX, "other");
@@ -179,9 +181,9 @@ async fn a_user_with_the_documented_access_runs_its_role_on_a_cluster() {
 
     // While a slot migrates, the node that gives it away sends a call to the other node, and the
     // call needs one more command there.
-    producer.create_stream(create("moves")).await.unwrap();
+    producer.create_no_id(create("moves")).await.unwrap();
     let first = producer
-        .append_records(append("moves", &[b"a"]))
+        .append_no_id(append("moves", &[b"a"]))
         .await
         .unwrap();
     let [moved_meta, moved_log, moved_producers, _] = keys(PREFIX, "moves");
@@ -190,7 +192,7 @@ async fn a_user_with_the_documented_access_runs_its_role_on_a_cluster() {
         .move_keys(&[&moved_meta, &moved_log, &moved_producers])
         .await;
     let second = producer
-        .append_records(append("moves", &[b"b"]))
+        .append_no_id(append("moves", &[b"b"]))
         .await
         .unwrap();
     let after = reader.read_records(read("moves", &first.last_offset)).await;

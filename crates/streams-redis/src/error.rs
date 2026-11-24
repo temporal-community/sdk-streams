@@ -2,7 +2,7 @@
 //! operation, with the reason that a caller acts on.
 
 use redis::{ErrorKind, ParsingError, RedisError, ServerErrorKind};
-use temporalio_streams::{Reason, StreamError, WireReason, proto::StreamErrorReason};
+use temporalio_streams::{StreamError, WireReason, proto::StreamErrorReason};
 
 /// An error of the Redis Store.
 #[derive(Debug, thiserror::Error)]
@@ -46,7 +46,7 @@ impl RedisStoreError {
 ///   wrong password, a missing ACL permission, a server that is too old and a server that is no
 ///   Redis. The request is fine, and the call succeeds once an operator fixes the setup, as it
 ///   does after an outage.
-impl<R: WireReason> From<RedisStoreError> for StreamError<Reason<R>> {
+impl<R: WireReason> From<RedisStoreError> for StreamError<R> {
     fn from(error: RedisStoreError) -> Self {
         let error = match error {
             RedisStoreError::Invalid(message) => return Self::invalid_argument(message),
@@ -122,7 +122,7 @@ fn outage(error: &RedisError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use temporalio_streams::{AnyReason, AppendError, AppendReason, DescribeError};
+    use temporalio_streams::{AnyReason, AppendError, AppendReason, DescribeError, DescribeReason};
 
     /// Parses the error from its wire form, so its code and detail split as in a real reply.
     fn reply(text: &str) -> RedisStoreError {
@@ -142,7 +142,7 @@ mod tests {
         );
         // A describe can't fail with `CLOSED`, so the answer isn't one of the describe script.
         let error = DescribeError::from(closed());
-        assert_eq!(error.reason, Reason::Any(AnyReason::StoreCorrupt));
+        assert_eq!(error.reason, DescribeReason::Other(AnyReason::StoreCorrupt));
         // A retry of these reads the same value again, so they must not look like an outage.
         let unreadable = redis::from_redis_value::<i64>(redis::Value::Okay).unwrap_err();
         let corrupt: [RedisStoreError; 3] = [
@@ -156,7 +156,11 @@ mod tests {
         for error in corrupt {
             let text = error.to_string();
             let error = AppendError::from(error);
-            assert_eq!(error.reason, Reason::Any(AnyReason::StoreCorrupt), "{text}");
+            assert_eq!(
+                error.reason,
+                AppendReason::Other(AnyReason::StoreCorrupt),
+                "{text}"
+            );
         }
         // The first four pass by themselves, and the others need an operator. Workflow code
         // waits for either, so none of them may be a reason that fails the call for good.
@@ -178,7 +182,7 @@ mod tests {
         ];
         for text in outages {
             let error = AppendError::from(reply(text));
-            let unavailable = Reason::Any(AnyReason::StoreUnavailable);
+            let unavailable = AppendReason::Other(AnyReason::StoreUnavailable);
             assert_eq!(error.reason, unavailable, "{text}");
             let (_, detail) = text.split_once(' ').unwrap();
             assert!(error.message.contains(detail), "{error}");
@@ -186,10 +190,13 @@ mod tests {
         // Bytes that are no reply of Redis, as another service at the URL sends them.
         let http = redis::parse_redis_value(b"HTTP/1.1 400 Bad Request\r\n\r\n").unwrap_err();
         let not_redis = AppendError::from(RedisStoreError::from(http));
-        assert_eq!(not_redis.reason, Reason::Any(AnyReason::StoreUnavailable));
+        assert_eq!(
+            not_redis.reason,
+            AppendReason::Other(AnyReason::StoreUnavailable)
+        );
         assert!(not_redis.message.contains("another service"), "{not_redis}");
         let old = AppendError::from(reply("ERR unknown command 'EVALSHA_RO', with args"));
-        assert_eq!(old.reason, Reason::Any(AnyReason::StoreUnavailable));
+        assert_eq!(old.reason, AppendReason::Other(AnyReason::StoreUnavailable));
         assert!(old.message.contains("needs Redis 7.0"), "{old}");
     }
 }

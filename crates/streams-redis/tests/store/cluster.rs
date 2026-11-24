@@ -4,13 +4,13 @@
 use crate::{
     reads::{page, until_blocked, waiting},
     support::{
-        Cluster, Redis, Rng, append, close, create, describe, keys, read, reason, runtime, seeds,
-        standalone,
+        Cluster, NoRequestId, Redis, Rng, append, close, create, describe, keys, read, reason,
+        runtime, seeds, standalone,
     },
 };
 use std::{sync::Arc, time::Duration};
 use temporalio_streams::{
-    AnyReason, Reason,
+    AnyReason, CreateReason,
     proto::{StreamErrorReason, StreamStatus},
 };
 use temporalio_streams_redis::{RedisServers, RedisStoreOptions};
@@ -35,7 +35,7 @@ async fn a_waiting_read_blocks_on_the_node_of_its_stream() {
         for round in 0..20 {
             let text: String = (0..rng.below(12)).map(|_| rng.pick(&characters)).collect();
             let id = format!("{text}{round}");
-            store.create_stream(create(&id)).await.unwrap();
+            store.create_no_id(create(&id)).await.unwrap();
             let request = waiting(&id, &[], 60);
             let reader = store.clone();
             let read = tokio::spawn(async move { reader.read_records(request).await });
@@ -44,7 +44,7 @@ async fn a_waiting_read_blocks_on_the_node_of_its_stream() {
             let [_, log, ..] = keys(PREFIX, &id);
             let node = cluster.node_of(slot_of(&cluster.nodes[0], &log).await);
             until_blocked(&node.url(), 1).await;
-            let appended = store.append_records(append(&id, &[b"x"])).await.unwrap();
+            let appended = store.append_no_id(append(&id, &[b"x"])).await.unwrap();
             let got = read.await.unwrap();
             assert_eq!(
                 got,
@@ -60,13 +60,13 @@ async fn a_waiting_read_blocks_on_the_node_of_its_stream() {
 async fn a_cluster_resend_of_one_call_writes_once() {
     let cluster = Cluster::start().await;
     let store = runtime(cluster.options());
-    store.create_stream(create("s")).await.unwrap();
+    store.create_no_id(create("s")).await.unwrap();
     // The node has the append script after this call, so the next append runs at its first try.
-    store.append_records(append("s", &[b"a"])).await.unwrap();
-    // The cluster connection sends a call again when its connection drops. This batch has no
-    // `request_id`, so only its request key tells Redis that the second one is the same call.
+    store.append_no_id(append("s", &[b"a"])).await.unwrap();
+    // The cluster connection sends a call again when its connection drops. This batch has an
+    // empty request id, so only its request key tells Redis that the second one is the same call.
     cluster.lose_next_reply();
-    let appended = store.append_records(append("s", &[b"b"])).await.unwrap();
+    let appended = store.append_no_id(append("s", &[b"b"])).await.unwrap();
     assert!(cluster.lost_the_reply());
     let all = store.read_records(read("s", &[])).await.unwrap();
     let bodies = all
@@ -156,8 +156,8 @@ async fn a_stream_is_served_while_its_slot_migrates() {
     options.response_timeout = Duration::from_secs(1);
     let store = Arc::new(runtime(options));
     let unavailable = StreamErrorReason::StoreUnavailable;
-    store.create_stream(create("s")).await.unwrap();
-    store.append_records(append("s", &[b"a"])).await.unwrap();
+    store.create_no_id(create("s")).await.unwrap();
+    store.append_no_id(append("s", &[b"a"])).await.unwrap();
 
     let [meta, log, producers, closed] = keys(PREFIX, "s");
     let migration = Migration::start(&cluster, &meta).await;
@@ -178,12 +178,12 @@ async fn a_stream_is_served_while_its_slot_migrates() {
     };
 
     // The source still has every key of the Stream, so it serves it.
-    store.append_records(append("s", &[b"b"])).await.unwrap();
+    store.append_no_id(append("s", &[b"b"])).await.unwrap();
     refused_close().await;
 
     migration.move_keys(&[&meta, &log, &producers]).await;
     // The target has every key, and the source redirects each call to it.
-    let third = store.append_records(append("s", &[b"c"])).await.unwrap();
+    let third = store.append_no_id(append("s", &[b"c"])).await.unwrap();
     let all = store.read_records(read("s", &[])).await.unwrap();
     assert_eq!(all.records.len(), 3);
     assert_eq!(all.last_offset, third.last_offset);
@@ -191,7 +191,7 @@ async fn a_stream_is_served_while_its_slot_migrates() {
     let request = waiting("s", &third.last_offset, 60);
     let reader = store.clone();
     let waiting_read = tokio::spawn(async move { reader.read_records(request).await });
-    let fourth = store.append_records(append("s", &[b"d"])).await.unwrap();
+    let fourth = store.append_no_id(append("s", &[b"d"])).await.unwrap();
     assert_eq!(
         waiting_read.await.unwrap(),
         Ok(page(&fourth.first_offset, b"d"))
@@ -225,10 +225,13 @@ async fn the_wrong_kind_of_servers_is_an_outage_that_says_its_cause() {
     }
     let one_server = runtime(standalone(node.url()));
     let error = one_server
-        .create_stream(create(&id.to_string()))
+        .create_no_id(create(&id.to_string()))
         .await
         .unwrap_err();
-    assert_eq!(error.reason, Reason::Any(AnyReason::StoreUnavailable));
+    assert_eq!(
+        error.reason,
+        CreateReason::Other(AnyReason::StoreUnavailable)
+    );
     assert!(
         error.message.contains("needs `RedisServers::Cluster`"),
         "{error}"
@@ -239,6 +242,6 @@ async fn the_wrong_kind_of_servers_is_an_outage_that_says_its_cause() {
         first: redis.url().parse().unwrap(),
         rest: Vec::new(),
     });
-    let created = runtime(options).create_stream(create("s")).await;
+    let created = runtime(options).create_no_id(create("s")).await;
     assert_eq!(reason(created), StreamErrorReason::StoreUnavailable);
 }

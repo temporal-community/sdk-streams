@@ -28,7 +28,7 @@ config of the SDK that calls the Store. The Store has none.
 | `retention` | 7 days | How long a Stream stays readable after its close |
 | `producer_idle_ttl` | none | How long an open Stream stays after its last append |
 | `fence` | `Fence::Off` | Whether a write of an earlier attempt of a Producer is refused |
-| `resend_window` | 16 | The batches of a Producer whose `request_id` the Store remembers |
+| `resend_window` | 16 | The batches of a Producer whose request id the Store remembers |
 | `response_timeout` | 5 s | How long a call waits for Redis |
 | `wait` | none | The replicas that each write waits for, with `WAIT`, and for how long |
 | `max_blocking_connections` | 256 | The reads and the writes that can block at a time |
