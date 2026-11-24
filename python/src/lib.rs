@@ -8,7 +8,8 @@
 
 //! The native module of the Python package of the Redis Store. It runs the Store of the
 //! `temporalio-streams-redis` crate behind a [`StreamRuntime`], on Tokio threads of its own, and
-//! Python calls each operation with the encoded request.
+//! Python calls each operation with the encoded request. A create and an append also take their
+//! request id, which is no field of the request.
 
 use prost::Message;
 use pyo3::{
@@ -191,15 +192,25 @@ impl RedisStore {
         })
     }
 
-    fn create_stream<'py>(&self, py: Python<'py>, request: &[u8]) -> PyResult<Bound<'py, PyAny>> {
+    fn create_stream<'py>(
+        &self,
+        py: Python<'py>,
+        request: &[u8],
+        request_id: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
         self.call(py, request, |runtime, request| async move {
-            runtime.create_stream(request).await
+            runtime.create_stream(request, request_id).await
         })
     }
 
-    fn append_records<'py>(&self, py: Python<'py>, request: &[u8]) -> PyResult<Bound<'py, PyAny>> {
+    fn append_records<'py>(
+        &self,
+        py: Python<'py>,
+        request: &[u8],
+        request_id: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
         self.call(py, request, |runtime, request| async move {
-            runtime.append_records(request).await
+            runtime.append_records(request, request_id).await
         })
     }
 
