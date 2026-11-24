@@ -20,6 +20,7 @@ from temporalio.api.stream.v1 import (
     ClientProducer,
     Producer,
     StreamRecord,
+    StreamRef,
     WorkflowActivityProducer,
 )
 from temporalio.api.streamservice.v1 import (
@@ -38,6 +39,7 @@ from temporalio.exceptions import StreamError
 from temporalio_streams_redis import RedisStreamStore
 
 CLIENT = Producer(client=ClientProducer(namespace="default", id="client:test"))
+REF = StreamRef(id="s")
 
 
 def new_store(redis: Redis, **options: Any) -> RedisStreamStore:
@@ -66,35 +68,30 @@ def body(data: bytes) -> AppendRecord:
 async def test_the_five_calls_cross_the_boundary(redis: Redis):
     store = new_store(redis)
     created = await store.create_stream(
-        CreateStreamRequest(stream_id="s", request_id="create-1")
+        CreateStreamRequest(stream_ref=REF), request_id="create-1"
     )
-    assert created == CreateStreamResponse(created=True)
+    assert created == CreateStreamResponse(ref=REF, created=True)
     batch = AppendRecordsRequest(
-        stream_id="s",
-        producer=activity(1),
-        request_id="append-1",
-        records=[body(b"a"), body(b"b")],
+        ref=REF, producer=activity(1), records=[body(b"a"), body(b"b")]
     )
-    appended = await store.append_records(batch)
+    appended = await store.append_records(batch, request_id="append-1")
     assert appended.first_offset < appended.last_offset
     # A resend has the answer of the first write, which shows that the request id crossed.
-    assert await store.append_records(batch) == appended
+    assert await store.append_records(batch, request_id="append-1") == appended
 
-    page = await store.read_records(ReadRecordsRequest(stream_id="s", max_records=1))
+    page = await store.read_records(ReadRecordsRequest(ref=REF, max_records=1))
     first = StreamRecord(
         producer=activity(1), body=body(b"a").body, offset=appended.first_offset
     )
     assert page == ReadRecordsResponse(records=[first], last_offset=first.offset)
-    described = await store.describe_stream(DescribeStreamRequest(stream_id="s"))
+    described = await store.describe_stream(DescribeStreamRequest(ref=REF))
     assert described == DescribeStreamResponse(
         status=StreamStatus.STREAM_STATUS_OPEN, last_offset=appended.last_offset
     )
-    closed = await store.close_stream(
-        CloseStreamRequest(stream_id="s", producer=CLIENT)
-    )
+    closed = await store.close_stream(CloseStreamRequest(ref=REF, producer=CLIENT))
     assert closed == CloseStreamResponse()
     rest = await store.read_records(
-        ReadRecordsRequest(stream_id="s", from_offset=first.offset)
+        ReadRecordsRequest(ref=REF, from_offset=first.offset)
     )
     second = StreamRecord(
         producer=activity(1), body=body(b"b").body, offset=appended.last_offset
@@ -107,10 +104,8 @@ async def test_the_five_calls_cross_the_boundary(redis: Redis):
 async def test_a_refusal_keeps_its_reason(redis: Redis):
     reasons = StreamErrorReason
     store = new_store(redis, fence=True, retention=timedelta(milliseconds=1))
-    append = AppendRecordsRequest(
-        stream_id="s", producer=activity(2), records=[body(b"a")]
-    )
-    create = CreateStreamRequest(stream_id="s")
+    append = AppendRecordsRequest(ref=REF, producer=activity(2), records=[body(b"a")])
+    create = CreateStreamRequest(stream_ref=REF)
 
     async def refused(call: Any) -> StreamErrorReason.ValueType:
         with pytest.raises(StreamError) as raised:
@@ -119,49 +114,45 @@ async def test_a_refusal_keeps_its_reason(redis: Redis):
         return raised.value.reason
 
     assert (
-        await refused(store.append_records(append))
+        await refused(store.append_records(append, request_id=""))
         == reasons.STREAM_ERROR_REASON_NOT_FOUND
     )
-    await store.create_stream(create)
+    await store.create_stream(create, request_id="")
     assert (
-        await refused(store.create_stream(create))
+        await refused(store.create_stream(create, request_id=""))
         == reasons.STREAM_ERROR_REASON_ALREADY_EXISTS
     )
-    await store.append_records(append)
-    earlier = AppendRecordsRequest(
-        stream_id="s", producer=activity(1), records=[body(b"b")]
-    )
+    await store.append_records(append, request_id="")
+    earlier = AppendRecordsRequest(ref=REF, producer=activity(1), records=[body(b"b")])
     assert (
-        await refused(store.append_records(earlier))
+        await refused(store.append_records(earlier, request_id=""))
         == reasons.STREAM_ERROR_REASON_FENCED
     )
     # The limits of a batch are those of the SDK's Stream config, so the Store has none.
-    many = AppendRecordsRequest(
-        stream_id="s", producer=CLIENT, records=[body(b"c")] * 1001
-    )
-    await store.append_records(many)
-    high = ReadRecordsRequest(stream_id="s", from_offset=b"\xff" * 16)
+    many = AppendRecordsRequest(ref=REF, producer=CLIENT, records=[body(b"c")] * 1001)
+    await store.append_records(many, request_id="")
+    high = ReadRecordsRequest(ref=REF, from_offset=b"\xff" * 16)
     assert (
         await refused(store.read_records(high))
         == reasons.STREAM_ERROR_REASON_OFFSET_TOO_HIGH
     )
-    short = ReadRecordsRequest(stream_id="s", from_offset=b"12345")
+    short = ReadRecordsRequest(ref=REF, from_offset=b"12345")
     assert (
         await refused(store.read_records(short))
         == reasons.STREAM_ERROR_REASON_INVALID_ARGUMENT
     )
-    await store.close_stream(CloseStreamRequest(stream_id="s", producer=CLIENT))
+    await store.close_stream(CloseStreamRequest(ref=REF, producer=CLIENT))
     # The Retention of 1 ms has passed by the next call or the one after it.
     while True:
-        reason = await refused(store.append_records(append))
+        reason = await refused(store.append_records(append, request_id=""))
         if reason == reasons.STREAM_ERROR_REASON_EXPIRED:
             break
         assert reason == reasons.STREAM_ERROR_REASON_CLOSED
     # A Store that doesn't fence takes the earlier attempt, as the default is.
     plain = new_store(redis)
-    await plain.create_stream(create)
-    await plain.append_records(append)
-    await plain.append_records(earlier)
+    await plain.create_stream(create, request_id="")
+    await plain.append_records(append, request_id="")
+    await plain.append_records(earlier, request_id="")
 
 
 def blocked_reads(redis: Redis) -> int:
@@ -171,8 +162,8 @@ def blocked_reads(redis: Redis) -> int:
 
 async def test_a_cancelled_read_frees_its_connection(redis: Redis):
     store = new_store(redis)
-    await store.create_stream(CreateStreamRequest(stream_id="s"))
-    waits = ReadRecordsRequest(stream_id="s", wait=Duration(seconds=60))
+    await store.create_stream(CreateStreamRequest(stream_ref=REF), request_id="")
+    waits = ReadRecordsRequest(ref=REF, wait=Duration(seconds=60))
     before = blocked_reads(redis)
     read = asyncio.create_task(store.read_records(waits))
     while blocked_reads(redis) == before:
@@ -192,7 +183,7 @@ async def test_a_cancelled_read_frees_its_connection(redis: Redis):
 )
 async def test_a_store_in_a_forked_child_raises(redis: Redis):
     store = new_store(redis)
-    describe = DescribeStreamRequest(stream_id="s")
+    describe = DescribeStreamRequest(ref=REF)
     # The first call starts the threads of the Store in this process.
     with pytest.raises(StreamError):
         await store.describe_stream(describe)
@@ -212,7 +203,7 @@ async def test_a_store_in_a_forked_child_raises(redis: Redis):
 async def test_a_store_with_no_server_fails_as_an_outage():
     store = RedisStreamStore(f"redis://127.0.0.1:{free_port()}")
     with pytest.raises(StreamError) as raised:
-        await store.create_stream(CreateStreamRequest(stream_id="s"))
+        await store.create_stream(CreateStreamRequest(stream_ref=REF), request_id="")
     assert (
         raised.value.reason == StreamErrorReason.STREAM_ERROR_REASON_STORE_UNAVAILABLE
     )
@@ -247,8 +238,10 @@ async def test_a_tls_server_is_reached(tmp_path: Path, monkeypatch: pytest.Monke
         monkeypatch.setenv("SSL_CERT_FILE", str(tmp_path / "ca.pem"))
         # A wheel with no TLS provider fails here, at the first TLS connection of the process.
         store = RedisStreamStore(f"rediss://127.0.0.1:{port}")
-        created = await store.create_stream(CreateStreamRequest(stream_id="s"))
-        assert created == CreateStreamResponse(created=True)
+        created = await store.create_stream(
+            CreateStreamRequest(stream_ref=REF), request_id=""
+        )
+        assert created == CreateStreamResponse(ref=REF, created=True)
     finally:
         server.stop()
 

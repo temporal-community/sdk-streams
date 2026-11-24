@@ -119,19 +119,21 @@ class RedisStreamStore(temporalio.client.StreamStore):
         """Return the name that a ``StreamConfig`` registers this Store under."""
         return self._name
 
-    async def create_stream(self, request: CreateStreamRequest) -> CreateStreamResponse:
+    async def create_stream(
+        self, request: CreateStreamRequest, *, request_id: str
+    ) -> CreateStreamResponse:
         """See base class."""
         response = await self._store.create_stream(
-            request.SerializeToString(), request.request_id
+            request.SerializeToString(), request_id
         )
         return CreateStreamResponse.FromString(response)
 
     async def append_records(
-        self, request: AppendRecordsRequest
+        self, request: AppendRecordsRequest, *, request_id: str
     ) -> AppendRecordsResponse:
         """See base class."""
         response = await self._store.append_records(
-            request.SerializeToString(), request.request_id
+            request.SerializeToString(), request_id
         )
         return AppendRecordsResponse.FromString(response)
 

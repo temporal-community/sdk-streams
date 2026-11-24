@@ -20,6 +20,7 @@ from temporalio.api.stream.v1 import (
     LocalActivityProducer,
     Producer,
     StandaloneActivityProducer,
+    StreamRef,
     WorkflowActivityProducer,
     WorkflowProducer,
     WorkflowTaskAttempt,
@@ -68,30 +69,31 @@ class Side:
         newest = offsets[-1]
         return (int.from_bytes(newest) + 1).to_bytes(len(newest))
 
-    async def answer(self, call: Message, from_rank: int) -> Any:
+    async def answer(self, call: Message, request_id: str, from_rank: int) -> Any:
         """Send a call, and return its answer in a form that both Stores share."""
         try:
             if isinstance(call, CreateStreamRequest):
-                return await self.store.create_stream(call)
+                return await self.store.create_stream(call, request_id=request_id)
             if isinstance(call, CloseStreamRequest):
                 return await self.store.close_stream(call)
             if isinstance(call, DescribeStreamRequest):
                 described = await self.store.describe_stream(call)
-                return self._described(call.stream_id, described)
+                return self._described(call.ref.id, described)
             if isinstance(call, AppendRecordsRequest):
-                appended = await self.store.append_records(call)
-                await self._learn(call.stream_id)
-                return self._appended(call.stream_id, appended)
+                appended = await self.store.append_records(call, request_id=request_id)
+                await self._learn(call.ref.id)
+                return self._appended(call.ref.id, appended)
             assert isinstance(call, ReadRecordsRequest)
             read = ReadRecordsRequest()
             read.CopyFrom(call)
-            read.from_offset = self.offset(call.stream_id, from_rank)
-            return self._page(call.stream_id, await self.store.read_records(read))
+            read.from_offset = self.offset(call.ref.id, from_rank)
+            return self._page(call.ref.id, await self.store.read_records(read))
         except StreamError as err:
             return err.reason
 
     async def _learn(self, stream_id: str) -> None:
-        page = await self.store.read_records(ReadRecordsRequest(stream_id=stream_id))
+        read = ReadRecordsRequest(ref=StreamRef(id=stream_id))
+        page = await self.store.read_records(read)
         self.offsets[stream_id] = [record.offset for record in page.records]
 
     def _appended(self, stream_id: str, appended: AppendRecordsResponse) -> Any:
@@ -167,57 +169,62 @@ class Calls:
     """The generator of the calls of one seed."""
 
     rng: random.Random
-    # The appends that each kind of Producer sent to a Stream, the newest last, for the resends.
-    sent: dict[tuple[str, str | None], list[AppendRecordsRequest]] = field(
+    # The appends that each kind of Producer sent to a Stream with their request ids, the newest
+    # last, for the resends.
+    sent: dict[tuple[str, str | None], list[tuple[AppendRecordsRequest, str]]] = field(
         default_factory=dict
     )
     created: set[str] = field(default_factory=set)
 
-    def next(self, records: dict[str, int]) -> tuple[Message, int]:
-        """Return a call, and for a read the place of the offset that it reads from."""
+    def next(self, records: dict[str, int]) -> tuple[Message, str, int]:
+        """Return a call, the request id of a create or an append, and for a read the
+        place of the offset that it reads from.
+        """
         rng = self.rng
         stream_id = rng.choice(STREAMS)
+        ref = StreamRef(id=stream_id)
         roll = rng.randrange(100)
         # A Stream that isn't created refuses every other call, so its create comes early.
         if roll < 6 or (stream_id not in self.created and roll < 50):
             self.created.add(stream_id)
             request_id = rng.choice(["", "c1", "c2"])
             policy: Any = rng.randrange(3)
-            create = CreateStreamRequest(
-                stream_id=stream_id, id_conflict_policy=policy, request_id=request_id
-            )
-            return create, 0
+            create = CreateStreamRequest(stream_ref=ref, id_conflict_policy=policy)
+            return create, request_id, 0
         if roll < 60:
-            return self._append(stream_id), 0
+            batch, request_id = self._append(stream_id)
+            return batch, request_id, 0
         if roll < 61:
-            return CloseStreamRequest(stream_id=stream_id, producer=producer(rng)), 0
+            return CloseStreamRequest(ref=ref, producer=producer(rng)), "", 0
         if roll < 68:
-            return DescribeStreamRequest(stream_id=stream_id), 0
+            return DescribeStreamRequest(ref=ref), "", 0
         known = records.get(stream_id, 0)
         # A place of a Record, the start, or the place after the newest Record.
         from_rank = rng.randrange(known + 2) if known else 0
-        read = ReadRecordsRequest(stream_id=stream_id, max_records=rng.randrange(6))
-        return read, from_rank
+        read = ReadRecordsRequest(ref=ref, max_records=rng.randrange(6))
+        return read, "", from_rank
 
-    def _append(self, stream_id: str) -> AppendRecordsRequest:
+    def _append(self, stream_id: str) -> tuple[AppendRecordsRequest, str]:
         rng = self.rng
-        batch = AppendRecordsRequest(stream_id=stream_id, producer=producer(rng))
+        batch = AppendRecordsRequest(
+            ref=StreamRef(id=stream_id), producer=producer(rng)
+        )
+        request_id = ""
         kind = batch.producer.WhichOneof("kind")
         earlier = self.sent.setdefault((stream_id, kind), [])
         if earlier and rng.random() < 0.4:
             # The request id of a batch around the place where a Store forgets one. With the
             # earlier attempt it's a resend, and with the new attempt it's none.
-            again = rng.choice(earlier[-(WINDOW + 2) :])
-            batch.request_id = again.request_id
+            again, request_id = rng.choice(earlier[-(WINDOW + 2) :])
             if rng.random() < 0.85:
                 batch.producer.CopyFrom(again.producer)
         elif rng.random() < 0.7:
-            batch.request_id = f"r{sum(map(len, self.sent.values()))}"
+            request_id = f"r{sum(map(len, self.sent.values()))}"
         # A resend has other Records than its first send, since a Store compares none.
         for _ in range(1 + rng.randrange(3)):
             batch.records.add(body=Payload(data=rng.randbytes(rng.randrange(20))))
-        earlier.append(batch)
-        return batch
+        earlier.append((batch, request_id))
+        return batch, request_id
 
 
 @pytest.mark.parametrize("fence", [False, True])
@@ -236,8 +243,11 @@ async def test_the_redis_store_answers_as_the_memory_store(redis: Redis, fence: 
             records = {
                 stream: len(found) for stream, found in redis_side.offsets.items()
             }
-            call, from_rank = calls.next(records)
-            on_redis = await redis_side.answer(call, from_rank)
-            in_memory = await memory_side.answer(call, from_rank)
-            note = f"seed {seed}, fence {fence}, step {step}, from place {from_rank}"
+            call, request_id, from_rank = calls.next(records)
+            on_redis = await redis_side.answer(call, request_id, from_rank)
+            in_memory = await memory_side.answer(call, request_id, from_rank)
+            note = (
+                f"seed {seed}, fence {fence}, step {step}, request id {request_id!r}, "
+                f"from place {from_rank}"
+            )
             assert on_redis == in_memory, f"{note}\n{type(call).__name__}\n{call}"
