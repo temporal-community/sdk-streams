@@ -3,7 +3,7 @@
 -- KEYS: the meta key, the log, the Producers.
 -- ARGV:
 -- 1. The field of the Producer
--- 2. The attempt key of the batch (40 bytes)
+-- 2. The attempt key of the batch (28 bytes)
 -- 3. The request key of the batch (16 bytes)
 -- 4. `1` when the Store fences
 -- 5. The number of batches that the Store remembers for a Producer

@@ -106,9 +106,11 @@ the key as it is and don't parse it. It has these fields.
 
 1. The proto field number of the Producer's kind (1 byte)
 2. Each id of the kind, in the order of its proto fields. An id is its length as a big-endian
-   number (4 bytes), and then its bytes.
+   number (4 bytes), and then its bytes. A text id is UTF-8. The scheduled event id of an
+   Activity that a Workflow scheduled is a number id of 8 big-endian bytes, which the key leaves
+   out when it's zero.
 
-The value of the field starts with the Producer's newest attempt key (40 bytes), which the fence
+The value of the field starts with the Producer's newest attempt key (28 bytes), which the fence
 compares bytewise. Then come the batches of the Producer that the Store remembers, the newest
 first. A batch has these big-endian fields.
 
@@ -120,7 +122,7 @@ first. A batch has these big-endian fields.
 - An append whose request key is among them is a resend. It writes nothing and gets the offsets
   of that batch, also after a later attempt wrote and after the close.
 - The Store that appends cuts the list at its own `resend_window`, 16 by default. So the value
-  of a Producer has 40 bytes and 40 more for each remembered batch.
+  of a Producer has 28 bytes and 40 more for each remembered batch.
 - An append replaces the attempt key by a later one and never by an earlier one, with the fence
   on or off. A close doesn't change the field.
 - The Store keeps the field of a Producer for as long as the Stream exists. No call removes

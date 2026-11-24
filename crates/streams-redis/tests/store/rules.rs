@@ -710,6 +710,7 @@ fn producer(rng: &mut Rng) -> Producer {
             workflow_id,
             run_id,
             activity_id,
+            scheduled_event_id: 0,
             attempt: activity(rng),
         }),
         3 => Kind::StandaloneActivity(StandaloneActivityProducer {
