@@ -5,14 +5,17 @@ use crate::{
     faults::after_outage,
     reads::until_blocked_in,
     support::{
-        Cluster, NoRequestId, Redis, append, close, create, keys, made, read, reason, runtime,
-        standalone, stream_ref,
+        Cluster, NoRequestId, Redis, append, create, keys, made, read, reason, runtime, standalone,
+        stream_ref,
     },
 };
 use std::{num::NonZeroUsize, sync::Arc, time::Duration};
 use temporalio_streams::{
     AnyReason, StreamError, StreamRuntime,
-    proto::{CreateStreamRequest, CreateStreamResponse, StreamErrorReason, StreamIdConflictPolicy},
+    proto::{
+        StreamErrorReason, StreamIdConflictPolicy,
+        sdk::{CreateStreamRequest, CreateStreamResponse},
+    },
 };
 use temporalio_streams_redis::{RedisStoreOptions, WaitForReplicas};
 
@@ -48,8 +51,7 @@ async fn a_write_waits_for_its_replicas() {
     // Each Store has its own connections. A `WAIT` covers the last write of its connection, so
     // a call on the connection of an earlier write would wait for that write anyway.
     let short = Duration::from_millis(100);
-    let [first, second, third, fourth, fifth] =
-        [(); 5].map(|()| waits(standalone(redis.url()), short));
+    let [first, second, third, fourth] = [(); 4].map(|()| waits(standalone(redis.url()), short));
     first.create_no_id(create("s")).await.unwrap();
     first.append_no_id(append("s", &[b"a"])).await.unwrap();
 
@@ -58,30 +60,25 @@ async fn a_write_waits_for_its_replicas() {
     assert_not_replicated(first.append_records(batch.clone(), batch_id.clone()).await);
     // A call that finds its write done answers only once the replicas have that write.
     assert_not_replicated(second.append_records(batch.clone(), batch_id.clone()).await);
-    plain.close_stream(close("s")).await.unwrap();
-    assert_not_replicated(third.close_stream(close("s")).await);
     let (other, other_id) = (create("other"), "create-1".to_string());
     plain
         .create_stream(other.clone(), other_id.clone())
         .await
         .unwrap();
-    assert_not_replicated(fourth.create_stream(other.clone(), other_id.clone()).await);
+    assert_not_replicated(third.create_stream(other.clone(), other_id.clone()).await);
     let found = CreateStreamRequest {
         id_conflict_policy: StreamIdConflictPolicy::UseExisting as i32,
         ..create("other")
     };
-    assert_not_replicated(fifth.create_no_id(found.clone()).await);
+    assert_not_replicated(fourth.create_no_id(found.clone()).await);
 
     replica.resume();
     let appended = after_outage(|| second.append_records(batch.clone(), batch_id.clone()))
         .await
         .unwrap();
-    after_outage(|| third.close_stream(close("s")))
-        .await
-        .unwrap();
-    let created = after_outage(|| fourth.create_stream(other.clone(), other_id.clone())).await;
+    let created = after_outage(|| third.create_stream(other.clone(), other_id.clone())).await;
     assert_eq!(created, Ok(made(&other)));
-    let found = after_outage(|| fifth.create_no_id(found.clone())).await;
+    let found = after_outage(|| fourth.create_no_id(found.clone())).await;
     let existing = CreateStreamResponse {
         r#ref: stream_ref("other"),
         created: false,

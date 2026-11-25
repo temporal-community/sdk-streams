@@ -4,15 +4,13 @@
 use crate::{
     cluster::Migration,
     reads::{page, until_blocked, waiting},
-    support::{
-        Cluster, NoRequestId, Redis, append, close, create, describe, keys, read, reason, runtime,
-    },
+    support::{Cluster, NoRequestId, Redis, append, create, describe, keys, read, reason, runtime},
 };
 use redis::aio::ConnectionLike;
 use std::{collections::BTreeSet, num::NonZeroUsize, sync::Arc};
 use temporalio_streams::{
     StreamRuntime,
-    proto::{StreamErrorReason, StreamStatus},
+    proto::{ReadRecordsResponse, StreamErrorReason},
 };
 use temporalio_streams_redis::{RedisServers, RedisStoreOptions, WaitForReplicas};
 
@@ -61,7 +59,6 @@ fn each_script_calls_the_commands_that_the_docs_list() {
         include_str!("../../lua/write.lua"),
         include_str!("../../lua/create.lua"),
         include_str!("../../lua/append.lua"),
-        include_str!("../../lua/close.lua"),
     ];
     let reads = [
         state,
@@ -114,12 +111,13 @@ async fn run_roles(producer: &StreamRuntime, reader: &Arc<StreamRuntime>, blocks
     );
     let described = reader.describe_stream(describe("s")).await.unwrap();
     assert_eq!(described.last_offset, first.last_offset);
-    producer.close_stream(close("s")).await.unwrap();
-    let end = reader
-        .read_records(read("s", &first.last_offset))
-        .await
-        .unwrap();
-    assert!(end.done);
+    // A read with no wait, which runs only the script.
+    let rest = reader.read_records(read("s", &first.last_offset)).await;
+    let empty = ReadRecordsResponse {
+        records: Vec::new(),
+        last_offset: first.last_offset,
+    };
+    assert_eq!(rest, Ok(empty));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -186,7 +184,7 @@ async fn a_user_with_the_documented_access_runs_its_role_on_a_cluster() {
         .append_no_id(append("moves", &[b"a"]))
         .await
         .unwrap();
-    let [moved_meta, moved_log, moved_producers, _] = keys(PREFIX, "moves");
+    let [moved_meta, moved_log, moved_producers] = keys(PREFIX, "moves");
     let migration = Migration::start(&cluster, &moved_meta).await;
     migration
         .move_keys(&[&moved_meta, &moved_log, &moved_producers])
@@ -198,6 +196,6 @@ async fn a_user_with_the_documented_access_runs_its_role_on_a_cluster() {
     let after = reader.read_records(read("moves", &first.last_offset)).await;
     assert_eq!(after, Ok(page(&second.first_offset, b"b")));
     let described = reader.describe_stream(describe("moves")).await.unwrap();
-    assert_eq!(described.status, StreamStatus::Open as i32);
+    assert_eq!(described.last_offset, second.last_offset);
     migration.finish().await;
 }

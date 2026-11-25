@@ -10,10 +10,10 @@ On this page, an id is the id of an entry of a Redis stream, `<ms>-<seq>`.
 - **Redis 7.0 or later.** The reads use `EVALSHA_RO` and the flags of a script.
 - **`maxmemory-policy noeviction`.** With another policy Redis removes keys of a Stream when it
   is full ("A lost log" below). The Store doesn't read the policy.
-- **A limit for open Streams.** An open Stream doesn't expire by default, and with `noeviction` a
-  Redis that is full refuses every write of every Stream. Set `producer_idle_ttl`, so that an
-  open Stream that nobody writes to expires. Close a Stream that is done, so that its Retention
-  starts. Watch the memory of a Stream with many writers ("What a Stream costs" below).
+- **A Retention that the memory allows.** A Stream stays for one `retention` after its create or
+  the last append that wrote a batch, 7 days by default. With `noeviction` a Redis that is full
+  refuses every write of every Stream. Watch the memory of a Stream with many writers ("What a
+  Stream costs" below).
 - **Persistence.** A Redis with no AOF and no RDB file comes back from a restart with no Stream.
   Every call then fails with `NOT_FOUND`, which no caller tries again. With `appendonly yes` a
   restart loses at most what `appendfsync` allows, which is a second of writes by default.
@@ -33,7 +33,7 @@ On this page, an id is the id of an entry of a Redis stream, `<ms>-<seq>`.
 
 ## Keys
 
-A Stream has four keys. `<prefix>` is the `key_prefix` of the Store. `<id>` is the Stream id with
+A Stream has three keys. `<prefix>` is the `key_prefix` of the Store. `<id>` is the Stream id with
 `%` written as `%25` and `}` as `%7D`, so the hash tag ends where the id ends.
 
 | Key | Type | Holds |
@@ -41,7 +41,6 @@ A Stream has four keys. `<prefix>` is the `key_prefix` of the Store. `<id>` is t
 | `<prefix>:{<id>}:meta` | hash | The state of the Stream |
 | `<prefix>:{<id>}:log` | stream | The Records, one entry each |
 | `<prefix>:{<id>}:producers` | hash | One field for each Producer that wrote to the Stream |
-| `<prefix>:{<id>}:closed` | stream | One entry, which the close adds |
 
 - The keys have one hash tag, so a Redis Cluster keeps them in one slot and one script can use
   them all.
@@ -57,14 +56,12 @@ Each value is text, except `rid`.
 | `v` | The format version, `1` |
 | `rid` | The request key of the create that made the Stream (16 bytes) |
 | `ret` | The Retention of the Stream, in ms |
-| `idle` | The Producer idle TTL of the Stream, in ms. It's absent when the Stream has none. |
-| `exp` | When the Stream expires, in ms since 1970. An open Stream with no `idle` has none. |
-| `closed` | `1` once the Stream is closed |
+| `exp` | When the Stream expires, in ms since 1970 |
 | `newest` | The id of the newest Record. It's absent while the Stream has no Record. |
 | `lost` | The id of the newest Record that the log lost |
 
-- A Stream keeps the `ret` and the `idle` of the Store that created it. No later call changes
-  them, also not from a Store with other settings.
+- A Stream keeps the `ret` of the Store that created it. No later call changes it, also not from
+  a Store with other settings.
 - A Store refuses every call of a Stream with a higher `v` than it knows, with
   `FORMAT_TOO_NEW`.
 - The request key of a call is the first 16 bytes of a SHA-256. For a create it covers the
@@ -120,11 +117,11 @@ first. A batch has these big-endian fields.
 4. The `<seq>` of its last Record (8 bytes)
 
 - An append whose request key is among them is a resend. It writes nothing and gets the offsets
-  of that batch, also after a later attempt wrote and after the close.
+  of that batch, also after a later attempt wrote.
 - The Store that appends cuts the list at its own `resend_window`, 16 by default. So the value
   of a Producer has 28 bytes and 40 more for each remembered batch.
 - An append replaces the attempt key by a later one and never by an earlier one, with the fence
-  on or off. A close doesn't change the field.
+  on or off.
 - The Store keeps the field of a Producer for as long as the Stream exists. No call removes
   one, so nothing bounds the number of fields of a Stream.
 - The cluster client can send the bytes of one call a second time, after a dropped connection.
@@ -141,15 +138,10 @@ Measured on Redis 8, with ids of usual lengths (a namespace, two UUIDs and a sho
   expires.
 - **A Record** with a body of 100 bytes costs about 220 bytes alone in its batch and about 120
   bytes in a batch of 100, since only the first entry of a batch has the Producer.
-- **An append** writes the whole value of its Producer again, with its field. With the default
-  window, an append of one Record of 100 bytes adds about 1,260 bytes to the AOF and to the
-  replication stream, and an append of 100 such Records about 21,400.
-
-## The close
-
-A close stores no Record. It sets `closed` and adds one entry with the field `c` to `:closed`. A
-read that waits blocks on `:log` and on `:closed` in one `XREAD`, so an append and a close both
-wake it.
+- **An append** writes the whole value of its Producer again, with its field, and sets `exp` and
+  the expiry of the three keys. With the default window, an append of one Record of 100 bytes
+  adds about 1,570 bytes to the AOF and to the replication stream, and an append of 100 such
+  Records about 21,300.
 
 ## The order of the checks
 
@@ -158,19 +150,15 @@ An append checks in this order.
 1. The Stream doesn't exist or has expired.
 2. The batch is a resend.
 3. A later attempt of the Producer wrote (with the fence on).
-4. The Stream is closed.
 
-So a retry of a batch that was written gets its offsets, whatever happened to the Stream after
-the first try.
+So a retry of a batch that was written gets its offsets, also after a later attempt wrote.
 
-A close checks in this order.
+A create checks in this order.
 
-1. The Stream doesn't exist or has expired.
-2. The Stream is closed already.
-3. A later attempt of the Producer wrote (with the fence on).
-
-A close of a closed Stream succeeds before the fence, because it changes nothing, and the fence
-only stops a write.
+1. The Stream has expired.
+2. The create has the request key of the create that made the Stream, so it's a retry.
+3. The conflict policy is `USE_EXISTING`, so the create answers `created` false. With another
+   policy it fails with `ALREADY_EXISTS`.
 
 ## A read
 
@@ -185,16 +173,19 @@ only stops a write.
   `from_offset`.
 - A `from_offset` above `newest` fails with `OFFSET_TOO_HIGH`, and one that isn't 16 bytes with
   `INVALID_ARGUMENT`.
+- A read that waits stops at `exp` or at the end of its `wait`, whichever comes first. At `exp`
+  it fails with `EXPIRED`, also with a `wait` too long to have a deadline. The script gives the
+  time left by the clock of Redis.
 
 ## Expiry
 
-- An open Stream with `idle` expires that long after its last append, or after its create. Each
-  append sets `exp` again. An open Stream with no `idle` doesn't expire, which is the default.
-- A closed Stream expires one Retention after its close.
-- `:log`, `:producers` and `:closed` expire at `exp`. `:meta` stays 30 days longer. In that time
-  every call of the Stream fails with `EXPIRED`, also a create. After it the Store has forgotten
-  the Stream, so a call fails with `NOT_FOUND` and a create makes a new Stream. The Store can't
-  tell a Stream whose `:meta` Redis removed from one that nobody created.
+- A Stream expires one `ret` after its create or the last append that wrote a batch. The create
+  sets `exp`, and each append that writes a batch sets it again. A resend and a create of an
+  existing Stream don't change it.
+- `:log` and `:producers` expire at `exp`. `:meta` stays 30 days longer. In that time every call
+  of the Stream fails with `EXPIRED`, also a create. After it the Store has forgotten the Stream,
+  so a call fails with `NOT_FOUND` and a create makes a new Stream. The Store can't tell a Stream
+  whose `:meta` Redis removed from one that nobody created.
 - A TTL of more than 2^52 ms counts as 2^52 ms, which is 142,000 years.
 
 ## A lost log
@@ -226,7 +217,7 @@ succeed once the setup is right.
 Redis checks the ACL of a script call, and of each command that the script runs. A Redis user
 has one role or both. `tests/store/acl.rs` runs each role with exactly these lists.
 
-- A Producer creates, appends and closes. Its user needs the keys `~<prefix>:*` and the commands
+- A Producer creates and appends. Its user needs the keys `~<prefix>:*` and the commands
   `+evalsha +script|load +time +hmget +hget +hset +pexpireat +xadd +xrange`. With the `wait`
   option it also needs `+wait`.
 - A Reader reads and describes. Its user needs the keys `%R~<prefix>:*` and the commands
@@ -246,7 +237,6 @@ Each script declares every key that it uses, so Redis runs it only on a node tha
 them. While a slot migrates, a script whose keys exist only in part gets `TRYAGAIN`. These calls
 fail with `STORE_UNAVAILABLE` until the migration of their slot ends, and they write nothing.
 
-- A close, whose `:closed` key doesn't exist before it
 - The first append of a Stream, whose `:log` and `:producers` keys don't exist before it
 - A read of a Stream with no Record, whose `:log` key doesn't exist. That is every reader that
   waits for the first Record of a new Stream.
@@ -283,13 +273,13 @@ Redis replicates after it answers, so a failover can lose a write that a call go
 for. A read from the offset of a lost write fails with `OFFSET_TOO_HIGH` until the Stream has
 Records up to it.
 
-With the `wait` option, each create, append and close sends `WAIT` after its script, in one
+With the `wait` option, each create and append sends `WAIT` after its script, in one
 pipeline on a connection of its own.
 
 - A write that too few replicas have after the timeout fails with `STORE_UNAVAILABLE`. The write
   is in Redis, so a retry with its request id writes nothing again.
-- `WAIT` covers the last write of its connection. So a call that finds its work done (a resend, a
-  close of a closed Stream, a create of a Stream that exists) writes `v` again before the
-  `WAIT`, and it succeeds only once the replicas have the first write.
+- `WAIT` covers the last write of its connection. So a call that finds its work done (a resend
+  or a create of a Stream that exists) writes `v` again before the `WAIT`, and it succeeds only
+  once the replicas have the first write.
 - A reader can get a Record before the `WAIT` of its append ends, and a failover can still lose
   that Record.

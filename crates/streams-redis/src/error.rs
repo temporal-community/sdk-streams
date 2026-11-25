@@ -135,13 +135,13 @@ mod tests {
 
     #[test]
     fn a_redis_failure_gets_the_reason_of_its_class() {
-        let closed = || reply("STREAM_ERROR_REASON_CLOSED The Stream is closed");
+        let fenced = || reply("STREAM_ERROR_REASON_FENCED A later attempt wrote");
         assert_eq!(
-            AppendError::from(closed()),
-            AppendError::operation(AppendReason::Closed, "The Stream is closed")
+            AppendError::from(fenced()),
+            AppendError::operation(AppendReason::Fenced, "A later attempt wrote")
         );
-        // A describe can't fail with `CLOSED`, so the answer isn't one of the describe script.
-        let error = DescribeError::from(closed());
+        // A describe can't fail with `FENCED`, so the answer isn't one of the describe script.
+        let error = DescribeError::from(fenced());
         assert_eq!(error.reason, DescribeReason::Other(AnyReason::StoreCorrupt));
         // A retry of these reads the same value again, so they must not look like an outage.
         let unreadable = redis::from_redis_value::<i64>(redis::Value::Okay).unwrap_err();

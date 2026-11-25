@@ -10,6 +10,10 @@
 //! `temporalio-streams-redis` crate behind a [`StreamRuntime`], on Tokio threads of its own, and
 //! Python calls each operation with the encoded request. A create and an append also take their
 //! request id, which is no field of the request.
+//!
+//! Python sends the requests of a Store, which have only the Stream id, and gets the responses
+//! of a Store. The runtime takes the requests of an SDK, so the module gives it a ref with that
+//! id and no Store name.
 
 use prost::Message;
 use pyo3::{
@@ -24,7 +28,12 @@ use std::{
     time::Duration,
 };
 use temporalio_streams::{
-    StreamError, StreamRuntime, proto::StreamErrorReason, record::StoreLimits,
+    CreateError, StreamError, StreamRuntime,
+    proto::{
+        AppendRecordsRequest, CreateStreamRequest, CreateStreamResponse, DescribeStreamRequest,
+        ReadRecordsRequest, StreamErrorReason, sdk,
+    },
+    record::StoreLimits,
 };
 use temporalio_streams_redis::{
     ClusterNodeUrl, Fence, KeyPrefix, RedisServers, RedisStoreError, RedisStoreOptions, RedisUrl,
@@ -96,7 +105,6 @@ struct Options {
     cluster: bool,
     key_prefix: Option<String>,
     retention: Option<Duration>,
-    producer_idle_ttl: Option<Duration>,
     fence: bool,
     resend_window: Option<usize>,
     response_timeout: Option<Duration>,
@@ -154,7 +162,6 @@ impl TryFrom<Options> for RedisStoreOptions {
         let mut built = RedisStoreOptions::new(servers);
         built.key_prefix = key_prefix.map_err(invalid)?.unwrap_or(built.key_prefix);
         built.retention = options.retention.unwrap_or(built.retention);
-        built.producer_idle_ttl = options.producer_idle_ttl;
         built.fence = match options.fence {
             true => Fence::On,
             false => Fence::Off,
@@ -199,7 +206,16 @@ impl RedisStore {
         request_id: String,
     ) -> PyResult<Bound<'py, PyAny>> {
         self.call(py, request, |runtime, request| async move {
-            runtime.create_stream(request, request_id).await
+            let CreateStreamRequest {
+                stream_id,
+                id_conflict_policy,
+            } = request;
+            let request = sdk::CreateStreamRequest {
+                stream_ref: stream_ref(stream_id),
+                id_conflict_policy,
+            };
+            let created = runtime.create_stream(request, request_id).await?.created;
+            Ok::<_, CreateError>(CreateStreamResponse { created })
         })
     }
 
@@ -210,27 +226,58 @@ impl RedisStore {
         request_id: String,
     ) -> PyResult<Bound<'py, PyAny>> {
         self.call(py, request, |runtime, request| async move {
+            let AppendRecordsRequest {
+                stream_id,
+                producer,
+                records,
+            } = request;
+            let request = sdk::AppendRecordsRequest {
+                r#ref: stream_ref(stream_id),
+                producer,
+                records,
+            };
             runtime.append_records(request, request_id).await
         })
     }
 
     fn read_records<'py>(&self, py: Python<'py>, request: &[u8]) -> PyResult<Bound<'py, PyAny>> {
         self.call(py, request, |runtime, request| async move {
+            let ReadRecordsRequest {
+                stream_id,
+                from_offset,
+                max_records,
+                max_bytes,
+                wait,
+            } = request;
+            let request = sdk::ReadRecordsRequest {
+                r#ref: stream_ref(stream_id),
+                from_offset,
+                max_records,
+                max_bytes,
+                wait,
+            };
             runtime.read_records(request).await
-        })
-    }
-
-    fn close_stream<'py>(&self, py: Python<'py>, request: &[u8]) -> PyResult<Bound<'py, PyAny>> {
-        self.call(py, request, |runtime, request| async move {
-            runtime.close_stream(request).await
         })
     }
 
     fn describe_stream<'py>(&self, py: Python<'py>, request: &[u8]) -> PyResult<Bound<'py, PyAny>> {
         self.call(py, request, |runtime, request| async move {
+            let DescribeStreamRequest { stream_id } = request;
+            let request = sdk::DescribeStreamRequest {
+                r#ref: stream_ref(stream_id),
+            };
             runtime.describe_stream(request).await
         })
     }
+}
+
+/// Returns the ref that the runtime takes for a Stream id. The Store gets only the id, so the ref
+/// has no Store name.
+fn stream_ref(stream_id: String) -> Option<sdk::StreamRef> {
+    Some(sdk::StreamRef {
+        id: stream_id,
+        store: String::new(),
+    })
 }
 
 impl RedisStore {

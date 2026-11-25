@@ -20,7 +20,6 @@ from temporalio.api.stream.v1 import (
     LocalActivityProducer,
     Producer,
     StandaloneActivityProducer,
-    StreamRef,
     WorkflowActivityProducer,
     WorkflowProducer,
     WorkflowTaskAttempt,
@@ -28,7 +27,6 @@ from temporalio.api.stream.v1 import (
 from temporalio.api.streamservice.v1 import (
     AppendRecordsRequest,
     AppendRecordsResponse,
-    CloseStreamRequest,
     CreateStreamRequest,
     DescribeStreamRequest,
     DescribeStreamResponse,
@@ -74,25 +72,23 @@ class Side:
         try:
             if isinstance(call, CreateStreamRequest):
                 return await self.store.create_stream(call, request_id=request_id)
-            if isinstance(call, CloseStreamRequest):
-                return await self.store.close_stream(call)
             if isinstance(call, DescribeStreamRequest):
                 described = await self.store.describe_stream(call)
-                return self._described(call.ref.id, described)
+                return self._described(call.stream_id, described)
             if isinstance(call, AppendRecordsRequest):
                 appended = await self.store.append_records(call, request_id=request_id)
-                await self._learn(call.ref.id)
-                return self._appended(call.ref.id, appended)
+                await self._learn(call.stream_id)
+                return self._appended(call.stream_id, appended)
             assert isinstance(call, ReadRecordsRequest)
             read = ReadRecordsRequest()
             read.CopyFrom(call)
-            read.from_offset = self.offset(call.ref.id, from_rank)
-            return self._page(call.ref.id, await self.store.read_records(read))
+            read.from_offset = self.offset(call.stream_id, from_rank)
+            return self._page(call.stream_id, await self.store.read_records(read))
         except StreamError as err:
             return err.reason
 
     async def _learn(self, stream_id: str) -> None:
-        read = ReadRecordsRequest(ref=StreamRef(id=stream_id))
+        read = ReadRecordsRequest(stream_id=stream_id)
         page = await self.store.read_records(read)
         self.offsets[stream_id] = [record.offset for record in page.records]
 
@@ -101,18 +97,14 @@ class Side:
         return ("appended", first, self.rank(stream_id, appended.last_offset))
 
     def _described(self, stream_id: str, described: DescribeStreamResponse) -> Any:
-        return (
-            "described",
-            described.status,
-            self.rank(stream_id, described.last_offset),
-        )
+        return ("described", self.rank(stream_id, described.last_offset))
 
     def _page(self, stream_id: str, page: ReadRecordsResponse) -> Any:
         records = [
             (record.producer, record.body, self.rank(stream_id, record.offset))
             for record in page.records
         ]
-        return ("page", records, self.rank(stream_id, page.last_offset), page.done)
+        return ("page", records, self.rank(stream_id, page.last_offset))
 
 
 def producer(rng: random.Random) -> Producer:
@@ -182,33 +174,28 @@ class Calls:
         """
         rng = self.rng
         stream_id = rng.choice(STREAMS)
-        ref = StreamRef(id=stream_id)
         roll = rng.randrange(100)
         # A Stream that isn't created refuses every other call, so its create comes early.
         if roll < 6 or (stream_id not in self.created and roll < 50):
             self.created.add(stream_id)
             request_id = rng.choice(["", "c1", "c2"])
             policy: Any = rng.randrange(3)
-            create = CreateStreamRequest(stream_ref=ref, id_conflict_policy=policy)
+            create = CreateStreamRequest(stream_id=stream_id, id_conflict_policy=policy)
             return create, request_id, 0
         if roll < 60:
             batch, request_id = self._append(stream_id)
             return batch, request_id, 0
-        if roll < 61:
-            return CloseStreamRequest(ref=ref, producer=producer(rng)), "", 0
         if roll < 68:
-            return DescribeStreamRequest(ref=ref), "", 0
+            return DescribeStreamRequest(stream_id=stream_id), "", 0
         known = records.get(stream_id, 0)
         # A place of a Record, the start, or the place after the newest Record.
         from_rank = rng.randrange(known + 2) if known else 0
-        read = ReadRecordsRequest(ref=ref, max_records=rng.randrange(6))
+        read = ReadRecordsRequest(stream_id=stream_id, max_records=rng.randrange(6))
         return read, "", from_rank
 
     def _append(self, stream_id: str) -> tuple[AppendRecordsRequest, str]:
         rng = self.rng
-        batch = AppendRecordsRequest(
-            ref=StreamRef(id=stream_id), producer=producer(rng)
-        )
+        batch = AppendRecordsRequest(stream_id=stream_id, producer=producer(rng))
         request_id = ""
         kind = batch.producer.WhichOneof("kind")
         earlier = self.sent.setdefault((stream_id, kind), [])

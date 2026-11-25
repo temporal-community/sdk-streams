@@ -20,10 +20,13 @@ use temporalio_common::protos::temporal::api::common::v1::Payload;
 use temporalio_streams::{
     AppendError, CreateError, StreamError, StreamRuntime,
     proto::{
-        AppendRecord, AppendRecordsRequest, AppendRecordsResponse, ClientProducer,
-        CloseStreamRequest, CreateStreamRequest, CreateStreamResponse, DescribeStreamRequest,
-        Producer, ReadRecordsRequest, StreamErrorReason, StreamIdConflictPolicy, StreamRef,
+        AppendRecord, AppendRecordsResponse, ClientProducer, Producer, StreamErrorReason,
+        StreamIdConflictPolicy,
         producer::Kind,
+        sdk::{
+            AppendRecordsRequest, CreateStreamRequest, CreateStreamResponse, DescribeStreamRequest,
+            ReadRecordsRequest, StreamRef,
+        },
     },
     record::StoreLimits,
 };
@@ -254,10 +257,10 @@ impl NoRequestId for StreamRuntime {
     }
 }
 
-/// Returns the four keys of a Stream, as `docs/redis.md` gives them.
-pub(crate) fn keys(prefix: &str, stream_id: &str) -> [String; 4] {
+/// Returns the three keys of a Stream, as `docs/redis.md` gives them.
+pub(crate) fn keys(prefix: &str, stream_id: &str) -> [String; 3] {
     let id = stream_id.replace('%', "%25").replace('}', "%7D");
-    ["meta", "log", "producers", "closed"].map(|part| format!("{prefix}:{{{id}}}:{part}"))
+    ["meta", "log", "producers"].map(|part| format!("{prefix}:{{{id}}}:{part}"))
 }
 
 /// What the keys of a Stream hold and when they expire, so a test can show that a call changed
@@ -267,8 +270,7 @@ pub(crate) struct Snapshot {
     meta: BTreeMap<Vec<u8>, Vec<u8>>,
     producers: BTreeMap<Vec<u8>, Vec<u8>>,
     log: redis::Value,
-    closed: redis::Value,
-    expiries: [i64; 4],
+    expiries: [i64; 3],
 }
 
 pub(crate) async fn snapshot(
@@ -276,25 +278,22 @@ pub(crate) async fn snapshot(
     prefix: &str,
     stream_id: &str,
 ) -> Snapshot {
-    let [meta, log, producers, closed] = keys(prefix, stream_id);
+    let [meta, log, producers] = keys(prefix, stream_id);
     let mut pipe = redis::pipe();
     pipe.cmd("HGETALL")
         .arg(&meta)
         .cmd("HGETALL")
         .arg(&producers);
-    for key in [&log, &closed] {
-        pipe.cmd("XRANGE").arg(key).arg("-").arg("+");
-    }
-    for key in [&meta, &log, &producers, &closed] {
+    pipe.cmd("XRANGE").arg(&log).arg("-").arg("+");
+    for key in [&meta, &log, &producers] {
         pipe.cmd("PEXPIRETIME").arg(key);
     }
-    let (meta, producers, log, closed, a, b, c, d) = pipe.query_async(admin).await.unwrap();
+    let (meta, producers, log, a, b, c) = pipe.query_async(admin).await.unwrap();
     Snapshot {
         meta,
         producers,
         log,
-        closed,
-        expiries: [a, b, c, d],
+        expiries: [a, b, c],
     }
 }
 
@@ -352,13 +351,6 @@ pub(crate) fn append(stream_id: &str, records: &[&[u8]]) -> AppendRecordsRequest
         r#ref: stream_ref(stream_id),
         producer: Some(client("client:test")),
         records: records.iter().map(|data| record(data)).collect(),
-    }
-}
-
-pub(crate) fn close(stream_id: &str) -> CloseStreamRequest {
-    CloseStreamRequest {
-        r#ref: stream_ref(stream_id),
-        producer: Some(client("client:test")),
     }
 }
 

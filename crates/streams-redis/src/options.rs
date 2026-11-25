@@ -203,13 +203,10 @@ pub struct RedisStoreOptions {
     /// The prefix of every key of the Store, `temporal-streams` by default. A key has no Temporal
     /// namespace, so a Stream id is unique in one Redis and key prefix.
     pub key_prefix: KeyPrefix,
-    /// How long a Stream stays readable after its close, 7 days by default and at least 1 ms. A
-    /// Stream keeps the Retention of the Store that created it.
+    /// How long a Stream stays after its create or the last append that wrote a batch, 7 days by
+    /// default and at least 1 ms. The Stream then expires. A Stream keeps the Retention of the
+    /// Store that created it.
     pub retention: Duration,
-    /// How long an open Stream stays after its last append, at least 1 ms. It's `None` by
-    /// default, and an open Stream then doesn't expire. A Stream keeps the value of the Store
-    /// that created it.
-    pub producer_idle_ttl: Option<Duration>,
     /// Whether the Store fences. It doesn't by default.
     pub fence: Fence,
     /// The number of batches of each Producer of a Stream whose request id the Store remembers,
@@ -217,7 +214,7 @@ pub struct RedisStoreOptions {
     pub resend_window: NonZeroUsize,
     /// How long a call waits for Redis to respond, 5 seconds by default and more than zero.
     pub response_timeout: Duration,
-    /// The replicas that each create, append and close waits for. It's `None` by default, and a
+    /// The replicas that each create and append waits for. It's `None` by default, and a
     /// write then succeeds once its Redis node has it. Redis replicates after it answers, so a
     /// failover can lose such a write. With a wait, a write that too few replicas have in time
     /// fails with `STORE_UNAVAILABLE`, and a retry with its request id writes nothing again.
@@ -236,7 +233,6 @@ impl RedisStoreOptions {
             servers,
             key_prefix: KeyPrefix::default(),
             retention: Duration::from_secs(7 * 24 * 60 * 60),
-            producer_idle_ttl: None,
             fence: Fence::Off,
             resend_window: DEFAULT_RESEND_WINDOW,
             response_timeout: Duration::from_secs(5),
@@ -293,7 +289,6 @@ pub(crate) struct Settings {
     pub(crate) servers: RedisServers,
     pub(crate) key_prefix: KeyPrefix,
     pub(crate) retention: Millis,
-    pub(crate) producer_idle_ttl: Option<Millis>,
     pub(crate) fence: Fence,
     pub(crate) resend_window: NonZeroUsize,
     pub(crate) response_timeout: Duration,
@@ -315,7 +310,6 @@ impl TryFrom<RedisStoreOptions> for Settings {
                 "response_timeout must be more than zero".to_string(),
             ));
         }
-        let idle = options.producer_idle_ttl;
         // `WAIT` with a timeout of zero waits with no end.
         let wait = options.wait.map(|wait| {
             let timeout = millis("The timeout of wait", wait.timeout)?;
@@ -328,9 +322,6 @@ impl TryFrom<RedisStoreOptions> for Settings {
             servers: options.servers,
             key_prefix: options.key_prefix,
             retention: millis("retention", options.retention)?,
-            producer_idle_ttl: idle
-                .map(|ttl| millis("producer_idle_ttl", ttl))
-                .transpose()?,
             fence: options.fence,
             resend_window: options.resend_window,
             response_timeout: options.response_timeout,

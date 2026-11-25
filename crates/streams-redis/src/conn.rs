@@ -378,7 +378,7 @@ impl Connections {
         }
     }
 
-    /// Waits until the Stream has an entry after `after`, until it closes, or until `deadline`.
+    /// Waits until the Stream has an entry after `after`, or until `deadline`.
     /// A read with no deadline waits with no end. The wait can also end earlier, and the caller
     /// then runs its script again. It fails only for an error that a retry gets again, such as
     /// a missing ACL permission.
@@ -474,8 +474,8 @@ async fn until(deadline: Option<Instant>) {
     }
 }
 
-/// Returns the `XREAD` that blocks until the log has an entry after `after`, until the Stream
-/// closes, or until `deadline`.
+/// Returns the `XREAD` that blocks until the log has an entry after `after`, or until
+/// `deadline`.
 fn xread(keys: &StreamKeys, after: EntryId, deadline: Option<Instant>) -> Xread {
     // `BLOCK 0` waits with no end, as a read with no deadline does. A read at its deadline
     // blocks for 1 ms.
@@ -491,10 +491,7 @@ fn xread(keys: &StreamKeys, after: EntryId, deadline: Option<Instant>) -> Xread 
         .arg(1)
         .arg("STREAMS")
         .arg(keys.log())
-        .arg(keys.closed())
-        .arg(after)
-        // The key of a close has an entry only once the Stream is closed.
-        .arg(EntryId::ZERO);
+        .arg(after);
     Xread(xread)
 }
 

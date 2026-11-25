@@ -24,10 +24,11 @@ local stream, refused = live(meta, now)
 if refused then
   return refused
 end
+-- A `ret` that isn't a number fails the script here, before its first write.
+local expires = now + stream.ret
 local state = redis.call('HGET', producers, field) or ''
 local newest_attempt, batches = string.sub(state, 1, ATTEMPT), string.sub(state, ATTEMPT + 1)
--- A resend comes before the fence and the close, so that a retry gets its answer after a later
--- attempt wrote or the Stream closed.
+-- A resend comes before the fence, so that a retry gets its answer after a later attempt wrote.
 for at = 1, #batches, BATCH do
   if string.sub(batches, at, at + REQUEST - 1) == request then
     local batch_ms, first_seq, last_seq = struct.unpack('>I8I8I8', batches, at + REQUEST)
@@ -37,9 +38,6 @@ for at = 1, #batches, BATCH do
 end
 if fence == '1' and below(attempt, newest_attempt) then
   return refuse('FENCED', 'A later attempt of the Producer already wrote to the Stream')
-end
-if stream.closed then
-  return refuse('CLOSED', 'The Stream is closed')
 end
 
 local lost = lost_mark(stream, log)
@@ -71,7 +69,6 @@ end
 local batch = request .. struct.pack('>I8I8I8', ms, first_seq, seq)
 redis.call('HSET', producers, field,
   newest_attempt .. batch .. string.sub(batches, 1, (window - 1) * BATCH))
-if stream.idle then
-  expire_at(meta, {log, producers}, now + stream.idle)
-end
+-- A resend writes no batch, so only this path starts the Retention again.
+expire_at(meta, {log, producers}, expires)
 return {ms, first_seq, seq}

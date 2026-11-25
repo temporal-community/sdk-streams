@@ -10,8 +10,8 @@ use crate::{
     options::Settings,
     producer::{producer_keys, request_key},
     scripts::{
-        self, AppendArgs, Appended, CloseArgs, Closed, CreateArgs, Created, Described, Existing,
-        NoArgs, Page, ReadArgs, ScriptCall, Status,
+        self, AppendArgs, Appended, CreateArgs, Created, Existing, NoArgs, Page, ReadArgs,
+        ScriptCall,
     },
 };
 use futures_util::future::BoxFuture;
@@ -19,12 +19,11 @@ use prost::Message;
 use redis::FromRedisValue;
 use std::time::Duration;
 use temporalio_streams::{
-    AppendError, CloseError, CreateError, DescribeError, ReadError, StreamStore,
+    AppendError, CreateError, DescribeError, ReadError, StreamStore,
     proto::{
-        AppendRecordsRequest, AppendRecordsResponse, CloseStreamRequest, CloseStreamResponse,
-        CreateStreamRequest, CreateStreamResponse, DescribeStreamRequest, DescribeStreamResponse,
-        ReadRecordsRequest, ReadRecordsResponse, StreamIdConflictPolicy, StreamRecord, StreamRef,
-        StreamStatus,
+        AppendRecordsRequest, AppendRecordsResponse, CreateStreamRequest, CreateStreamResponse,
+        DescribeStreamRequest, DescribeStreamResponse, ReadRecordsRequest, ReadRecordsResponse,
+        StreamIdConflictPolicy, StreamRecord,
     },
 };
 use tokio::{sync::OnceCell, time::Instant};
@@ -63,13 +62,15 @@ impl RedisStore {
         Ok(self.conns.get_or_try_init(open).await?)
     }
 
-    /// Returns the keys of the Stream of a ref, whose `id` is the Stream id. The `store` of the
-    /// ref is for an SDK, so the Store ignores it.
-    fn keys(&self, stream_ref: Option<&StreamRef>) -> RedisStoreResult<StreamKeys> {
-        // The runtime refuses a request with no ref, so only a direct call of the Store fails here.
-        let stream_ref = stream_ref
-            .ok_or_else(|| RedisStoreError::Invalid("The request has no ref".to_string()))?;
-        Ok(StreamKeys::new(&self.settings.key_prefix, &stream_ref.id))
+    /// Returns the keys of the Stream `stream_id`.
+    fn keys(&self, stream_id: &str) -> RedisStoreResult<StreamKeys> {
+        // The runtime refuses an empty id, so only a direct call of the Store fails here.
+        if stream_id.is_empty() {
+            return Err(RedisStoreError::Invalid(
+                "The request has no stream_id".to_string(),
+            ));
+        }
+        Ok(StreamKeys::new(&self.settings.key_prefix, stream_id))
     }
 
     async fn run<T: FromRedisValue>(&self, call: &ScriptCall) -> RedisStoreResult<T> {
@@ -115,13 +116,11 @@ impl RedisStore {
             retention: self.settings.retention,
             existing,
             then: self.settings.wait.into(),
-            producer_idle_ttl: self.settings.producer_idle_ttl,
         };
-        let keys = self.keys(request.stream_ref.as_ref())?;
+        let keys = self.keys(&request.stream_id)?;
         let call = ScriptCall::write(&scripts::CREATE, &[keys.meta()], args);
         let created = self.write(&call).await?;
         Ok(CreateStreamResponse {
-            r#ref: request.stream_ref,
             created: matches!(created, Created::Made),
         })
     }
@@ -149,7 +148,7 @@ impl RedisStore {
             producer: &producer,
             bodies: bodies.collect::<Result<_, _>>()?,
         };
-        let keys = self.keys(request.r#ref.as_ref())?;
+        let keys = self.keys(&request.stream_id)?;
         let keys = [keys.meta(), keys.log(), keys.producers()];
         let call = ScriptCall::write(&scripts::APPEND, &keys, args);
         let appended: Appended = self.write(&call).await?;
@@ -157,22 +156,6 @@ impl RedisStore {
             first_offset: appended.first.offset(),
             last_offset: appended.last.offset(),
         })
-    }
-
-    async fn close(&self, request: CloseStreamRequest) -> Result<CloseStreamResponse, CloseError> {
-        let (field, attempt) = producer_keys(&request.producer.unwrap_or_default())?;
-        let args = CloseArgs {
-            field: &field,
-            attempt,
-            fence: self.settings.fence,
-            then: self.settings.wait.into(),
-        };
-        let keys = self.keys(request.r#ref.as_ref())?;
-        let keys = [keys.meta(), keys.log(), keys.producers(), keys.closed()];
-        let Closed = self
-            .write(&ScriptCall::write(&scripts::CLOSE, &keys, args))
-            .await?;
-        Ok(CloseStreamResponse {})
     }
 
     async fn read(&self, request: ReadRecordsRequest) -> Result<ReadRecordsResponse, ReadError> {
@@ -196,7 +179,7 @@ impl RedisStore {
         let wait = wait.map_err(|_| negative("wait"))?;
         // A wait that an `Instant` can't hold has no deadline.
         let deadline = Instant::now().checked_add(wait);
-        let keys = self.keys(request.r#ref.as_ref())?;
+        let keys = self.keys(&request.stream_id)?;
         let args = ReadArgs {
             from,
             max_records,
@@ -204,18 +187,22 @@ impl RedisStore {
         };
         let call = ScriptCall::read(&scripts::READ, &[keys.meta(), keys.log()], args);
         loop {
-            let page = page(
-                self.run(&call).await?,
-                from,
-                &request.from_offset,
-                max_bytes,
-            );
+            let answer: Page = self.run(&call).await?;
+            let expires_in = answer.expires_in;
+            let page = page(answer, &request.from_offset, max_bytes);
             let late = deadline.is_some_and(|deadline| deadline <= Instant::now());
-            if !page.records.is_empty() || page.done || late {
+            if !page.records.is_empty() || late {
                 return Ok(page);
             }
+            // No Record comes after the expiry, so the wait ends there and the next script answers
+            // `EXPIRED`. Redis gives the time that is left, so the clock of this host can differ.
+            let expiry = expires_in.and_then(|left| Instant::now().checked_add(left));
+            let until = match (deadline, expiry) {
+                (Some(deadline), Some(expiry)) => Some(deadline.min(expiry)),
+                (deadline, expiry) => deadline.or(expiry),
+            };
             let conns = self.conns().await?;
-            conns.wait_for_entry(&keys, from, deadline).await?;
+            conns.wait_for_entry(&keys, from, until).await?;
         }
     }
 
@@ -223,15 +210,10 @@ impl RedisStore {
         &self,
         request: DescribeStreamRequest,
     ) -> Result<DescribeStreamResponse, DescribeError> {
-        let keys = self.keys(request.r#ref.as_ref())?;
+        let keys = self.keys(&request.stream_id)?;
         let call = ScriptCall::read(&scripts::DESCRIBE, &[keys.meta()], NoArgs);
-        let (status, newest): Described = self.run(&call).await?;
-        let status = match status {
-            Status::Open => StreamStatus::Open,
-            Status::Closed => StreamStatus::Closed,
-        };
+        let newest: EntryId = self.run(&call).await?;
         Ok(DescribeStreamResponse {
-            status: status.into(),
             last_offset: newest.offset(),
         })
     }
@@ -243,10 +225,9 @@ impl RedisStore {
 /// The page stops before the Record that takes it over `max_bytes`, unless that is the first
 /// one. The script only stops near that limit, since it can't measure an encoded Record. A
 /// Record counts as the page encodes it, which is how the runtime counts too.
-fn page(page: Page, from: EntryId, from_offset: &[u8], max_bytes: usize) -> ReadRecordsResponse {
+fn page(page: Page, from_offset: &[u8], max_bytes: usize) -> ReadRecordsResponse {
     let mut producer = page.earlier;
     let mut records = Vec::with_capacity(page.entries.len());
-    let mut end = from;
     let mut bytes = 0;
     for entry in page.entries {
         producer = entry.producer.or(producer);
@@ -260,16 +241,12 @@ fn page(page: Page, from: EntryId, from_offset: &[u8], max_bytes: usize) -> Read
             break;
         }
         records.push(record);
-        end = entry.id;
     }
     ReadRecordsResponse {
         last_offset: match records.last() {
             Some(record) => record.offset.clone(),
             None => from_offset.to_vec(),
         },
-        // A closed Stream gets no more Records, so the page that ends at its newest one is the
-        // last page.
-        done: page.status == Status::Closed && end == page.newest,
         records,
     }
 }
@@ -296,13 +273,6 @@ impl StreamStore for RedisStore {
         request: ReadRecordsRequest,
     ) -> BoxFuture<'_, Result<ReadRecordsResponse, ReadError>> {
         Box::pin(self.read(request))
-    }
-
-    fn close_stream(
-        &self,
-        request: CloseStreamRequest,
-    ) -> BoxFuture<'_, Result<CloseStreamResponse, CloseError>> {
-        Box::pin(self.close(request))
     }
 
     fn describe_stream(

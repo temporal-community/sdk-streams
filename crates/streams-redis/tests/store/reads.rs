@@ -1,13 +1,13 @@
 //! Reads that wait for a Record.
 
 use crate::support::{
-    NoRequestId, Redis, admin, append, client, close, create, read, record, runtime, standalone,
+    NoRequestId, Redis, admin, append, client, create, read, record, runtime, standalone,
 };
 use redis::aio::MultiplexedConnection;
 use std::{num::NonZeroUsize, sync::Arc, time::Duration};
 use temporalio_streams::{
     StreamRuntime,
-    proto::{ReadRecordsRequest, ReadRecordsResponse, StreamRecord},
+    proto::{ReadRecordsResponse, StreamRecord, sdk::ReadRecordsRequest},
 };
 use tokio::time::Instant;
 
@@ -57,13 +57,12 @@ pub(crate) fn page(offset: &[u8], data: &[u8]) -> ReadRecordsResponse {
             offset: offset.to_vec(),
         }],
         last_offset: offset.to_vec(),
-        done: false,
     }
 }
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs Redis"]
-async fn a_waiting_read_wakes_on_an_append_and_on_a_close() {
+async fn a_waiting_read_wakes_on_an_append() {
     let redis = Redis::start(&[]);
     let store = Arc::new(runtime(standalone(redis.url())));
     store.create_no_id(create("s")).await.unwrap();
@@ -88,16 +87,6 @@ async fn a_waiting_read_wakes_on_an_append_and_on_a_close() {
         assert_eq!(read.await.unwrap(), Ok(page(&appended.first_offset, b"b")));
         from = appended.last_offset;
     }
-
-    let read = spawn(waiting("s", &from, 60));
-    until_blocked(&redis.url(), 1).await;
-    store.close_stream(close("s")).await.unwrap();
-    let done = ReadRecordsResponse {
-        records: vec![],
-        last_offset: from,
-        done: true,
-    };
-    assert_eq!(read.await.unwrap(), Ok(done));
 
     // With nothing to wake it, a read ends at its deadline with an empty page.
     store.create_no_id(create("quiet")).await.unwrap();

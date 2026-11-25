@@ -25,8 +25,7 @@ config of the SDK that calls the Store. The Store has none.
 |---|---|---|
 | `servers` | | One server, or some nodes of a Redis Cluster, each from its URL |
 | `key_prefix` | `temporal-streams` | The prefix of every key |
-| `retention` | 7 days | How long a Stream stays readable after its close |
-| `producer_idle_ttl` | none | How long an open Stream stays after its last append |
+| `retention` | 7 days | How long a Stream stays after its create or its last written batch |
 | `fence` | `Fence::Off` | Whether a write of an earlier attempt of a Producer is refused |
 | `resend_window` | 16 | The batches of a Producer whose request id the Store remembers |
 | `response_timeout` | 5 s | How long a call waits for Redis |
@@ -38,7 +37,7 @@ TLS and verifies the server against the root certificates of the system. A priva
 through the `SSL_CERT_FILE` variable, and the Store can't send a client certificate.
 
 No option has an upper bound. A count is a `NonZeroUsize`, and a time below 1 ms is refused. A
-Stream keeps the `retention` and the `producer_idle_ttl` of the Store that created it.
+Stream keeps the `retention` of the Store that created it.
 `crates/streams-redis/docs/redis.md` says what an operator of the Redis sets up, and what the
 Store keeps there.
 

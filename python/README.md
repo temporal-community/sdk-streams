@@ -40,8 +40,7 @@ upper bound.
 | `url` | | One `redis://` or `rediss://` URL, or the URLs of some nodes of a cluster |
 | `cluster` | `False` | Set it for a Redis Cluster |
 | `key_prefix` | `temporal-streams` | The prefix of every key |
-| `retention` | 7 days | How long a Stream stays readable after its close |
-| `producer_idle_ttl` | none | How long an open Stream stays after its last append |
+| `retention` | 7 days | How long a Stream stays after its create or its last written batch |
 | `fence` | `False` | Refuse a write of an earlier attempt of a Producer |
 | `resend_window` | 16 | The batches of a Producer whose request id the Store remembers |
 | `response_timeout` | 5 s | How long a call waits for Redis |
@@ -51,15 +50,15 @@ upper bound.
 | `name` | `redis` | The name that a `StreamConfig` registers the Store under |
 
 The URL sets the credentials and TLS. A Redis key has no Temporal namespace, so give each
-namespace its own `key_prefix`. A Stream keeps the `retention` and the `producer_idle_ttl` of the
-Store that created it. `crates/streams-redis/docs/redis.md` describes what the Store keeps in
-Redis, and the access that its Redis user needs.
+namespace its own `key_prefix`. A Stream keeps the `retention` of the Store that created it.
+`crates/streams-redis/docs/redis.md` describes what the Store keeps in Redis, and the access that
+its Redis user needs.
 
 ## Checks
 
 Every call runs the Stream runtime of Temporal's Rust crates in this package, which checks the
-request and the response. SDK Core runs the same checks for the appends, closes and reads of
-Workflow code, so those calls are checked twice.
+request and the response. SDK Core runs the same checks for the appends and reads of Workflow
+code, so those calls are checked twice.
 
 ## Limits
 

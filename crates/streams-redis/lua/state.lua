@@ -27,8 +27,7 @@ end
 -- Returns the fields of a Stream, or nil when nobody created it. `newest` is `0-0`, which is
 -- never the id of an entry, while the Stream has no Record.
 local function load(meta)
-  local fields =
-    redis.call('HMGET', meta, 'v', 'rid', 'ret', 'idle', 'exp', 'closed', 'newest', 'lost')
+  local fields = redis.call('HMGET', meta, 'v', 'rid', 'ret', 'exp', 'newest', 'lost')
   if not fields[1] then
     return nil
   end
@@ -36,11 +35,9 @@ local function load(meta)
     v = fields[1],
     rid = fields[2],
     ret = fields[3],
-    idle = fields[4],
-    exp = fields[5],
-    closed = fields[6],
-    newest = fields[7] or '0-0',
-    lost = fields[8],
+    exp = fields[4],
+    newest = fields[5] or '0-0',
+    lost = fields[6],
   }
 end
 

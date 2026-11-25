@@ -12,7 +12,7 @@ use redis::{
     Cmd, ErrorKind, FromRedisValue, ParsingError, RedisResult, RedisWrite, Script, ServerErrorKind,
     ToRedisArgs, Value, aio::ConnectionLike, from_redis_value,
 };
-use std::{num::NonZeroUsize, sync::LazyLock};
+use std::{num::NonZeroUsize, sync::LazyLock, time::Duration};
 use temporalio_common::protos::temporal::api::common::v1::Payload;
 use temporalio_streams::proto::Producer;
 
@@ -23,8 +23,6 @@ pub(crate) static CREATE: LazyLock<Script> =
     LazyLock::new(|| write_script(include_str!("../lua/create.lua")));
 pub(crate) static APPEND: LazyLock<Script> =
     LazyLock::new(|| write_script(include_str!("../lua/append.lua")));
-pub(crate) static CLOSE: LazyLock<Script> =
-    LazyLock::new(|| write_script(include_str!("../lua/close.lua")));
 pub(crate) static READ: LazyLock<Script> =
     LazyLock::new(|| read_script(include_str!("../lua/read.lua")));
 pub(crate) static DESCRIBE: LazyLock<Script> =
@@ -120,7 +118,7 @@ impl ToRedisArgs for Fence {
     }
 }
 
-/// What a create does with an open Stream that another create made.
+/// What a create does with a Stream that another create made.
 pub(crate) enum Existing {
     Fail,
     Use,
@@ -165,7 +163,6 @@ pub(crate) struct CreateArgs {
     pub(crate) retention: Millis,
     pub(crate) existing: Existing,
     pub(crate) then: AfterWrite,
-    pub(crate) producer_idle_ttl: Option<Millis>,
 }
 
 impl ToRedisArgs for CreateArgs {
@@ -174,8 +171,6 @@ impl ToRedisArgs for CreateArgs {
         self.retention.write_redis_args(out);
         self.existing.write_redis_args(out);
         self.then.write_redis_args(out);
-        // A Stream with no idle TTL has no last argument.
-        self.producer_idle_ttl.write_redis_args(out);
     }
 }
 
@@ -205,23 +200,6 @@ impl ToRedisArgs for AppendArgs<'_> {
         self.then.write_redis_args(out);
         out.write_arg(&self.producer.encode_to_vec());
         self.bodies.write_redis_args(out);
-    }
-}
-
-/// The arguments of `close.lua`.
-pub(crate) struct CloseArgs<'a> {
-    pub(crate) field: &'a [u8],
-    pub(crate) attempt: AttemptKey,
-    pub(crate) fence: Fence,
-    pub(crate) then: AfterWrite,
-}
-
-impl ToRedisArgs for CloseArgs<'_> {
-    fn write_redis_args<W: ?Sized + RedisWrite>(&self, out: &mut W) {
-        out.write_arg(self.field);
-        out.write_arg(&self.attempt);
-        self.fence.write_redis_args(out);
-        self.then.write_redis_args(out);
     }
 }
 
@@ -275,38 +253,6 @@ impl FromRedisValue for Appended {
     }
 }
 
-/// The answer of `close.lua`.
-pub(crate) struct Closed;
-
-impl FromRedisValue for Closed {
-    fn from_redis_value(value: Value) -> Result<Self, ParsingError> {
-        match i64::from_redis_value(value)? {
-            1 => Ok(Self),
-            other => Err(format!("The close script answered {other}").into()),
-        }
-    }
-}
-
-/// Whether a Stream is open, as a script answers it.
-#[derive(Clone, Copy, PartialEq)]
-pub(crate) enum Status {
-    Open,
-    Closed,
-}
-
-impl FromRedisValue for Status {
-    fn from_redis_value(value: Value) -> Result<Self, ParsingError> {
-        match i64::from_redis_value(value)? {
-            0 => Ok(Self::Open),
-            1 => Ok(Self::Closed),
-            other => Err(format!("A script answered the status {other}").into()),
-        }
-    }
-}
-
-/// The answer of `describe.lua`, which has the id of the newest Record.
-pub(crate) type Described = (Status, EntryId);
-
 /// An entry of the log, which is one Record.
 pub(crate) struct LogEntry {
     pub(crate) id: EntryId,
@@ -340,21 +286,19 @@ fn decode<M: Message + Default>(bytes: &[u8]) -> Result<M, ParsingError> {
 
 /// The answer of `read.lua`.
 pub(crate) struct Page {
-    pub(crate) status: Status,
-    /// The id of the newest Record, or [`EntryId::ZERO`] for a Stream with none.
-    pub(crate) newest: EntryId,
     pub(crate) entries: Vec<LogEntry>,
     /// The Producer of the first entry, when its batch starts before the page.
     pub(crate) earlier: Option<Producer>,
+    /// The time until the Stream expires, by the clock of Redis.
+    pub(crate) expires_in: Option<Duration>,
 }
 
 impl FromRedisValue for Page {
     fn from_redis_value(value: Value) -> Result<Self, ParsingError> {
-        let (status, newest, entries, earlier): (_, _, _, Option<Vec<u8>>) =
+        let (entries, earlier, expires_in): (_, Option<Vec<u8>>, Option<u64>) =
             from_redis_value(value)?;
         Ok(Self {
-            status,
-            newest,
+            expires_in: expires_in.map(Duration::from_millis),
             entries,
             earlier: earlier.as_deref().map(decode).transpose()?,
         })
@@ -373,8 +317,6 @@ mod tests {
             Ok(Created::Made)
         ));
         assert!(Created::from_redis_value(value(b":2\r\n")).is_err());
-        assert!(Closed::from_redis_value(value(b":0\r\n")).is_err());
-        assert!(Status::from_redis_value(value(b":2\r\n")).is_err());
         // An entry with the id `5-0`, and the four items of its two fields.
         let entry = |name: &str, body_name: &str| {
             let fields = format!("$1\r\n{name}\r\n$0\r\n\r\n$1\r\n{body_name}\r\n$0\r\n\r\n");

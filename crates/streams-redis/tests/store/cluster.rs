@@ -4,15 +4,12 @@
 use crate::{
     reads::{page, until_blocked, waiting},
     support::{
-        Cluster, NoRequestId, Redis, Rng, append, close, create, describe, keys, read, reason,
-        runtime, seeds, standalone,
+        Cluster, NoRequestId, Redis, Rng, append, create, describe, keys, read, reason, runtime,
+        seeds, standalone,
     },
 };
 use std::{sync::Arc, time::Duration};
-use temporalio_streams::{
-    AnyReason, CreateReason,
-    proto::{StreamErrorReason, StreamStatus},
-};
+use temporalio_streams::{AnyReason, CreateReason, proto::StreamErrorReason};
 use temporalio_streams_redis::{RedisServers, RedisStoreOptions};
 
 const PREFIX: &str = "temporal-streams";
@@ -39,7 +36,7 @@ async fn a_waiting_read_blocks_on_the_node_of_its_stream() {
             let request = waiting(&id, &[], 60);
             let reader = store.clone();
             let read = tokio::spawn(async move { reader.read_records(request).await });
-            // The four keys are in one slot, or the scripts of the Stream would fail. A read
+            // The three keys are in one slot, or the scripts of the Stream would fail. A read
             // that computes another slot never blocks on this node.
             let [_, log, ..] = keys(PREFIX, &id);
             let node = cluster.node_of(slot_of(&cluster.nodes[0], &log).await);
@@ -159,29 +156,40 @@ async fn a_stream_is_served_while_its_slot_migrates() {
     store.create_no_id(create("s")).await.unwrap();
     store.append_no_id(append("s", &[b"a"])).await.unwrap();
 
-    let [meta, log, producers, closed] = keys(PREFIX, "s");
+    // A Stream with no Record in the slot of `s`. Its first append makes its log and its
+    // Producers, so its keys exist only in part while the slot migrates, on either node.
+    let slot = |id: &str| crc16::State::<crc16::XMODEM>::calculate(id.as_bytes()) % 16384;
+    let mut ids = (0..).map(|n| format!("fresh-{n}"));
+    let fresh = ids.find(|id| slot(id) == slot("s")).unwrap();
+    store.create_no_id(create(&fresh)).await.unwrap();
+    let [meta, log, producers] = keys(PREFIX, "s");
+    let [fresh_meta, fresh_log, _] = keys(PREFIX, &fresh);
     let migration = Migration::start(&cluster, &meta).await;
     let (source, target) = (migration.source, migration.target);
 
-    // A close makes the `closed` key, so its keys exist only in part while the slot migrates, on
-    // either node. Redis refuses to run it, and nothing of it is written.
-    let refused_close = async || {
+    // Redis refuses to run the first append, and nothing of it is written.
+    let refused_append = async || {
         let before = (keys_on(source).await, keys_on(target).await);
-        let error = store.close_stream(close("s")).await.unwrap_err();
+        let error = store
+            .append_no_id(append(&fresh, &[b"x"]))
+            .await
+            .unwrap_err();
         assert_eq!(StreamErrorReason::from(error.reason), unavailable);
         // The outage has the answer of Redis, and not only a timeout of the client.
         assert!(error.message.contains("TRYAGAIN"), "{error}");
-        let open = store.describe_stream(describe("s")).await.unwrap();
-        assert_eq!(open.status, StreamStatus::Open as i32);
+        let empty = store.describe_stream(describe(&fresh)).await.unwrap();
+        assert!(empty.last_offset.is_empty());
         assert_eq!((keys_on(source).await, keys_on(target).await), before);
-        assert!(!before.0.contains(&closed) && !before.1.contains(&closed));
+        assert!(!before.0.contains(&fresh_log) && !before.1.contains(&fresh_log));
     };
 
     // The source still has every key of the Stream, so it serves it.
     store.append_no_id(append("s", &[b"b"])).await.unwrap();
-    refused_close().await;
+    refused_append().await;
 
-    migration.move_keys(&[&meta, &log, &producers]).await;
+    migration
+        .move_keys(&[&meta, &log, &producers, &fresh_meta])
+        .await;
     // The target has every key, and the source redirects each call to it.
     let third = store.append_no_id(append("s", &[b"c"])).await.unwrap();
     let all = store.read_records(read("s", &[])).await.unwrap();
@@ -196,17 +204,14 @@ async fn a_stream_is_served_while_its_slot_migrates() {
         waiting_read.await.unwrap(),
         Ok(page(&fourth.first_offset, b"d"))
     );
-    refused_close().await;
+    refused_append().await;
 
     migration.finish().await;
-    crate::faults::after_outage(|| store.close_stream(close("s")))
+    let first = crate::faults::after_outage(|| store.append_no_id(append(&fresh, &[b"x"])))
         .await
         .unwrap();
-    let end = store
-        .read_records(read("s", &fourth.last_offset))
-        .await
-        .unwrap();
-    assert!(end.done && end.records.is_empty());
+    let all = store.read_records(read(&fresh, &[])).await;
+    assert_eq!(all, Ok(page(&first.first_offset, b"x")));
 }
 
 #[tokio::test(flavor = "multi_thread")]

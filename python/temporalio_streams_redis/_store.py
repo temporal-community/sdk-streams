@@ -7,8 +7,6 @@ import temporalio.client
 from temporalio.api.streamservice.v1 import (
     AppendRecordsRequest,
     AppendRecordsResponse,
-    CloseStreamRequest,
-    CloseStreamResponse,
     CreateStreamRequest,
     CreateStreamResponse,
     DescribeStreamRequest,
@@ -51,7 +49,6 @@ class RedisStreamStore(temporalio.client.StreamStore):
         cluster: bool = False,
         key_prefix: str | None = None,
         retention: timedelta | None = None,
-        producer_idle_ttl: timedelta | None = None,
         fence: bool = False,
         resend_window: int | None = None,
         response_timeout: timedelta | None = None,
@@ -72,12 +69,9 @@ class RedisStreamStore(temporalio.client.StreamStore):
             cluster: Whether the URLs are nodes of a Redis Cluster.
             key_prefix: The prefix of every key, ``temporal-streams`` by default.
                 It has only letters, digits and the characters ``-._~:``.
-            retention: How long a Stream stays readable after its close, 7 days
-                by default. A Stream keeps the Retention of the Store that created
-                it.
-            producer_idle_ttl: How long an open Stream stays after its last
-                append. By default an open Stream doesn't expire. A Stream keeps
-                the value of the Store that created it.
+            retention: How long a Stream stays after its create or the last
+                append that wrote a batch, 7 days by default. The Stream then
+                expires. A Stream keeps the Retention of the Store that created it.
             fence: Whether the Store refuses a write from an earlier attempt of a
                 Producer, with ``STREAM_ERROR_REASON_FENCED``, once a later
                 attempt of it has written to the Stream.
@@ -105,7 +99,6 @@ class RedisStreamStore(temporalio.client.StreamStore):
                 "cluster": cluster,
                 "key_prefix": key_prefix,
                 "retention": retention,
-                "producer_idle_ttl": producer_idle_ttl,
                 "fence": fence,
                 "resend_window": resend_window,
                 "response_timeout": response_timeout,
@@ -141,11 +134,6 @@ class RedisStreamStore(temporalio.client.StreamStore):
         """See base class."""
         response = await self._store.read_records(request.SerializeToString())
         return ReadRecordsResponse.FromString(response)
-
-    async def close_stream(self, request: CloseStreamRequest) -> CloseStreamResponse:
-        """See base class."""
-        response = await self._store.close_stream(request.SerializeToString())
-        return CloseStreamResponse.FromString(response)
 
     async def describe_stream(
         self, request: DescribeStreamRequest

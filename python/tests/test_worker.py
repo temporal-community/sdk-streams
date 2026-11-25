@@ -1,9 +1,10 @@
 """The Redis Store under SDK Core, in a Worker of a local Temporal server.
 
-Workflow code appends, reads and closes through Core and the bridge, and its Activity
-appends through its client, so both paths of the SDK write one Stream.
+Workflow code appends and reads through Core and the bridge, and its Activity appends
+through its client, so both paths of the SDK write one Stream.
 """
 
+import asyncio
 import uuid
 from datetime import timedelta
 
@@ -22,6 +23,9 @@ from temporalio.worker import Replayer, Worker
 
 from temporalio_streams_redis import RedisStreamStore
 
+# The Records that the Workflow and its Activity append.
+RECORDS = 5
+
 
 @activity.defn
 async def append_in_activity(stream_id: str) -> None:
@@ -35,19 +39,22 @@ class AppendingWorkflow:
     @workflow.run
     async def run(self, stream_id: str) -> list[str]:
         stream = await workflow.create_stream(id=stream_id, body_type=str)
-        try:
-            await stream.append("workflow 1")
-            await workflow.execute_activity(
-                append_in_activity,
-                stream_id,
-                activity_id="append",
-                start_to_close_timeout=timedelta(seconds=30),
-            )
-            await stream.append("workflow 2", "workflow 3")
-            # History keeps a digest of what this read gave, which a replay checks.
-            return [record.body async for record in stream.read()]
-        finally:
-            await stream.close()
+        await stream.append("workflow 1")
+        await workflow.execute_activity(
+            append_in_activity,
+            stream_id,
+            activity_id="append",
+            start_to_close_timeout=timedelta(seconds=30),
+        )
+        await stream.append("workflow 2", "workflow 3")
+        # History keeps a digest of what this read gave, which a replay checks. A read
+        # waits for more Records, so it stops at the five that the Stream has.
+        bodies: list[str] = []
+        async for record in stream.read():
+            bodies.append(record.body)
+            if len(bodies) == RECORDS:
+                break
+        return bodies
 
 
 def writer(record: StreamRecord[str]) -> tuple[str, int]:
@@ -74,15 +81,23 @@ async def test_a_workflow_writes_through_core_to_redis(redis: Redis):
             workflows=[AppendingWorkflow],
             activities=[append_in_activity],
         ):
+            # A lost Record would leave the reads of the test waiting for it.
             handle = await env.client.start_workflow(
-                AppendingWorkflow.run, "events", id="wf", task_queue="streams"
+                AppendingWorkflow.run,
+                "events",
+                id="wf",
+                task_queue="streams",
+                execution_timeout=timedelta(seconds=60),
             )
             read_by_workflow = await handle.result()
 
         stream = env.client.get_stream(StreamRef[str](id="events"))
-        pages = [page async for page in stream.read_pages()]
-        assert pages[-1].done
-        records = [record for page in pages for record in page.records]
+        records: list[StreamRecord[str]] = []
+        async with asyncio.timeout(30):
+            async for page in stream.read_pages():
+                records.extend(page.records)
+                if len(records) >= RECORDS:
+                    break
         # The SDK sends the appends of Workflow code with no attempt, and Core adds
         # the attempt of the Workflow Task.
         run = handle.result_run_id

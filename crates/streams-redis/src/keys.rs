@@ -2,7 +2,7 @@
 
 use crate::KeyPrefix;
 
-/// The four keys of one Stream. They have one hash tag, so a Redis Cluster keeps them in one slot
+/// The three keys of one Stream. They have one hash tag, so a Redis Cluster keeps them in one slot
 /// and one script can use them all.
 pub(crate) struct StreamKeys {
     base: String,
@@ -38,10 +38,5 @@ impl StreamKeys {
     /// Returns the key of the hash with the state of each Producer.
     pub(crate) fn producers(&self) -> String {
         format!("{}:producers", self.base)
-    }
-
-    /// Returns the key of the Redis stream that gets one entry when the Stream closes.
-    pub(crate) fn closed(&self) -> String {
-        format!("{}:closed", self.base)
     }
 }

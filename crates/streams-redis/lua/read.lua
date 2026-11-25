@@ -7,17 +7,17 @@
 -- 3. The maximum number of bytes that their entries store
 --
 -- Returns:
--- 1. `1` for a closed Stream and `0` for an open one
--- 2. The id of the newest Record, `0-0` for none
--- 3. The entries of the page, as `XRANGE` gives them
--- 4. The encoded Producer of the first entry's batch when that batch starts before the page,
+-- 1. The entries of the page, as `XRANGE` gives them
+-- 2. The encoded Producer of the first entry's batch when that batch starts before the page,
 --    and nil otherwise
+-- 3. The ms until the Stream expires, by the clock of Redis, and nil for a Stream with no `exp`
 local meta, log = KEYS[1], KEYS[2]
 local from, max_records, max_bytes = ARGV[1], tonumber(ARGV[2]), tonumber(ARGV[3])
 -- The entries of one `XRANGE`. A page with a byte limit reads at most this many past it.
 local CHUNK = 64
 
-local stream, refused = live(meta, now_ms())
+local now = now_ms()
+local stream, refused = live(meta, now)
 if refused then
   return refused
 end
@@ -54,4 +54,4 @@ if first and first[2][1] == 'b' then
   local id = string.match(first[1], '^%d+') .. '-' .. first[2][2]
   producer = redis.call('XRANGE', log, id, id)[1][2][2]
 end
-return {stream.closed and 1 or 0, stream.newest, page, producer}
+return {page, producer, stream.exp and stream.exp - now or false}

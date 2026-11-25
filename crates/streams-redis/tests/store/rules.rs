@@ -14,12 +14,15 @@ use temporalio_streams::{
     StreamRuntime, StreamStore,
     attempt::{ATTEMPT_KEY_LEN, attempt_key},
     proto::{
-        ActivityAttempt, AppendRecord, AppendRecordsRequest, AppendRecordsResponse, ClientProducer,
-        CloseStreamRequest, CloseStreamResponse, CreateStreamRequest, CreateStreamResponse,
-        DescribeStreamRequest, DescribeStreamResponse, LocalActivityAttempt, LocalActivityProducer,
-        Producer, ReadRecordsRequest, ReadRecordsResponse, StandaloneActivityProducer,
-        StreamErrorReason, StreamIdConflictPolicy, StreamRecord, StreamRef, StreamStatus,
-        WorkflowActivityProducer, WorkflowProducer, WorkflowTaskAttempt, producer::Kind,
+        self, ActivityAttempt, AppendRecord, AppendRecordsResponse, ClientProducer,
+        DescribeStreamResponse, LocalActivityAttempt, LocalActivityProducer, Producer,
+        ReadRecordsResponse, StandaloneActivityProducer, StreamErrorReason, StreamIdConflictPolicy,
+        StreamRecord, WorkflowActivityProducer, WorkflowProducer, WorkflowTaskAttempt,
+        producer::Kind,
+        sdk::{
+            AppendRecordsRequest, CreateStreamRequest, CreateStreamResponse, DescribeStreamRequest,
+            ReadRecordsRequest, StreamRef,
+        },
     },
     record::StoreLimits,
 };
@@ -91,7 +94,6 @@ struct Writer {
 struct Known {
     /// The request id of the create that made the Stream.
     created_by: Option<String>,
-    closed: bool,
     /// The Records of the accepted batches, in the order of their offsets.
     records: Vec<StreamRecord>,
     /// The offset up to which the log lost its Records, or empty.
@@ -111,7 +113,6 @@ enum Call {
     Create(CreateStreamRequest, String),
     /// An append, and its request id.
     Append(AppendRecordsRequest, String),
-    Close(CloseStreamRequest),
     Read(ReadRecordsRequest),
     Describe(DescribeStreamRequest),
     /// Deletes the log of the Stream, as an eviction does.
@@ -125,7 +126,6 @@ enum Call {
 enum Answer {
     Created(CreateStreamResponse),
     Appended(AppendRecordsResponse),
-    Closed(CloseStreamResponse),
     Page(ReadRecordsResponse),
     Described(DescribeStreamResponse),
     Refused(StreamErrorReason),
@@ -224,7 +224,7 @@ impl<C: ConnectionLike> Run<C> {
 
     fn next_call(&mut self) -> Call {
         let stream_id = self.rng.pick(&STREAMS).to_string();
-        // A Store ignores the `store` of a ref, and a create returns the ref as the request had it.
+        // The Store gets only the id of a ref, and a create returns the ref as the request had it.
         let stream_ref = Some(StreamRef {
             id: stream_id.clone(),
             store: self.rng.pick(&["", "redis"]).to_string(),
@@ -237,14 +237,10 @@ impl<C: ConnectionLike> Run<C> {
                 },
                 self.rng.pick(&["", "c1", "c2"]).to_string(),
             ),
-            10..57 => {
+            10..59 => {
                 let (request, request_id) = self.next_append(stream_ref);
                 Call::Append(request, request_id)
             }
-            57..59 => Call::Close(CloseStreamRequest {
-                r#ref: stream_ref,
-                producer: Some(producer(&mut self.rng)),
-            }),
             59..66 => Call::Describe(DescribeStreamRequest { r#ref: stream_ref }),
             66..68 => Call::LoseLog(stream_id),
             68..70 => Call::StepClockBack(stream_id),
@@ -352,7 +348,6 @@ impl<C: ConnectionLike> Run<C> {
         let stream_ref = match call {
             Call::Create(request, _) => &request.stream_ref,
             Call::Append(request, _) => &request.r#ref,
-            Call::Close(request) => &request.r#ref,
             Call::Read(request) => &request.r#ref,
             Call::Describe(request) => &request.r#ref,
             Call::LoseLog(stream_id) => {
@@ -368,8 +363,8 @@ impl<C: ConnectionLike> Run<C> {
             }
             Call::StepClockBack(stream_id) => {
                 let known = self.known.get_mut(stream_id).unwrap();
-                // A Record of a closed Stream or of a lost log isn't what an append leaves.
-                if known.closed || known.newest() <= known.lost {
+                // A Record of a lost log isn't what an append leaves.
+                if known.newest() <= known.lost {
                     return None;
                 }
                 // The test writes the Record as an append does, at an id that the clock of
@@ -417,9 +412,7 @@ impl<C: ConnectionLike> Run<C> {
                     return Expected::Written(created(true));
                 };
                 let use_existing = StreamIdConflictPolicy::UseExisting as i32;
-                if known.closed {
-                    refused(StreamErrorReason::Closed)
-                } else if !request_id.is_empty() && request_id == created_by {
+                if !request_id.is_empty() && request_id == created_by {
                     Expected::Unchanged(created(true))
                 } else if request.id_conflict_policy != use_existing {
                     refused(StreamErrorReason::AlreadyExists)
@@ -446,39 +439,14 @@ impl<C: ConnectionLike> Run<C> {
                 if fences && newest_attempt.is_some_and(|newest| attempt < newest) {
                     return refused(StreamErrorReason::Fenced);
                 }
-                if known.closed {
-                    return refused(StreamErrorReason::Closed);
-                }
                 Expected::NewBatch
-            }
-            Call::Close(request) => {
-                let known = self.known.get_mut(id_of(request.r#ref.as_ref())).unwrap();
-                if known.created_by.is_none() {
-                    return refused(StreamErrorReason::NotFound);
-                }
-                let closed = Answer::Closed(CloseStreamResponse {});
-                if known.closed {
-                    return Expected::Unchanged(closed);
-                }
-                let (writer, attempt) = writer_of(request.producer.as_ref().unwrap());
-                let newest_attempt = known.writers.get(&writer).and_then(|w| w.newest_attempt);
-                if fences && newest_attempt.is_some_and(|newest| attempt < newest) {
-                    return refused(StreamErrorReason::Fenced);
-                }
-                known.closed = true;
-                Expected::Written(closed)
             }
             Call::Describe(request) => {
                 let known = &self.known[id_of(request.r#ref.as_ref())];
                 if known.created_by.is_none() {
                     return refused(StreamErrorReason::NotFound);
                 }
-                let status = match known.closed {
-                    true => StreamStatus::Closed,
-                    false => StreamStatus::Open,
-                };
                 Expected::Unchanged(Answer::Described(DescribeStreamResponse {
-                    status: status as i32,
                     last_offset: known.newest(),
                 }))
             }
@@ -524,13 +492,10 @@ impl<C: ConnectionLike> Run<C> {
                     .await,
                 Answer::Appended,
             ),
-            Call::Close(request) => {
-                answer(runtime.close_stream(request.clone()).await, Answer::Closed)
-            }
             Call::Read(request) => {
                 let page = runtime.read_records(request.clone()).await;
                 // The Store keeps to both limits of a read, so the runtime has nothing to cut.
-                let bare = via.store.read_records(request.clone()).await;
+                let bare = via.store.read_records(store_read(request)).await;
                 assert_eq!(bare, page, "seed {}, {request:?}", self.seed);
                 answer(page, Answer::Page)
             }
@@ -594,11 +559,10 @@ impl<C: ConnectionLike> Run<C> {
                 ..Default::default()
             };
             let page = self.stores[0].runtime.read_records(request).await.unwrap();
-            let ended = page.done || page.records.is_empty();
+            let ended = page.records.is_empty();
             records.extend(page.records);
             from = page.last_offset;
             if ended {
-                assert_eq!(page.done, known.closed, "seed {}, {stream_id}", self.seed);
                 break;
             }
         }
@@ -633,9 +597,19 @@ fn page(known: &Known, request: &ReadRecordsRequest) -> ReadRecordsResponse {
         None => request.from_offset.clone(),
     };
     ReadRecordsResponse {
-        done: known.closed && last_offset == known.newest(),
         last_offset,
         records,
+    }
+}
+
+/// Returns the read that the runtime gives the Store for an SDK read, which has only the id.
+fn store_read(request: &ReadRecordsRequest) -> proto::ReadRecordsRequest {
+    proto::ReadRecordsRequest {
+        stream_id: id_of(request.r#ref.as_ref()).to_string(),
+        from_offset: request.from_offset.clone(),
+        max_records: request.max_records,
+        max_bytes: request.max_bytes,
+        wait: request.wait,
     }
 }
 
