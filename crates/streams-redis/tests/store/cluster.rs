@@ -22,6 +22,34 @@ pub(crate) async fn slot_of(node: &Redis, key: &str) -> u16 {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs Redis"]
+async fn a_null_endpoint_uses_the_host_of_the_seed_that_answered() {
+    let cluster = Cluster::start().await;
+    for node in &cluster.nodes {
+        redis::cmd("CONFIG")
+            .arg(("SET", "cluster-preferred-endpoint-type", "unknown-endpoint"))
+            .query_async::<()>(&mut node.admin().await)
+            .await
+            .unwrap();
+    }
+    let mut options = cluster.options();
+    let RedisServers::Cluster { first, rest } = &mut options.servers else {
+        unreachable!()
+    };
+    let unreachable_seed = format!("redis://127.0.0.2:{}", cluster.seed_port());
+    rest.push(std::mem::replace(first, unreachable_seed.parse().unwrap()));
+    let store = Arc::new(runtime(options));
+    store.create_no_id(create("s")).await.unwrap();
+    let reader = store.clone();
+    let read = tokio::spawn(async move { reader.read_records(waiting("s", &[], 60)).await });
+    let [_, log, _] = keys(PREFIX, "s");
+    let primary = cluster.node_of(slot_of(&cluster.nodes[0], &log).await);
+    until_blocked(&primary.url(), 1).await;
+    let appended = store.append_no_id(append("s", &[b"x"])).await.unwrap();
+    assert_eq!(read.await.unwrap(), Ok(page(&appended.first_offset, b"x")));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Redis"]
 async fn a_waiting_read_blocks_on_the_node_of_its_stream() {
     let cluster = Cluster::start().await;
     let store = Arc::new(runtime(cluster.options()));

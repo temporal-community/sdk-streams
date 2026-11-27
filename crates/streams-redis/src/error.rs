@@ -48,7 +48,7 @@ impl<R: WireReason> From<RedisStoreError> for StreamError<R> {
             return Self::from_wire(i32::from(reason), detail);
         }
         match error.kind() {
-            // Redis preserves specific error codes. Plain script errors need a separate cause check.
+            // Plain script errors need a cause check because Redis gives them no specific code.
             ErrorKind::Server(ServerErrorKind::ResponseError)
                 if detail.contains("@user_script") && !stopped_by_redis(detail) =>
             {

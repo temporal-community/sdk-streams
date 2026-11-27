@@ -8,7 +8,8 @@ later. The package has its own native module, which runs the Redis Store of the
 
 ## Install
 
-The package is unreleased. Install Rust and `protoc`, then run these commands from the repository root.
+The package needs the SDK's unreleased `StreamStore` API. A published `temporalio` release does not
+provide it yet. Install Rust and `protoc`, then use the SDK branch below from the repository root.
 
 ```sh
 SDK_RUST_REF=moe/streams-crate-types scripts/patch-sdk-rust.sh
@@ -16,7 +17,8 @@ pip install "temporalio @ git+https://github.com/temporalio/sdk-python@moe/strea
 pip install ./python
 ```
 
-The SDK branch and Store must use compatible `temporalio-streams` types.
+The SDK branch and Store must use compatible `temporalio-streams` types. Before publishing this
+package, set its `temporalio` lower bound to the first SDK release with Stream support.
 
 ## Use
 
@@ -77,7 +79,8 @@ code, so those calls are checked twice.
 ```sh
 cd python
 uv venv
-uv pip install --group dev "temporalio @ git+https://github.com/temporalio/sdk-python@moe/streams-api"
+uv pip install --group dev \
+  "temporalio @ git+https://github.com/temporalio/sdk-python@moe/streams-api"
 uv run --no-sync maturin develop
 uv run --no-sync pytest
 ```

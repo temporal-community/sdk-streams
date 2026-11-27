@@ -129,6 +129,18 @@ async fn reads_over_the_connection_limit_still_get_their_records() {
         tokio::spawn(async move { store.read_records(request).await })
     };
 
+    let holder = spawn(waiting("s", &[], 60));
+    until_blocked(&redis.url(), 1).await;
+    let next = spawn(waiting("s", &[], 1));
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    holder.abort();
+    let page_after_wait = tokio::time::timeout(Duration::from_millis(800), next)
+        .await
+        .expect("pool wait counts toward the read deadline")
+        .unwrap()
+        .unwrap();
+    assert!(page_after_wait.records.is_empty());
+
     let readers = [spawn(waiting("s", &[], 60)), spawn(waiting("s", &[], 60))];
     until_blocked(&redis.url(), 1).await;
     let appended = store.append_no_id(append("s", &[b"a"])).await.unwrap();

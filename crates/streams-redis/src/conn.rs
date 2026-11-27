@@ -10,8 +10,8 @@ use crate::{
 };
 use parking_lot::Mutex;
 use redis::{
-    AsyncConnectionConfig, Client, Cmd, ConnectionInfo, ErrorKind, FromRedisValue, ParsingError,
-    Pipeline, RedisError, RedisFuture, RedisResult, Value,
+    AsyncConnectionConfig, Client, Cmd, ConnectionAddr, ConnectionInfo, ErrorKind, FromRedisValue,
+    ParsingError, Pipeline, RedisError, RedisFuture, RedisResult, Value,
     aio::{ConnectionLike, ConnectionManager, ConnectionManagerConfig, MultiplexedConnection},
     cluster::ClusterClient,
     cluster_async::ClusterConnection,
@@ -61,7 +61,7 @@ pub(crate) enum Called<T> {
 impl<C> Pool<C> {
     pub(crate) fn new(size: NonZeroUsize) -> Self {
         Self {
-            // Tokio reserves high bits for semaphore state.
+            // A connection limit is an upper bound, so larger limits can use the supported maximum.
             permits: Arc::new(Semaphore::new(size.get().min(Semaphore::MAX_PERMITS))),
             idle: Arc::default(),
         }
@@ -69,7 +69,6 @@ impl<C> Pool<C> {
 
     async fn lease(&self, give_up: impl Future<Output = ()>) -> RedisResult<Leased<C>> {
         let permit = tokio::select! {
-            // A free place wins when `give_up` is ready too.
             biased;
             permit = self.permits.clone().acquire_owned() => permit,
             () = give_up => return Ok(Leased::Busy),
@@ -275,14 +274,38 @@ impl PooledCall<Shared> for WriteAndWait<'_> {
     }
 }
 
-struct Xread(Cmd);
+struct Xread<'a> {
+    keys: &'a StreamKeys,
+    after: EntryId,
+    deadline: Option<Instant>,
+}
 
-impl PooledCall<MultiplexedConnection> for Xread {
+impl PooledCall<MultiplexedConnection> for Xread<'_> {
     type Answer = Value;
     const KIND: CallKind = CallKind::Read;
 
     async fn run(&self, conn: &mut MultiplexedConnection) -> RedisResult<Value> {
-        self.0.query_async(conn).await
+        let block = match self.deadline {
+            None => 0,
+            Some(deadline) => {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Ok(Value::Nil);
+                }
+                // Redis treats zero as an unlimited wait.
+                u64::try_from(left.as_millis()).unwrap_or(u64::MAX).max(1)
+            }
+        };
+        redis::cmd("XREAD")
+            .arg("BLOCK")
+            .arg(block)
+            .arg("COUNT")
+            .arg(1)
+            .arg("STREAMS")
+            .arg(self.keys.log())
+            .arg(self.after)
+            .query_async(conn)
+            .await
     }
 }
 
@@ -359,7 +382,10 @@ impl Connections {
         after: EntryId,
         deadline: Option<Instant>,
     ) -> RedisStoreResult<()> {
-        let node = self.node(keys).await?;
+        let node = tokio::select! {
+            node = self.node(keys) => node?,
+            () = until(deadline) => return Ok(()),
+        };
         let pool = self.pool(node.addr().to_string());
         let open = || async {
             // The read bounds its own wait, so the connection has no response timeout.
@@ -375,7 +401,11 @@ impl Connections {
                 () = until(deadline) => {}
             }
         };
-        let xread = xread(keys, after, deadline);
+        let xread = Xread {
+            keys,
+            after,
+            deadline,
+        };
         let called = pool.call(give_up, open, &xread);
         // A server that stopped without closing the connection never replies.
         let end = deadline.and_then(|deadline| deadline.checked_add(self.response_timeout));
@@ -392,19 +422,56 @@ impl Connections {
     }
 
     async fn node(&self, keys: &StreamKeys) -> RedisStoreResult<ConnectionInfo> {
-        let first = match &self.servers {
+        let (first, rest) = match &self.servers {
             RedisServers::Standalone(server) => return Ok(server.info().clone()),
-            RedisServers::Cluster { first, .. } => first,
+            RedisServers::Cluster { first, rest } => (first, rest),
         };
         let slot = keys.slot();
         let serves = |range: &&SlotRange| range.first <= slot && slot <= range.last;
         let node = |range: &SlotRange| first.node(range.host.clone(), range.port);
-        let known = self.slots.lock().iter().find(serves).map(node);
-        if let Some(node) = known {
+        if let Some(node) = self.slots.lock().iter().find(serves).map(node) {
             return Ok(node);
         }
-        let mut slots = redis::cmd("CLUSTER");
-        let ranges: Vec<SlotRange> = slots.arg("SLOTS").query_async(&mut self.shared()).await?;
+        let mut command = redis::cmd("CLUSTER");
+        command.arg("SLOTS");
+        let mut ranges: Vec<SlotRange> = command.query_async(&mut self.shared()).await?;
+        if ranges.iter().find(serves).is_some_and(|r| r.host.is_some()) {
+            // Only explicit endpoints can be cached from a reply with an unknown responder.
+            ranges.retain(|r| r.host.is_some());
+        } else if ranges.iter().any(|r| r.host.is_none()) {
+            // An omitted endpoint is relative to the seed that received the command.
+            let mut source = first;
+            let mut others = rest.iter();
+            let config = AsyncConnectionConfig::new()
+                .set_connection_timeout(Some(self.response_timeout))
+                .set_response_timeout(Some(self.response_timeout));
+            loop {
+                let reply = async {
+                    let client = Client::open(source.info().clone())?;
+                    let mut conn = client
+                        .get_multiplexed_async_connection_with_config(&config)
+                        .await?;
+                    command.query_async(&mut conn).await
+                }
+                .await;
+                match reply {
+                    Ok(reply) => {
+                        ranges = reply;
+                        let host = match source.info().addr() {
+                            ConnectionAddr::Tcp(host, _) | ConnectionAddr::TcpTls { host, .. } => {
+                                host
+                            }
+                            _ => unreachable!("cluster seeds require a host"),
+                        };
+                        for range in &mut ranges {
+                            range.host.get_or_insert_with(|| host.clone());
+                        }
+                        break;
+                    }
+                    Err(error) => source = others.next().ok_or(error)?,
+                }
+            }
+        }
         let node = ranges.iter().find(serves).map(node);
         *self.slots.lock() = ranges;
         node.ok_or_else(|| {
@@ -419,24 +486,6 @@ async fn until(deadline: Option<Instant>) {
         Some(deadline) => tokio::time::sleep_until(deadline).await,
         None => std::future::pending().await,
     }
-}
-
-fn xread(keys: &StreamKeys, after: EntryId, deadline: Option<Instant>) -> Xread {
-    // Redis treats `BLOCK 0` as an unlimited wait, so expired deadlines need 1 ms.
-    let block = deadline.map_or(0, |deadline| {
-        let left = deadline.saturating_duration_since(Instant::now());
-        u64::try_from(left.as_millis()).unwrap_or(u64::MAX).max(1)
-    });
-    let mut xread = redis::cmd("XREAD");
-    xread
-        .arg("BLOCK")
-        .arg(block)
-        .arg("COUNT")
-        .arg(1)
-        .arg("STREAMS")
-        .arg(keys.log())
-        .arg(after);
-    Xread(xread)
 }
 
 #[cfg(test)]

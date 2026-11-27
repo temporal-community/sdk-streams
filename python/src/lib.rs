@@ -29,7 +29,7 @@ use temporalio_streams::{
     record::StoreLimits,
 };
 use temporalio_streams_redis::{
-    ClusterNodeUrl, Fence, KeyPrefix, RedisServers, RedisStoreError, RedisStoreOptions, RedisUrl,
+    ClusterNodeUrl, KeyPrefix, RedisServers, RedisStoreError, RedisStoreOptions, RedisUrl,
     WaitForReplicas,
 };
 use tokio::runtime::{Builder, Runtime};
@@ -150,10 +150,7 @@ impl TryFrom<Options> for RedisStoreOptions {
         let mut built = RedisStoreOptions::new(servers);
         built.key_prefix = key_prefix.map_err(invalid)?.unwrap_or(built.key_prefix);
         built.retention = options.retention.unwrap_or(built.retention);
-        built.fence = match options.fence {
-            true => Fence::On,
-            false => Fence::Off,
-        };
+        built.fence = options.fence.into();
         built.resend_window = window.unwrap_or(built.resend_window);
         built.response_timeout = options.response_timeout.unwrap_or(built.response_timeout);
         built.wait = wait;

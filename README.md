@@ -51,6 +51,9 @@ See the [operator guide](crates/streams-redis/docs/redis.md) for access, persist
 
 ## Testing
 
+After installing the Python development dependencies, run `make format` and `make lint-code`
+from the repository root. These targets use the same Rust and Python checks as CI.
+
 `cargo test` runs the tests that need no server. `cargo test -- --include-ignored` runs all of
 them, and needs `redis-server` in the `PATH`, or its path in `REDIS_SERVER`. Each test starts the
 servers that it needs on free ports and stops them. `STREAMS_SEED=<seed>` runs one seed of a

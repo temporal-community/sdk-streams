@@ -13,6 +13,12 @@ pub enum Fence {
     On,
 }
 
+impl From<bool> for Fence {
+    fn from(enabled: bool) -> Self {
+        if enabled { Self::On } else { Self::Off }
+    }
+}
+
 /// A Redis server, from its URL. The URL starts with `redis://` or `rediss://`, and it also sets
 /// the credentials and TLS.
 #[derive(Clone)]
@@ -227,6 +233,7 @@ impl RedisStoreOptions {
         Self {
             servers,
             key_prefix: KeyPrefix::default(),
+            // A producer can stop without a final write, so retention can't depend on completion.
             retention: Duration::from_secs(7 * 24 * 60 * 60),
             fence: Fence::Off,
             resend_window: DEFAULT_RESEND_WINDOW,
