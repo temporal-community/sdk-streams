@@ -24,8 +24,13 @@ local stream, refused = live(meta, now)
 if refused then
   return refused
 end
--- A `ret` that isn't a number fails the script here, before its first write.
-local expires = now + stream.ret
+-- The Store writes a positive whole number of milliseconds up to 2^52. Reject damaged
+-- metadata before passing the expiry to PEXPIREAT, which accepts only integers.
+local retention = tonumber(stream.ret)
+if not retention or retention < 1 or retention > 2^52 or retention ~= math.floor(retention) then
+  return refuse('STORE_CORRUPT', 'Invalid Stream retention')
+end
+local expires = now + retention
 local state = redis.call('HGET', producers, field) or ''
 local newest_attempt, batches = string.sub(state, 1, ATTEMPT), string.sub(state, ATTEMPT + 1)
 -- A resend comes before the fence, so that a retry gets its answer after a later attempt wrote.
@@ -41,9 +46,6 @@ if fence == '1' and below(attempt, newest_attempt) then
 end
 
 local lost = lost_mark(stream, log)
-if lost and lost ~= stream.lost then
-  redis.call('HSET', meta, 'lost', lost)
-end
 -- The ids of a batch have one `<ms>`. They start after `newest`, so they never go down when
 -- the clock steps back or the log is lost.
 local ms, seq = id_parts(stream.newest)
@@ -55,20 +57,32 @@ end
 local function id(entry_seq)
   return string.format('%.0f-%.0f', ms, entry_seq)
 end
-local first_seq = seq
-redis.call('XADD', log, id(seq), 'p', producer, 'r', ARGV[FIRST_RECORD])
+local first_seq, last_seq = seq, seq + (#ARGV - FIRST_RECORD)
+-- Above this range Lua can round two consecutive ids to the same number.
+if ms > 2^53 - 1 or last_seq > 2^53 - 1 then
+  return refuse('STORE_CORRUPT', 'Stream entry id exceeds the supported range')
+end
+if below(newest_attempt, attempt) then
+  newest_attempt = attempt
+end
+local batch = request .. struct.pack('>I8I8I8', ms, first_seq, last_seq)
+local remembered = newest_attempt .. batch .. string.sub(batches, 1, (window - 1) * BATCH)
+local keys = {log, producers}
+check_expiry(meta, keys, expires)
+require_write('XADD', log, id(first_seq), 'p', producer, 'r', ARGV[FIRST_RECORD])
+require_write('HSET', producers, field, remembered)
+-- The first XADD can still reject a wrong-type log or a stale id. Do it before
+-- updating the metadata, including the mark of a previously lost log.
+redis.call('XADD', log, id(first_seq), 'p', producer, 'r', ARGV[FIRST_RECORD])
 for i = FIRST_RECORD + 1, #ARGV do
   seq = seq + 1
   redis.call('XADD', log, id(seq), 'b', first_seq, 'r', ARGV[i])
 end
-redis.call('HSET', meta, 'newest', id(seq))
-
-if below(newest_attempt, attempt) then
-  newest_attempt = attempt
+if lost and lost ~= stream.lost then
+  redis.call('HSET', meta, 'lost', lost)
 end
-local batch = request .. struct.pack('>I8I8I8', ms, first_seq, seq)
-redis.call('HSET', producers, field,
-  newest_attempt .. batch .. string.sub(batches, 1, (window - 1) * BATCH))
+redis.call('HSET', meta, 'newest', id(last_seq))
+redis.call('HSET', producers, field, remembered)
 -- A resend writes no batch, so only this path starts the Retention again.
-expire_at(meta, {log, producers}, expires)
+expire_at(meta, keys, expires)
 return {ms, first_seq, seq}

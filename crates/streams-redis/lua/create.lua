@@ -15,8 +15,10 @@ local request, retention, use_existing, wait = ARGV[1], ARGV[2], ARGV[3], ARGV[4
 local now = now_ms()
 local stream = load(meta)
 if not stream then
+  local expires = now + retention
+  check_expiry(meta, {}, expires)
   redis.call('HSET', meta, 'v', FORMAT, 'rid', request, 'ret', retention)
-  expire_at(meta, {}, now + retention)
+  expire_at(meta, {}, expires)
   return 1
 end
 local refused = unfit(stream, now)

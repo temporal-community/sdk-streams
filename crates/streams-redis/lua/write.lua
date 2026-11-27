@@ -5,6 +5,22 @@
 -- Stream from one that nobody created.
 local TOMBSTONE = 30 * 24 * 60 * 60 * 1000
 
+-- Redis authorizes each command as it runs. Check all target keys before changing any
+-- of them, including deployments that grant permissions with separate ACL selectors.
+local function require_write(cmd, ...)
+  if not redis.acl_check_cmd(cmd, ...) then
+    error('ACL failure in script: the user lacks permission for command ' .. cmd)
+  end
+end
+
+local function check_expiry(meta, keys, at)
+  require_write('HSET', meta, 'exp', at)
+  require_write('PEXPIREAT', meta, at + TOMBSTONE)
+  for _, key in ipairs(keys) do
+    require_write('PEXPIREAT', key, at)
+  end
+end
+
 -- Sets when the Stream expires, and the expiry of the meta key and of `keys`.
 local function expire_at(meta, keys, at)
   redis.call('HSET', meta, 'exp', at)

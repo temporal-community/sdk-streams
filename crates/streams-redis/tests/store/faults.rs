@@ -48,7 +48,13 @@ async fn an_append_to_a_stream_with_a_broken_retention_writes_nothing() {
     let mut admin = redis.admin().await;
     let store = runtime(standalone(redis.url()));
     let [meta, ..] = keys("temporal-streams", "s");
-    for broken in [None, Some("seven days")] {
+    for broken in [
+        None,
+        Some("seven days"),
+        Some("1.5"),
+        Some("0"),
+        Some("1e100"),
+    ] {
         let _: i64 = redis::cmd("DEL")
             .arg(&keys("temporal-streams", "s"))
             .query_async(&mut admin)
@@ -221,4 +227,84 @@ async fn a_wrong_setup_is_an_outage_that_says_its_cause() {
     let not_redis = runtime(standalone(not_redis));
     let message = outage(not_redis.create_no_id(create("s")).await.unwrap_err());
     assert!(message.contains("another service"), "{message}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Redis"]
+async fn rejected_writes_leave_the_stream_and_its_expiries_intact() {
+    let redis = Redis::start(&[]);
+    let mut admin = redis.admin().await;
+    let store = runtime(standalone(format!(
+        "redis://writer:local-test@127.0.0.1:{}",
+        redis.port
+    )));
+    let writer = |rules: &[&str]| {
+        let mut cmd = redis::cmd("ACL");
+        cmd.arg("SETUSER").arg("writer").arg(rules);
+        cmd
+    };
+    writer(&["on", ">local-test", "~*", "+@all", "-pexpireat"])
+        .query_async::<()>(&mut admin)
+        .await
+        .unwrap();
+    let before = snapshot(&mut admin, "temporal-streams", "s").await;
+    outage(store.create_no_id(create("s")).await.unwrap_err());
+    assert_eq!(snapshot(&mut admin, "temporal-streams", "s").await, before);
+    writer(&["+pexpireat"])
+        .query_async::<()>(&mut admin)
+        .await
+        .unwrap();
+    store.create_no_id(create("s")).await.unwrap();
+    store
+        .append_no_id(append("s", &[b"initial"]))
+        .await
+        .unwrap();
+
+    for (i, (deny, grant)) in [("-hset", "+hset"), ("-pexpireat", "+pexpireat")]
+        .into_iter()
+        .enumerate()
+    {
+        let request = append("s", &[b"next", b"batch"]);
+        let id = format!("batch-{i}");
+        let before = snapshot(&mut admin, "temporal-streams", "s").await;
+        // Grant the denied command on metadata only. Each key of the write must pass.
+        let selector = format!("(~*:meta {grant})");
+        writer(&[deny, &selector])
+            .query_async::<()>(&mut admin)
+            .await
+            .unwrap();
+        outage(
+            store
+                .append_records(request.clone(), id.clone())
+                .await
+                .unwrap_err(),
+        );
+        assert_eq!(snapshot(&mut admin, "temporal-streams", "s").await, before);
+        writer(&["clearselectors", grant])
+            .query_async::<()>(&mut admin)
+            .await
+            .unwrap();
+        let appended = store
+            .append_records(request.clone(), id.clone())
+            .await
+            .unwrap();
+        let written = snapshot(&mut admin, "temporal-streams", "s").await;
+        assert_eq!(store.append_records(request, id).await.unwrap(), appended);
+        assert_eq!(snapshot(&mut admin, "temporal-streams", "s").await, written);
+        let [meta, log, producers] = keys("temporal-streams", "s");
+        let (exp, log_exp, producer_exp, count): (i64, i64, i64, usize) = redis::pipe()
+            .cmd("HGET")
+            .arg(meta)
+            .arg("exp")
+            .cmd("PEXPIRETIME")
+            .arg(&log)
+            .cmd("PEXPIRETIME")
+            .arg(producers)
+            .cmd("XLEN")
+            .arg(log)
+            .query_async(&mut admin)
+            .await
+            .unwrap();
+        assert_eq!((log_exp, producer_exp, count), (exp, exp, 1 + 2 * (i + 1)));
+    }
 }
