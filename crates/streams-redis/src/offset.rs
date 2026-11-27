@@ -1,10 +1,8 @@
-//! Offsets. An offset is the id of its Record's log entry, `<ms>-<seq>`, in 16 bytes. So every id
-//! that Redis can give has an offset, and offsets sort bytewise in the order of the ids.
+//! Big-endian offsets preserve Redis entry order under unsigned byte comparison.
 
 use redis::{FromRedisValue, ParsingError, RedisWrite, ToRedisArgs, Value};
 use std::{fmt, str::FromStr};
 
-/// The id of a log entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct EntryId {
     pub(crate) ms: u64,
@@ -15,12 +13,6 @@ impl EntryId {
     /// The id before the first entry. Redis gives it to no entry.
     pub(crate) const ZERO: Self = Self { ms: 0, seq: 0 };
 
-    /// Returns the offset of the id, which has these big-endian fields.
-    ///
-    /// 1. The `<ms>` of the id (8 bytes)
-    /// 2. The `<seq>` of the id (8 bytes)
-    ///
-    /// [`ZERO`](Self::ZERO) has the empty offset.
     pub(crate) fn offset(self) -> Vec<u8> {
         if self == Self::ZERO {
             return Vec::new();
@@ -29,12 +21,10 @@ impl EntryId {
     }
 }
 
-/// Bytes that aren't an offset of this Store, with their length.
 #[derive(Debug, PartialEq, thiserror::Error)]
 #[error("it has {0} bytes, and an offset of this Store has 16")]
 pub(crate) struct NotAnOffset(usize);
 
-/// Reads an offset. An empty one is before the first Record.
 impl TryFrom<&[u8]> for EntryId {
     type Error = NotAnOffset;
 

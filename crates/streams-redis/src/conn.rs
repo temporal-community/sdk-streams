@@ -1,6 +1,4 @@
-//! The connections of the Store. A blocked `XREAD` or `WAIT` stops every later command on its
-//! connection. So each read that waits, and each write that waits for its replicas, takes a
-//! connection from a pool, and the calls that don't block share one.
+//! `XREAD` and `WAIT` block later commands, so each uses a separate pooled connection.
 
 use crate::{
     RedisServers,
@@ -25,13 +23,10 @@ use tokio::{
     time::Instant,
 };
 
-/// How long a read waits for a free connection before it runs its script again. So the reads over
-/// the maximum poll at this rate.
+// Reads above the connection limit must still observe new Records.
 const BUSY_POLL: Duration = Duration::from_secs(1);
 
-/// How long a read pauses after an `XREAD` that failed in a way that can pass, such as a dropped
-/// connection or a slot that migrates. Then it runs its script again, which fails the read if
-/// Redis is still down.
+// A short pause avoids a busy loop during slot migration or connection recovery.
 const RETRY_PAUSE: Duration = Duration::from_millis(100);
 
 /// A bounded set of connections, each for one call at a time.
@@ -40,7 +35,6 @@ pub(crate) struct Pool<C> {
     idle: Arc<Mutex<Vec<C>>>,
 }
 
-/// What [`Pool::lease`] gives.
 enum Leased<C> {
     /// A connection that was idle in the pool.
     Idle(IdleLease<C>),
@@ -50,8 +44,7 @@ enum Leased<C> {
     Busy,
 }
 
-/// Whether a call writes. A [`Pool`] runs only a read a second time, since Redis may have run a
-/// write whose connection failed.
+// Redis may have committed a write before its connection failed.
 pub(crate) enum CallKind {
     Write,
     Read,
@@ -65,7 +58,6 @@ pub(crate) trait PooledCall<C> {
     fn run(&self, conn: &mut C) -> impl Future<Output = RedisResult<Self::Answer>> + Send;
 }
 
-/// How a call on a connection of a [`Pool`] ended.
 pub(crate) enum Called<T> {
     Answered(T),
     /// Every connection stayed busy until the caller gave up, so the call didn't run.
@@ -75,13 +67,12 @@ pub(crate) enum Called<T> {
 impl<C> Pool<C> {
     pub(crate) fn new(size: NonZeroUsize) -> Self {
         Self {
-            permits: Arc::new(Semaphore::new(size.get())),
+            // Tokio reserves high bits for semaphore state.
+            permits: Arc::new(Semaphore::new(size.get().min(Semaphore::MAX_PERMITS))),
             idle: Arc::default(),
         }
     }
 
-    /// Takes an idle connection, or the right to open one. `give_up` ends the wait for a free
-    /// place, so the pool reads no clock.
     async fn lease(&self, give_up: impl Future<Output = ()>) -> RedisResult<Leased<C>> {
         let permit = tokio::select! {
             // A free place wins when `give_up` is ready too.
@@ -89,8 +80,7 @@ impl<C> Pool<C> {
             permit = self.permits.clone().acquire_owned() => permit,
             () = give_up => return Ok(Leased::Busy),
         };
-        // Nothing closes the semaphore, so a failed acquire is a bug of the Store. It must not
-        // look like a busy pool.
+        // A closed semaphore is a Store fault, not pool saturation.
         let permit = permit
             .map_err(|_| RedisError::from((ErrorKind::Client, "The connection pool is closed")))?;
         let permit = Permit {
@@ -104,9 +94,7 @@ impl<C> Pool<C> {
         })
     }
 
-    /// Runs `call` on a connection of the pool, which `open` makes when none is idle. A read on
-    /// a connection that was idle, and that the server has closed, gets one more try on a new
-    /// one. A write fails there, and its caller sends it again with its request id.
+    // Retry stale connections only for reads. A failed write may already be committed.
     pub(crate) async fn call<P, O>(
         &self,
         give_up: impl Future<Output = ()>,
@@ -138,24 +126,19 @@ impl<C> Pool<C> {
     }
 }
 
-/// The right to one connection of a [`Pool`], with the idle list that the connection goes back
-/// to.
 struct Permit<C> {
     idle: Arc<Mutex<Vec<C>>>,
     _permit: OwnedSemaphorePermit,
 }
 
-/// A connection of a [`Pool`], for one call. A dropped call doesn't stop its command on the
-/// server, and the next call would wait behind it. So a drop closes the connection, and only
-/// [`Lease::settle`] gives it back.
+// A dropped call may leave Redis blocked. Only `settle` can return its connection to the pool.
 struct Lease<C> {
     conn: C,
     permit: Permit<C>,
 }
 
 impl<C> Lease<C> {
-    /// Gives the connection back to the pool after an answer of Redis, which is a value or an
-    /// error with a code. Any other failure closes it.
+    // A transport error leaves the connection state unknown.
     fn settle<T>(self, result: &RedisResult<T>) {
         if !matches!(result, Err(error) if error.code().is_none()) {
             // The connection is back before its place gets free, so the next lease finds it.
@@ -164,11 +147,9 @@ impl<C> Lease<C> {
     }
 }
 
-/// A connection that was idle in a [`Pool`]. The server may have closed it since its last call,
-/// so its call can end with the right to a new connection.
+// Redis may close an idle connection before its next call.
 struct IdleLease<C>(Lease<C>);
 
-/// How a call on an [`IdleLease`] ended.
 enum Settled<C> {
     /// Redis answered, or the call failed on a connection that was alive.
     Done,
@@ -196,8 +177,6 @@ impl<C> IdleLease<C> {
     }
 }
 
-/// The connection of the calls that don't block, to one server or to a Redis Cluster. Both
-/// reconnect by themselves, and the one of a cluster sends a call to the node of a redirect.
 #[derive(Clone)]
 pub(crate) enum Shared {
     Single(ConnectionManager),
@@ -232,15 +211,11 @@ impl ConnectionLike for Shared {
     }
 }
 
-/// A range of slots of a Redis Cluster, and its primary. The reply of `CLUSTER SLOTS` has an
-/// array for each range, with its first slot, its last slot, and then its nodes, the primary
-/// first. A node is an array of its host, its port and more.
 #[derive(Debug, PartialEq)]
 struct SlotRange {
     first: u16,
     last: u16,
-    /// The host of the primary. Redis gives none, or an empty one, for a node that the client
-    /// reaches at the host that it asked.
+    // An absent host means the host that answered `CLUSTER SLOTS`.
     host: Option<String>,
     port: u16,
 }
@@ -269,12 +244,10 @@ impl FromRedisValue for SlotRange {
     }
 }
 
-/// Opens a connection of the kind that the calls share.
 async fn connect(servers: &RedisServers, response_timeout: Duration) -> RedisResult<Shared> {
     match servers {
         RedisServers::Standalone(server) => {
-            // A connect that fails must fail its call fast, since the other calls of a Store
-            // with no connection wait behind it. The next call connects again.
+            // Other Store calls wait for this connection, so fail fast and let them retry.
             let config = ConnectionManagerConfig::new()
                 .set_response_timeout(Some(response_timeout))
                 .set_number_of_retries(0);
@@ -284,8 +257,7 @@ async fn connect(servers: &RedisServers, response_timeout: Duration) -> RedisRes
         }
         RedisServers::Cluster { first, rest } => {
             let nodes = std::iter::once(first).chain(rest);
-            // The client tries a call again after `TRYAGAIN`, `CLUSTERDOWN` and `LOADING`. Its
-            // tries end before the response timeout, so a call that fails has the answer of Redis.
+            // Bound retry delays so migration errors return to the caller.
             let pause = u64::try_from(response_timeout.as_millis() / 20).unwrap_or(u64::MAX);
             let client = ClusterClient::builder(nodes.map(|node| node.info().clone()))
                 .response_timeout(response_timeout)
@@ -298,7 +270,6 @@ async fn connect(servers: &RedisServers, response_timeout: Duration) -> RedisRes
     }
 }
 
-/// A script that writes, and the `WAIT` after it.
 struct WriteAndWait<'a> {
     call: &'a ScriptCall,
     wait: Wait,
@@ -313,7 +284,6 @@ impl PooledCall<Shared> for WriteAndWait<'_> {
     }
 }
 
-/// The `XREAD` of a read that waits for an entry.
 struct Xread(Cmd);
 
 impl PooledCall<MultiplexedConnection> for Xread {
@@ -325,15 +295,11 @@ impl PooledCall<MultiplexedConnection> for Xread {
     }
 }
 
-/// The connections of one Store.
 pub(crate) struct Connections {
     shared: Shared,
     servers: RedisServers,
-    /// The connections of the writes that wait for their replicas.
     writers: Pool<Shared>,
-    /// What the Store knows of the slots of a cluster. A read that finds it empty asks again.
     slots: Mutex<Vec<SlotRange>>,
-    /// The connections of the reads that wait, for each node.
     readers: Mutex<HashMap<String, Arc<Pool<MultiplexedConnection>>>>,
     max_blocking_connections: NonZeroUsize,
     response_timeout: Duration,
@@ -352,13 +318,10 @@ impl Connections {
         })
     }
 
-    /// Returns the connection of the calls that don't block.
     pub(crate) fn shared(&self) -> Shared {
         self.shared.clone()
     }
 
-    /// Runs a script that writes, and then `WAIT` for `wait`, on a connection of its own. It
-    /// returns the answer of the script and the number of replicas that have its write.
     pub(crate) async fn write_and_wait<T: FromRedisValue>(
         &self,
         call: &ScriptCall,
@@ -378,10 +341,7 @@ impl Connections {
         }
     }
 
-    /// Waits until the Stream has an entry after `after`, or until `deadline`.
-    /// A read with no deadline waits with no end. The wait can also end earlier, and the caller
-    /// then runs its script again. It fails only for an error that a retry gets again, such as
-    /// a missing ACL permission.
+    // Transient wake-up failures must return to the read script for a fresh Stream state.
     pub(crate) async fn wait_for_entry(
         &self,
         keys: &StreamKeys,
@@ -435,14 +395,11 @@ impl Connections {
         Ok(())
     }
 
-    /// Returns the connections of the reads that wait on one node.
     fn pool(&self, node: String) -> Arc<Pool<MultiplexedConnection>> {
         let new = || Arc::new(Pool::new(self.max_blocking_connections));
         self.readers.lock().entry(node).or_insert_with(new).clone()
     }
 
-    /// Returns the node that a read of the Stream blocks on. It's the one server, or the node of
-    /// a cluster that serves the slot of the Stream's keys.
     async fn node(&self, keys: &StreamKeys) -> RedisStoreResult<ConnectionInfo> {
         let first = match &self.servers {
             RedisServers::Standalone(server) => return Ok(server.info().clone()),
@@ -466,7 +423,6 @@ impl Connections {
     }
 }
 
-/// Waits until `deadline`, or with no end when there is none.
 async fn until(deadline: Option<Instant>) {
     match deadline {
         Some(deadline) => tokio::time::sleep_until(deadline).await,
@@ -474,11 +430,8 @@ async fn until(deadline: Option<Instant>) {
     }
 }
 
-/// Returns the `XREAD` that blocks until the log has an entry after `after`, or until
-/// `deadline`.
 fn xread(keys: &StreamKeys, after: EntryId, deadline: Option<Instant>) -> Xread {
-    // `BLOCK 0` waits with no end, as a read with no deadline does. A read at its deadline
-    // blocks for 1 ms.
+    // Redis treats `BLOCK 0` as an unlimited wait, so expired deadlines need 1 ms.
     let block = deadline.map_or(0, |deadline| {
         let left = deadline.saturating_duration_since(Instant::now());
         u64::try_from(left.as_millis()).unwrap_or(u64::MAX).max(1)
@@ -565,6 +518,12 @@ mod tests {
         assert!(matches!(called, Ok(Called::Answered(9))));
         assert_eq!(*closed_until_9.1.lock(), [8, 9]);
         assert_eq!(*pool.idle.lock(), [9]);
+    }
+
+    #[test]
+    fn a_pool_accepts_the_largest_connection_limit() {
+        let pool = Pool::<()>::new(NonZeroUsize::MAX);
+        assert_eq!(pool.permits.available_permits(), Semaphore::MAX_PERMITS);
     }
 
     #[test]

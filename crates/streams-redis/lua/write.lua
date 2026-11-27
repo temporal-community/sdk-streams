@@ -1,5 +1,4 @@
--- The start of the scripts that write. A script refuses a call before its first write, since
--- Redis doesn't roll a script back.
+-- Redis does not roll back script errors, so reject known failures before writing.
 
 -- How long the meta key stays after its Stream expired, so that a call can tell an expired
 -- Stream from one that nobody created.
@@ -21,7 +20,6 @@ local function check_expiry(meta, keys, at)
   end
 end
 
--- Sets when the Stream expires, and the expiry of the meta key and of `keys`.
 local function expire_at(meta, keys, at)
   redis.call('HSET', meta, 'exp', at)
   redis.call('PEXPIREAT', meta, at + TOMBSTONE)
@@ -30,8 +28,7 @@ local function expire_at(meta, keys, at)
   end
 end
 
--- Returns whether the bytes of `a` sort below those of `b`. Lua's `<` orders two strings by the
--- locale of the server.
+-- Lua string order depends on the server locale. Attempt keys need unsigned byte order.
 local function below(a, b)
   for i = 1, math.min(#a, #b) do
     local x, y = string.byte(a, i), string.byte(b, i)
@@ -42,11 +39,9 @@ local function below(a, b)
   return #a < #b
 end
 
--- The length of an attempt key, which starts the value of a Producer.
 local ATTEMPT = 28
 
--- Writes `v` again in a call that found its work done, when a `WAIT` comes after the script.
--- `WAIT` waits for the last write of its connection, which a replica gets after the earlier one.
+-- `WAIT` covers only writes on this connection. A new write also covers the original batch.
 local function touch(meta, wait)
   if wait == '1' then
     redis.call('HSET', meta, 'v', FORMAT)

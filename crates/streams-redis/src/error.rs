@@ -1,5 +1,4 @@
-//! The errors of the Redis Store. At the `StreamStore` trait each one becomes the error of its
-//! operation, with the reason that a caller acts on.
+//! Error reasons determine whether a caller retries or stops.
 
 use redis::{ErrorKind, ParsingError, RedisError, ServerErrorKind};
 use temporalio_streams::{StreamError, WireReason, proto::StreamErrorReason};
@@ -35,17 +34,7 @@ impl RedisStoreError {
     }
 }
 
-/// Returns the error of an operation for an error of the Store.
-///
-/// - A script refuses a call with the name of a [`StreamErrorReason`] as its code, and the error
-///   has that reason and the script's message. A reason that the operation can't return means
-///   that the script is not one of this Store, so it's `STORE_CORRUPT`.
-/// - A key of another type, a script that fails at one of its steps and an answer that the
-///   Store can't convert are `STORE_CORRUPT`, since a retry reads the same value.
-/// - Any other failure of Redis is `STORE_UNAVAILABLE` with the text of Redis. That includes a
-///   wrong password, a missing ACL permission, a server that is too old and a server that is no
-///   Redis. The request is fine, and the call succeeds once an operator fixes the setup, as it
-///   does after an outage.
+// Retrying cannot repair stored data. Setup failures can recover after an operator corrects them.
 impl<R: WireReason> From<RedisStoreError> for StreamError<R> {
     fn from(error: RedisStoreError) -> Self {
         let error = match error {
@@ -59,8 +48,7 @@ impl<R: WireReason> From<RedisStoreError> for StreamError<R> {
             return Self::from_wire(i32::from(reason), detail);
         }
         match error.kind() {
-            // A failure inside a script keeps its code, such as `OOM`. So a script that stops with
-            // the plain `ERR` failed at one of its own steps, unless Redis stopped it.
+            // Redis preserves specific error codes. Plain script errors need a separate cause check.
             ErrorKind::Server(ServerErrorKind::ResponseError)
                 if detail.contains("@user_script") && !stopped_by_redis(detail) =>
             {
@@ -76,9 +64,7 @@ impl<R: WireReason> From<RedisStoreError> for StreamError<R> {
     }
 }
 
-/// Returns whether Redis stopped a script for a reason that isn't in what the Stream holds. That
-/// is a Redis user that lacks a permission, whose text changed after Redis 7.0, and an operator
-/// who sent `SCRIPT KILL`. Redis has no code for either.
+// Redis has no distinct code for ACL failures or `SCRIPT KILL` inside a script.
 fn stopped_by_redis(detail: &str) -> bool {
     [
         "ACL failure in script",
@@ -89,7 +75,6 @@ fn stopped_by_redis(detail: &str) -> bool {
     .any(|text| detail.contains(text))
 }
 
-/// Returns the message of a Redis failure that is no answer of a script.
 fn outage(error: &RedisError) -> String {
     match error.kind() {
         // Redis 7.0 added `EVALSHA_RO` and the flags of a script, which the Store's reads need.
@@ -100,13 +85,11 @@ fn outage(error: &RedisError) -> String {
         {
             format!("Redis doesn't know a command of the Store, which needs Redis 7.0: {error}")
         }
-        // The Store converts the answer of a script itself, so the library failed on bytes that
-        // are no reply of Redis.
+        // Script results are decoded separately, so this is a protocol failure.
         ErrorKind::Parse => format!(
             "The server didn't answer as Redis does, so its URL may be of another service: {error}"
         ),
-        // The cluster connection goes to the node of a redirect, so only a Store for one server
-        // gets one.
+        // Cluster connections handle redirects, so this indicates standalone configuration.
         ErrorKind::Server(ServerErrorKind::Moved | ServerErrorKind::Ask) => format!(
             "A node of a Redis Cluster redirected the call, so the Store needs \
              `RedisServers::Cluster`: {error}"

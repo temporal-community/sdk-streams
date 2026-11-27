@@ -2308,6 +2308,7 @@ dependencies = [
  "http",
  "pbjson",
  "pbjson-build",
+ "percent-encoding",
  "prost",
  "prost-wkt-types",
  "serde",

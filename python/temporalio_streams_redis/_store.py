@@ -21,12 +21,8 @@ from temporalio_streams_redis._native import RedisStore
 class RedisStreamStore(temporalio.client.StreamStore):
     """A Stream Store that keeps its Streams in Redis 7.0 or later.
 
-    The Store runs in this package's own native module, on threads of its own. It
-    connects at its first call, so creating it needs no server. Every call goes
-    through the Stream runtime of Temporal's Rust crates, which checks the request
-    before Redis gets it and the response on the way back. So a call of client or
-    Activity code gets the same checks as a call of Workflow code, which SDK Core
-    checks a second time.
+    The Store connects at its first call. Shared Rust validation gives client,
+    Activity and Workflow calls the same request and response checks.
 
     A failed call raises :py:class:`temporalio.exceptions.StreamError`. A failure
     of Redis or of the Store's setup, such as a wrong password, has the reason
@@ -59,8 +55,8 @@ class RedisStreamStore(temporalio.client.StreamStore):
     ) -> None:
         """Create a Redis Store.
 
-        An option that is ``None`` has its default. A zero or an empty value
-        raises ``ValueError``, and no option has an upper bound.
+        ``None`` uses the default. Counts and durations must be positive.
+        ``retention`` and ``wait_timeout`` must be at least 1 ms.
 
         Args:
             url: A ``redis://`` or ``rediss://`` URL, or the URLs of some nodes of
@@ -89,7 +85,8 @@ class RedisStreamStore(temporalio.client.StreamStore):
             max_blocking_connections: Maximum number of calls that block on Redis
                 at a time, each on its own connection, 256 by default. It holds
                 for the reads of one Redis node that wait for a Record, and again
-                for the writes that wait for their replicas.
+                for the writes that wait for their replicas. Values above Tokio's
+                permit limit use that limit.
             name: The name that a ``StreamConfig`` registers the Store under.
         """
         self._name = name

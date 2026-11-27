@@ -3,6 +3,7 @@
 import asyncio
 import os
 import subprocess
+import sys
 import time
 import uuid
 from datetime import timedelta
@@ -267,3 +268,11 @@ def test_the_urls_fit_the_kind_of_servers():
         RedisStreamStore(["redis://127.0.0.1:1", "redis://127.0.0.1:2"])
     with pytest.raises(ValueError, match="one URL or more"):
         RedisStreamStore([], cluster=True)
+
+
+async def test_a_large_connection_limit_does_not_panic(redis: Redis):
+    store = new_store(redis, max_blocking_connections=sys.maxsize)
+    response = await store.create_stream(
+        CreateStreamRequest(stream_id="large-limit"), request_id="create"
+    )
+    assert response.created

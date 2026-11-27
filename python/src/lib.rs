@@ -6,14 +6,7 @@
     clippy::cast_possible_truncation
 )]
 
-//! The native module of the Python package of the Redis Store. It runs the Store of the
-//! `temporalio-streams-redis` crate behind a [`StreamRuntime`], on Tokio threads of its own, and
-//! Python calls each operation with the encoded request. A create and an append also take their
-//! request id, which is no field of the request.
-//!
-//! Python sends the requests of a Store, which have only the Stream id, and gets the responses
-//! of a Store. The runtime takes the requests of an SDK, so the module gives it a ref with that
-//! id and no Store name.
+//! Python calls use the shared Stream runtime so request checks match Workflow calls.
 
 use prost::Message;
 use pyo3::{
@@ -41,14 +34,11 @@ use temporalio_streams_redis::{
 };
 use tokio::runtime::{Builder, Runtime};
 
-/// The Tokio runtime of every call of the process. It stays up until the process ends.
 static TOKIO: OnceLock<Runtime> = OnceLock::new();
 
-/// The id of the process that started [`TOKIO`], or why it didn't start.
 static STARTED_BY: OnceLock<Result<u32, String>> = OnceLock::new();
 
-/// Starts the Tokio runtime at the first call, and checks that this process started it. A child
-/// of a fork has the runtime with none of its threads, so a call there would never answer.
+// A forked child has no runtime threads, so using the inherited runtime would hang.
 fn start_tokio() -> PyResult<()> {
     let started_by = STARTED_BY.get_or_init(|| {
         // The calls wait for Redis and do little work, so two threads serve many of them.
@@ -76,7 +66,6 @@ fn start_tokio() -> PyResult<()> {
     }
 }
 
-/// Returns the `temporalio.exceptions.StreamError` of a failed call.
 fn stream_error<R: Into<StreamErrorReason>>(error: StreamError<R>) -> PyErr {
     let reason: StreamErrorReason = error.reason.into();
     Python::attach(|py| {
@@ -96,8 +85,7 @@ fn invalid(error: RedisStoreError) -> PyErr {
     PyValueError::new_err(error.to_string())
 }
 
-/// The options of a Store, as the Python class gives them in a dict. An option that is `None`
-/// keeps the default of the crate.
+// `None` preserves the crate default so both APIs use the same values.
 #[derive(FromPyObject)]
 #[pyo3(from_item_all)]
 struct Options {
@@ -174,8 +162,6 @@ impl TryFrom<Options> for RedisStoreOptions {
     }
 }
 
-/// The Redis Store behind the runtime of `temporalio-streams`, which checks every request
-/// before the Store gets it and every response on the way back.
 #[pyclass(frozen)]
 struct RedisStore {
     runtime: Arc<StreamRuntime>,
@@ -183,13 +169,10 @@ struct RedisStore {
 
 #[pymethods]
 impl RedisStore {
-    /// Checks the options and builds the Store, which connects at its first call. A bad option
-    /// raises `ValueError`.
     #[new]
     fn new(options: Options) -> PyResult<Self> {
         let store = temporalio_streams_redis::RedisStore::new(options.try_into()?);
-        // The limits of a batch are settings of the SDK's Stream config, which the module doesn't
-        // know. The SDK checks each append against them before the Store gets it.
+        // The SDK checks its configured batch limits before calling this bridge.
         let limits = StoreLimits::UNBOUNDED;
         Ok(Self {
             runtime: Arc::new(StreamRuntime::new(
@@ -271,8 +254,7 @@ impl RedisStore {
     }
 }
 
-/// Returns the ref that the runtime takes for a Stream id. The Store gets only the id, so the ref
-/// has no Store name.
+// Routing is complete, so the runtime reference needs no Store name.
 fn stream_ref(stream_id: String) -> Option<sdk::StreamRef> {
     Some(sdk::StreamRef {
         id: stream_id,
@@ -281,9 +263,7 @@ fn stream_ref(stream_id: String) -> Option<sdk::StreamRef> {
 }
 
 impl RedisStore {
-    /// Runs one operation on an encoded request, and returns an awaitable of the encoded
-    /// response. A failed call raises `temporalio.exceptions.StreamError`. A cancel of the
-    /// awaitable drops the call, which closes the connection of a read that waits.
+    // Cancelling this future drops the Store call and releases its blocked connection.
     fn call<'py, Request, Response, R, Operation, Call>(
         &self,
         py: Python<'py>,
@@ -303,7 +283,7 @@ impl RedisStore {
         })?;
         let call = operation(self.runtime.clone(), request);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            // The response is encoded before the thread takes the GIL.
+            // Encode outside the GIL so Python can continue while Rust copies the response.
             let response = call.await.map_err(stream_error)?.encode_to_vec();
             Ok(Python::attach(|py| PyBytes::new(py, &response).unbind()))
         })

@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# Patches `temporalio-streams` and `temporalio-common` to a copy of sdk-rust, until
-# `temporalio-streams` is in an sdk-rust release. `SDK_RUST_PATH` takes a local checkout. Without
-# it, `SDK_RUST_GIT` and `SDK_RUST_REF` pick a branch of a git repo.
+# The unreleased Streams crate needs a local `SDK_RUST_PATH` or a Git source.
+# `SDK_RUST_GIT` and `SDK_RUST_REF` select that source.
 set -euo pipefail
 
 if [ -n "${SDK_RUST_PATH:-}" ]; then

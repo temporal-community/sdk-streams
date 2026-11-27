@@ -8,13 +8,15 @@ later. The package has its own native module, which runs the Redis Store of the
 
 ## Install
 
-The package has no release yet. Build it from a checkout of this repo, with Rust installed.
+The package is unreleased. Install Rust and `protoc`, then run these commands from the repository root.
 
 ```sh
+SDK_RUST_REF=moe/streams-crate-types scripts/patch-sdk-rust.sh
+pip install "temporalio @ git+https://github.com/temporalio/sdk-python@moe/streams-api"
 pip install ./python
 ```
 
-It needs a `temporalio` that has Streams.
+The SDK branch and Store must use compatible `temporalio-streams` types.
 
 ## Use
 
@@ -32,8 +34,8 @@ A Worker of this client uses the same Store for its Activities and Workflows.
 
 ## Options
 
-`None` takes the default. A zero or an empty value raises `ValueError`, and no option has an
-upper bound.
+`None` uses the default. Counts and durations must be positive.
+`retention` and `wait_timeout` must be at least 1 ms.
 
 | Option | Default | Use |
 |---|---|---|
@@ -74,7 +76,8 @@ code, so those calls are checked twice.
 
 ```sh
 cd python
-uv venv && uv pip install --group dev <a temporalio that has Streams>
+uv venv
+uv pip install --group dev "temporalio @ git+https://github.com/temporalio/sdk-python@moe/streams-api"
 uv run --no-sync maturin develop
 uv run --no-sync pytest
 ```

@@ -1,5 +1,4 @@
-//! The Lua scripts of the Store, with the arguments and the answer of each one. The docs at the
-//! top of a script give the order of its arguments and what it returns.
+//! Script headers define argument and response order for the Rust conversions.
 
 use crate::{
     Fence,
@@ -32,25 +31,21 @@ fn write_script(body: &str) -> Script {
     Script::new(&[STATE, WRITE, body].concat())
 }
 
-/// Returns a script that `EVALSHA_RO` runs, so a Redis user with only read access to the keys can
-/// call it.
+// Read-only scripts permit a Redis user with read-only key access.
 fn read_script(body: &str) -> Script {
     Script::new(&["#!lua flags=no-writes\n", STATE, body].concat())
 }
 
-/// A call of a script, with its keys and arguments.
 pub(crate) struct ScriptCall {
     script: &'static Script,
     cmd: Cmd,
 }
 
 impl ScriptCall {
-    /// Returns a call of a script that writes.
     pub(crate) fn write(script: &'static Script, keys: &[String], args: impl ToRedisArgs) -> Self {
         Self::new("EVALSHA", script, keys, args)
     }
 
-    /// Returns a call of a script that only reads.
     pub(crate) fn read(script: &'static Script, keys: &[String], args: impl ToRedisArgs) -> Self {
         Self::new("EVALSHA_RO", script, keys, args)
     }
@@ -69,11 +64,8 @@ impl ScriptCall {
         Self { script, cmd }
     }
 
-    /// Runs the call. Redis forgets its scripts when it restarts, so a call that finds no script
-    /// loads it and runs again. The first try wrote nothing, since the script didn't run.
-    ///
-    /// The caller converts the answer itself. From the library, a failed conversion has the
-    /// error kind of bytes that are no reply of Redis, which is an outage.
+    // `NOSCRIPT` means nothing ran, so loading and retrying cannot duplicate a write.
+    // The caller decodes the result to distinguish corrupt data from protocol failures.
     pub(crate) async fn run(&self, conn: &mut impl ConnectionLike) -> RedisResult<Value> {
         match self.cmd.query_async(conn).await {
             Err(error) if error.kind() == ErrorKind::Server(ServerErrorKind::NoScript) => {
@@ -84,9 +76,7 @@ impl ScriptCall {
         }
     }
 
-    /// Runs the call and then `WAIT`, and returns the answer of the script and the number of
-    /// replicas that have its write. Both go in one pipeline, since `WAIT` covers the last write
-    /// of its own connection, and a command of another call could come between them.
+    // `WAIT` covers this connection's last write. Pipeline both commands to prevent interleaving.
     pub(crate) async fn run_and_wait(
         &self,
         conn: &mut impl ConnectionLike,
@@ -118,7 +108,6 @@ impl ToRedisArgs for Fence {
     }
 }
 
-/// What a create does with a Stream that another create made.
 pub(crate) enum Existing {
     Fail,
     Use,
@@ -130,8 +119,7 @@ impl ToRedisArgs for Existing {
     }
 }
 
-/// Whether a `WAIT` comes after a script that writes. A call that finds its work done then
-/// writes once more, since `WAIT` waits only for a write of its own connection.
+// A resend must write again for `WAIT` to cover its original batch on this connection.
 #[derive(Clone, Copy)]
 pub(crate) enum AfterWrite {
     Answer,
@@ -150,14 +138,12 @@ impl ToRedisArgs for AfterWrite {
     }
 }
 
-/// The arguments of a script that takes none.
 pub(crate) struct NoArgs;
 
 impl ToRedisArgs for NoArgs {
     fn write_redis_args<W: ?Sized + RedisWrite>(&self, _: &mut W) {}
 }
 
-/// The arguments of `create.lua`.
 pub(crate) struct CreateArgs {
     pub(crate) request: RequestKey,
     pub(crate) retention: Millis,
@@ -174,7 +160,6 @@ impl ToRedisArgs for CreateArgs {
     }
 }
 
-/// The arguments of `append.lua`.
 pub(crate) struct AppendArgs<'a> {
     pub(crate) field: &'a [u8],
     pub(crate) attempt: AttemptKey,
@@ -203,7 +188,6 @@ impl ToRedisArgs for AppendArgs<'_> {
     }
 }
 
-/// The arguments of `read.lua`.
 pub(crate) struct ReadArgs {
     pub(crate) from: EntryId,
     pub(crate) max_records: usize,
@@ -218,7 +202,6 @@ impl ToRedisArgs for ReadArgs {
     }
 }
 
-/// The answer of `create.lua`.
 pub(crate) enum Created {
     /// This create made the Stream, or it's a retry of the create that did.
     Made,
@@ -236,7 +219,6 @@ impl FromRedisValue for Created {
     }
 }
 
-/// The answer of `append.lua`, which has the ids of the first and the last Record of the batch.
 pub(crate) struct Appended {
     pub(crate) first: EntryId,
     pub(crate) last: EntryId,
@@ -253,7 +235,6 @@ impl FromRedisValue for Appended {
     }
 }
 
-/// An entry of the log, which is one Record.
 pub(crate) struct LogEntry {
     pub(crate) id: EntryId,
     /// The Producer of the batch, which only the first entry of a batch has.
@@ -284,7 +265,6 @@ fn decode<M: Message + Default>(bytes: &[u8]) -> Result<M, ParsingError> {
     M::decode(bytes).map_err(|error| format!("A stored message doesn't decode: {error}").into())
 }
 
-/// The answer of `read.lua`.
 pub(crate) struct Page {
     pub(crate) entries: Vec<LogEntry>,
     /// The Producer of the first entry, when its batch starts before the page.

@@ -1,5 +1,3 @@
-//! The options of the Redis Store. Each type holds only values that the Store can use.
-
 use crate::error::{RedisStoreError, RedisStoreResult};
 use redis::{ConnectionAddr, ConnectionInfo, IntoConnectionInfo, RedisWrite, ToRedisArgs};
 use std::{fmt, num::NonZeroUsize, str::FromStr, time::Duration};
@@ -60,7 +58,6 @@ impl ClusterNodeUrl {
     /// that Redis gives no host for is at the host of this one.
     pub(crate) fn node(&self, host: Option<String>, port: u16) -> ConnectionInfo {
         let mut addr = self.info().addr().clone();
-        // The address is one of these two, as `try_from` checked.
         if let ConnectionAddr::Tcp(at, at_port)
         | ConnectionAddr::TcpTls {
             host: at,
@@ -120,7 +117,7 @@ pub enum RedisServers {
 pub struct KeyPrefix(String);
 
 impl KeyPrefix {
-    /// Returns the prefix as the keys have it.
+    /// The prefix used in Redis keys.
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -194,7 +191,7 @@ const DEFAULT_BLOCKING_CONNECTIONS: NonZeroUsize = match NonZeroUsize::new(256) 
     None => panic!("the default is above zero"),
 };
 
-/// The options of a [`RedisStore`](crate::RedisStore). No option has an upper bound.
+/// Configuration for a [`RedisStore`](crate::RedisStore).
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct RedisStoreOptions {
@@ -214,15 +211,13 @@ pub struct RedisStoreOptions {
     pub resend_window: NonZeroUsize,
     /// How long a call waits for Redis to respond, 5 seconds by default and more than zero.
     pub response_timeout: Duration,
-    /// The replicas that each create and append waits for. It's `None` by default, and a
-    /// write then succeeds once its Redis node has it. Redis replicates after it answers, so a
-    /// failover can lose such a write. With a wait, a write that too few replicas have in time
-    /// fails with `STORE_UNAVAILABLE`, and a retry with its request id writes nothing again.
+    /// Replicas required before a create or append succeeds. Defaults to `None`.
+    /// A timeout returns `STORE_UNAVAILABLE` after the write. Retry with the same request id
+    /// within the resend window to avoid another write.
     pub wait: Option<WaitForReplicas>,
-    /// Maximum number of calls that block on Redis at a time, 256 by default. A read that waits
-    /// for a Record and a write that waits for its replicas each have a connection of their
-    /// own. The maximum holds for the reads of one node, and again for the writes. A read over
-    /// it polls once a second, and a write waits for a free connection.
+    /// Maximum blocking connections, 256 by default. Reads have one pool per node.
+    /// Writes that use `WAIT` have a separate pool. Extra reads poll once per second.
+    /// Extra writes wait for a connection. Values above Tokio's permit limit use that limit.
     pub max_blocking_connections: NonZeroUsize,
 }
 
@@ -256,7 +251,6 @@ impl Millis {
     }
 }
 
-/// The error of a time below 1 ms, which a [`Millis`] can't hold.
 pub(crate) struct BelowOneMs;
 
 impl TryFrom<Duration> for Millis {
@@ -277,14 +271,12 @@ impl ToRedisArgs for Millis {
     }
 }
 
-/// The replicas that a write waits for, as `WAIT` takes them.
 #[derive(Clone, Copy)]
 pub(crate) struct Wait {
     pub(crate) replicas: NonZeroUsize,
     pub(crate) timeout: Millis,
 }
 
-/// The options of a Store in the form that its calls use.
 pub(crate) struct Settings {
     pub(crate) servers: RedisServers,
     pub(crate) key_prefix: KeyPrefix,

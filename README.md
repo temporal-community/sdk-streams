@@ -6,8 +6,7 @@ Experimental.
 `StreamStore` trait of `temporalio-streams`, which is in
 [sdk-rust](https://github.com/temporalio/sdk-rust). It needs Redis 7.0 or later.
 
-`python/` is the package of the Store for the Temporal Python SDK, `temporalio-streams-redis` on
-PyPI, with `RedisStreamStore`. Its own README says how to use it.
+The unreleased [Python package](python/README.md) exposes `RedisStreamStore`.
 
 ## Using the Store
 
@@ -36,15 +35,15 @@ A URL starts with `redis://` or `rediss://` and has the credentials. `rediss://`
 TLS and verifies the server against the root certificates of the system. A private CA works only
 through the `SSL_CERT_FILE` variable, and the Store can't send a client certificate.
 
-No option has an upper bound. A count is a `NonZeroUsize`, and a time below 1 ms is refused. A
-Stream keeps the `retention` of the Store that created it.
-`crates/streams-redis/docs/redis.md` says what an operator of the Redis sets up, and what the
-Store keeps there.
+Counts must be positive. `retention` and `wait.timeout` must be at least 1 ms.
+`response_timeout` must be positive. A Stream keeps its original retention.
+See the [operator guide](crates/streams-redis/docs/redis.md) for access, persistence and storage.
 
 ## Building
 
-- `temporalio-streams` isn't on crates.io yet, so run `scripts/patch-sdk-rust.sh` before you build.
-  `SDK_RUST_PATH` points it at a local checkout of sdk-rust.
+- `temporalio-streams` is unreleased. Run
+  `SDK_RUST_REF=moe/streams-crate-types scripts/patch-sdk-rust.sh` before building.
+  Use `SDK_RUST_PATH` for a local `sdk-rust` checkout.
 - A bridge that builds sdk-rust from its `sdk-core` submodule patches `temporalio-common` and
   `temporalio-streams` to those copies in `[patch.crates-io]`, so that each type exists once.
 - A FIPS build uses `default-features = false` and the `fips` feature. The default feature links

@@ -1,8 +1,4 @@
-"""The Redis Store under SDK Core, in a Worker of a local Temporal server.
-
-Workflow code appends and reads through Core and the bridge, and its Activity appends
-through its client, so both paths of the SDK write one Stream.
-"""
+"""Exercise both Core and client Store paths against one Stream."""
 
 import asyncio
 import uuid
@@ -23,13 +19,11 @@ from temporalio.worker import Replayer, Worker
 
 from temporalio_streams_redis import RedisStreamStore
 
-# The Records that the Workflow and its Activity append.
 RECORDS = 5
 
 
 @activity.defn
 async def append_in_activity(stream_id: str) -> None:
-    # An Activity calls the Store from its client, with no Core in between.
     stream = activity.client().get_stream(StreamRef[str](id=stream_id))
     await stream.append("activity 1", "activity 2")
 
@@ -47,8 +41,7 @@ class AppendingWorkflow:
             start_to_close_timeout=timedelta(seconds=30),
         )
         await stream.append("workflow 2", "workflow 3")
-        # History keeps a digest of what this read gave, which a replay checks. A read
-        # waits for more Records, so it stops at the five that the Stream has.
+        # Streams have no close operation, so stop after the expected Records.
         bodies: list[str] = []
         async for record in stream.read():
             bodies.append(record.body)
@@ -58,7 +51,6 @@ class AppendingWorkflow:
 
 
 def writer(record: StreamRecord[str]) -> tuple[str, int]:
-    """Return the writer of a Record, and the attempt that wrote it."""
     assert record.producer
     kind = record.producer.kind
     if isinstance(kind, ProducerKindWorkflow):
@@ -98,8 +90,7 @@ async def test_a_workflow_writes_through_core_to_redis(redis: Redis):
                 records.extend(page.records)
                 if len(records) >= RECORDS:
                     break
-        # The SDK sends the appends of Workflow code with no attempt, and Core adds
-        # the attempt of the Workflow Task.
+        # Workflow code cannot select its attempt, so Core must attach it.
         run = handle.result_run_id
         by_workflow, by_activity = (run, 1), (f"{run} append", 1)
         assert [(record.body, writer(record)) for record in records] == [

@@ -1,5 +1,4 @@
-//! The Redis Store. One Lua script runs each operation, so its checks and its write are one
-//! atomic step. `docs/redis.md` describes what the scripts store.
+//! Lua scripts prevent interleaved checks and writes. Redis does not roll back script errors.
 
 use crate::{
     RedisStoreOptions,
@@ -28,18 +27,15 @@ use temporalio_streams::{
 };
 use tokio::{sync::OnceCell, time::Instant};
 
-/// The number of Records in a page of a read that sets no `max_records`.
 const PAGE_RECORDS: usize = 1000;
 
-/// Maximum size of the Records in a page of a read that sets no `max_bytes`, which is 4 MiB. It's
-/// the default size of a batch in an SDK's Stream config, so such a page is no larger than that.
+// Match the SDK default batch size. One larger Record can exceed this page target.
 const PAGE_BYTES: usize = 4 * 1024 * 1024;
 
 /// A Stream Store that keeps its Streams in Redis 7.0 or later.
 ///
-/// The Store expects the requests that [`StreamRuntime`](temporalio_streams::StreamRuntime)
-/// passes on, so wrap it in one. The runtime takes the limits of a batch, which are settings of
-/// the Stream config of the SDK that calls the Store. The Store has none of its own.
+/// Wrap it in [`StreamRuntime`](temporalio_streams::StreamRuntime) for request validation.
+/// Batch limits come from the calling SDK configuration.
 pub struct RedisStore {
     settings: Settings,
     conns: OnceCell<Connections>,
@@ -55,14 +51,12 @@ impl RedisStore {
         })
     }
 
-    /// Returns the connections, which the first call opens. A failed connect is tried again at
-    /// the next call, so a Store that starts before its Redis works once Redis is up.
+    // A failed connection must not prevent later calls from connecting.
     async fn conns(&self) -> RedisStoreResult<&Connections> {
         let open = || Connections::open(&self.settings);
         Ok(self.conns.get_or_try_init(open).await?)
     }
 
-    /// Returns the keys of the Stream `stream_id`.
     fn keys(&self, stream_id: &str) -> RedisStoreResult<StreamKeys> {
         // The runtime refuses an empty id, so only a direct call of the Store fails here.
         if stream_id.is_empty() {
@@ -78,8 +72,6 @@ impl RedisStore {
         Ok(T::from_redis_value(call.run(&mut conn).await?)?)
     }
 
-    /// Runs a script that writes. With the `wait` option, the call succeeds only once enough
-    /// replicas have the write.
     async fn write<T: FromRedisValue>(&self, call: &ScriptCall) -> RedisStoreResult<T> {
         let Some(wait) = self.settings.wait else {
             return self.run(call).await;
@@ -194,8 +186,7 @@ impl RedisStore {
             if !page.records.is_empty() || late {
                 return Ok(page);
             }
-            // No Record comes after the expiry, so the wait ends there and the next script answers
-            // `EXPIRED`. Redis gives the time that is left, so the clock of this host can differ.
+            // Expiry ends the wait. Use Redis elapsed time because the host clocks can differ.
             let expiry = expires_in.and_then(|left| Instant::now().checked_add(left));
             let until = match (deadline, expiry) {
                 (Some(deadline), Some(expiry)) => Some(deadline.min(expiry)),
@@ -219,12 +210,7 @@ impl RedisStore {
     }
 }
 
-/// Builds the page of a read that started after `from`. The entries of a batch have its Producer
-/// only on the first one, so every later Record gets the Producer of the entry before it.
-///
-/// The page stops before the Record that takes it over `max_bytes`, unless that is the first
-/// one. The script only stops near that limit, since it can't measure an encoded Record. A
-/// Record counts as the page encodes it, which is how the runtime counts too.
+// Lua cannot measure encoded Records. Apply the exact byte limit after restoring each Producer.
 fn page(page: Page, from_offset: &[u8], max_bytes: usize) -> ReadRecordsResponse {
     let mut producer = page.earlier;
     let mut records = Vec::with_capacity(page.entries.len());
