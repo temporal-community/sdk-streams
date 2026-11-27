@@ -237,7 +237,7 @@ impl FromRedisValue for Appended {
 
 pub(crate) struct LogEntry {
     pub(crate) id: EntryId,
-    /// The Producer of the batch, which only the first entry of a batch has.
+    // Later entries reuse the first entry's Producer to reduce storage.
     pub(crate) producer: Option<Producer>,
     pub(crate) body: Payload,
 }
@@ -267,9 +267,9 @@ fn decode<M: Message + Default>(bytes: &[u8]) -> Result<M, ParsingError> {
 
 pub(crate) struct Page {
     pub(crate) entries: Vec<LogEntry>,
-    /// The Producer of the first entry, when its batch starts before the page.
+    // A page can start inside a batch whose Producer is in an earlier entry.
     pub(crate) earlier: Option<Producer>,
-    /// The time until the Stream expires, by the clock of Redis.
+    // Redis and SDK clocks can differ, so return the remaining time.
     pub(crate) expires_in: Option<Duration>,
 }
 

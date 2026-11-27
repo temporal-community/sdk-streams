@@ -10,7 +10,7 @@ pub(crate) struct EntryId {
 }
 
 impl EntryId {
-    /// The id before the first entry. Redis gives it to no entry.
+    // Redis reserves `0-0`, so it represents the position before any Record.
     pub(crate) const ZERO: Self = Self { ms: 0, seq: 0 };
 
     pub(crate) fn offset(self) -> Vec<u8> {

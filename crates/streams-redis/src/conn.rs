@@ -29,18 +29,14 @@ const BUSY_POLL: Duration = Duration::from_secs(1);
 // A short pause avoids a busy loop during slot migration or connection recovery.
 const RETRY_PAUSE: Duration = Duration::from_millis(100);
 
-/// A bounded set of connections, each for one call at a time.
 pub(crate) struct Pool<C> {
     permits: Arc<Semaphore>,
     idle: Arc<Mutex<Vec<C>>>,
 }
 
 enum Leased<C> {
-    /// A connection that was idle in the pool.
     Idle(IdleLease<C>),
-    /// The right to open a connection, since none was idle.
     Free(Permit<C>),
-    /// Every connection stayed busy until the caller gave up.
     Busy,
 }
 
@@ -50,7 +46,6 @@ pub(crate) enum CallKind {
     Read,
 }
 
-/// A call that a [`Pool`] runs on one of its connections.
 pub(crate) trait PooledCall<C> {
     type Answer;
     const KIND: CallKind;
@@ -60,7 +55,6 @@ pub(crate) trait PooledCall<C> {
 
 pub(crate) enum Called<T> {
     Answered(T),
-    /// Every connection stayed busy until the caller gave up, so the call didn't run.
     Busy,
 }
 
@@ -151,10 +145,7 @@ impl<C> Lease<C> {
 struct IdleLease<C>(Lease<C>);
 
 enum Settled<C> {
-    /// Redis answered, or the call failed on a connection that was alive.
     Done,
-    /// The server had closed the connection, and likely the other idle ones too, so the pool
-    /// dropped them all.
     Stale(Permit<C>),
 }
 
@@ -456,8 +447,7 @@ mod tests {
         io,
     };
 
-    /// A call on a connection that is a number. It answers with what `answer` gives for the
-    /// connection, and keeps the connections that it ran on.
+    // Numeric connections keep pool tests independent of Redis.
     struct Fake<F>(F, Mutex<Vec<u8>>);
 
     impl<F: Fn(u8) -> RedisResult<u8> + Sync> PooledCall<u8> for Fake<F> {
