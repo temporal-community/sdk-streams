@@ -215,7 +215,7 @@ succeed once the setup is right.
 ## Access
 
 Redis checks the ACL of a script call and of each command it runs. Before creating a Stream or
-writing a batch, the Store checks write permissions on each affected key. A denied command leaves
+writing a batch, the Store checks write permissions on each affected key. A write denied by this preflight leaves
 the batch, resend state and expiry unchanged. A Redis user
 has one role or both. `tests/store/acl.rs` runs each role with exactly these lists.
 
