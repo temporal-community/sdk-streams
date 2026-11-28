@@ -1,13 +1,19 @@
 #!/usr/bin/env bash
-# Patches `temporalio-streams` and `temporalio-common` to an sdk-rust git ref, for CI until
-# `temporalio-streams` is in an sdk-rust release. `SDK_RUST_REF` picks the branch of the review
-# stack on the sdk-rust fork.
+# The unreleased Streams crate needs a local `SDK_RUST_PATH` or a Git source.
+# `SDK_RUST_GIT` and `SDK_RUST_REF` select that source.
 set -euo pipefail
 
-ref=${SDK_RUST_REF:-moe/brook/review/streams-close-item}
+if [ -n "${SDK_RUST_PATH:-}" ]; then
+  common="path = \"$SDK_RUST_PATH/crates/common\""
+  streams="path = \"$SDK_RUST_PATH/crates/streams\""
+else
+  git=${SDK_RUST_GIT:-https://github.com/temporalio/sdk-rust}
+  common="git = \"$git\", branch = \"${SDK_RUST_REF:-main}\""
+  streams=$common
+fi
 mkdir -p .cargo
 cat >.cargo/config.toml <<TOML
 [patch.crates-io]
-temporalio-common = { git = "https://github.com/moetemp/sdk-rust", branch = "$ref" }
-temporalio-streams = { git = "https://github.com/moetemp/sdk-rust", branch = "$ref" }
+temporalio-common = { $common }
+temporalio-streams = { $streams }
 TOML

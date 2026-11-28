@@ -2,35 +2,51 @@
 
 Experimental.
 
-`temporalio-streams-redis` is the Redis Store of the Temporal Stream runtime. The runtime itself,
-`temporalio-streams`, is in [sdk-rust](https://github.com/temporalio/sdk-rust). A lang bridge builds
-the runtime with `RedisStreamRuntime`, which connects on its first call that needs Redis.
+`temporalio-streams-redis` is the Redis Store of Temporal Streams. `RedisStore` implements the
+`StreamStore` trait of `temporalio-streams`, which is in
+[sdk-rust](https://github.com/temporalio/sdk-rust). It needs Redis 7.0 or later.
 
-## Connecting
+The unreleased [Python package](python/README.md) exposes `RedisStreamStore`.
 
-Lang sends the options as a `RedisStreamConfig`, from
-`crates/streams-redis/protos/temporal/sdk/streams/v1/redis.proto`. Rust code can call
-`RedisStore::connect` with `RedisStoreOptions`. The Store needs Redis 7.0 or later. The table
-lists the main config fields. `RedisStoreOptions` has the same ones, except that
-`topology: Topology` replaces `urls` and `cluster`, and `wait: Option<WaitOptions>` replaces the two
-`wait_` fields.
+Use a fresh `key_prefix` when replacing the namespace-based Store. See the
+[storage format](crates/streams-redis/docs/redis.md#keys) before using an existing Redis deployment.
+
+## Using the Store
+
+```rust
+let servers = RedisServers::Standalone("redis://localhost:6379".parse()?);
+let store = RedisStore::new(RedisStoreOptions::new(servers))?;
+let runtime = StreamRuntime::new(Arc::new(store), StoreLimits::default());
+```
+
+The Store connects at its first call. Call it through a `StreamRuntime`, which checks each request
+before the Store gets it. The runtime takes the limits of a batch, which are settings of the Stream
+config of the SDK that calls the Store. The Store has none.
 
 | Option | Default | Use |
 |---|---|---|
-| `urls` | | One `redis://` or `rediss://` URL, or the seeds of a cluster |
-| `cluster` | `false` | Set for a Redis Cluster |
+| `servers` | | One server, or some nodes of a Redis Cluster, each from its URL |
 | `key_prefix` | `temporal-streams` | The prefix of every key |
-| `retention` | 7 days | The Retention of a Stream whose create sets none |
-| `safety_ttl` | 90 days | How long an open Workflow-owned Stream stays after its last write |
-| `wait_replicas` | 0 | The replicas that must have each write, with `WAIT` |
-| `wait_timeout` | 1 s | How long a write waits for its replicas |
+| `retention` | 7 days | How long a Stream stays after its create or its last written batch |
+| `fence` | `Fence::Off` | Whether a write of an earlier attempt of a Producer is refused |
+| `resend_window` | 16 | The batches of a Producer whose request id the Store remembers |
+| `response_timeout` | 5 s | How long a call waits for Redis |
+| `wait` | none | The replicas that each write waits for, with `WAIT`, and for how long |
+| `max_blocking_connections` | 256 | The reads and the writes that can block at a time |
 
-The URL sets the credentials and TLS. `crates/streams-redis/docs/redis.md` has the key layout, the
-TTLs, the ACLs and the known limits.
+A URL starts with `redis://` or `rediss://` and has the credentials. `rediss://` connects with
+TLS and verifies the server against the root certificates of the system. A private CA works only
+through the `SSL_CERT_FILE` variable, and the Store can't send a client certificate.
+
+Counts must be positive. `retention` and `wait.timeout` must be at least 1 ms.
+`response_timeout` must be positive. A Stream keeps its original retention.
+See the [operator guide](crates/streams-redis/docs/redis.md) for access, persistence and storage.
 
 ## Building
 
-- `temporalio-streams` isn't on crates.io yet, so run `scripts/patch-sdk-rust.sh` before you build.
+- `temporalio-streams` is unreleased. Run
+  `SDK_RUST_REF=moe/streams-crate-types scripts/patch-sdk-rust.sh` before building.
+  Use `SDK_RUST_PATH` for a local `sdk-rust` checkout.
 - A bridge that builds sdk-rust from its `sdk-core` submodule patches `temporalio-common` and
   `temporalio-streams` to those copies in `[patch.crates-io]`, so that each type exists once.
 - A FIPS build uses `default-features = false` and the `fips` feature. The default feature links
@@ -38,9 +54,13 @@ TTLs, the ACLs and the known limits.
 
 ## Testing
 
-`cargo test` runs the cases that need no server. The cases that need Redis are `#[ignore]`. To run
-them, start the servers with `crates/streams-redis/scripts/redis-test-servers.sh`, set the two URLs
-that it prints, and run `cargo test -- --include-ignored`.
+After installing the Python development dependencies, run `make format` and `make lint-code`
+from the repository root. These targets use the same Rust and Python checks as CI.
+
+`cargo test` runs the tests that need no server. `cargo test -- --include-ignored` runs all of
+them, and needs `redis-server` in the `PATH`, or its path in `REDIS_SERVER`. Each test starts the
+servers that it needs on free ports and stops them. `STREAMS_SEED=<seed>` runs one seed of a
+generated test.
 
 ## License
 

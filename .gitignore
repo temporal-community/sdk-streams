@@ -1,2 +1,8 @@
 /target
 /.cargo
+# What a build and a test run of the Python package leave.
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.so

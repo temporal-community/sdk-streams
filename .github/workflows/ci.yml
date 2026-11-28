@@ -11,6 +11,9 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # The branch of sdk-rust that adds `temporalio-streams`, until a release has the crate.
+  SDK_RUST_GIT: https://github.com/temporalio/sdk-rust
+  SDK_RUST_REF: moe/streams-crate-types
 
 jobs:
   lint:
@@ -33,7 +36,7 @@ jobs:
           -- -D warnings
 
   test:
-    name: unit tests
+    name: tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -43,7 +46,69 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       - uses: Swatinem/rust-cache@v2
       - run: scripts/patch-sdk-rust.sh
-      - run: cargo test --workspace
+      # The tests start their own `redis-server` processes.
+      - name: Install Redis from the Redis apt repo
+        run: |
+          curl -fsSL https://packages.redis.io/gpg \
+            | sudo gpg --dearmor -o /usr/share/keyrings/redis-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/redis-archive-keyring.gpg]" \
+            "https://packages.redis.io/deb $(lsb_release -cs) main" \
+            | sudo tee /etc/apt/sources.list.d/redis.list
+          sudo apt-get update && sudo apt-get install -y redis
+      - run: cargo test -- --include-ignored
+
+  test-redis-7-0:
+    name: tests on Redis 7.0
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: Swatinem/rust-cache@v2
+      - run: scripts/patch-sdk-rust.sh
+      # The oldest Redis that the Store works on. The image has the binary.
+      - run: |
+          docker create --name redis-7-0 redis:7.0
+          docker cp redis-7-0:/usr/local/bin/redis-server "$RUNNER_TEMP/redis-server"
+          echo "REDIS_SERVER=$RUNNER_TEMP/redis-server" >> "$GITHUB_ENV"
+      - run: cargo test -- --include-ignored
+
+  python:
+    name: Python package
+    runs-on: ubuntu-latest
+    env:
+      # The SDK that has Streams, until a release of it does.
+      TEMPORALIO: temporalio @ git+https://github.com/temporalio/sdk-python@moe/streams-api
+    defaults:
+      run:
+        working-directory: python
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v6
+      - run: scripts/patch-sdk-rust.sh
+        working-directory: .
+      # The tests start their own `redis-server` processes.
+      - name: Install Redis from the Redis apt repo
+        run: |
+          curl -fsSL https://packages.redis.io/gpg \
+            | sudo gpg --dearmor -o /usr/share/keyrings/redis-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/redis-archive-keyring.gpg]" \
+            "https://packages.redis.io/deb $(lsb_release -cs) main" \
+            | sudo tee /etc/apt/sources.list.d/redis.list
+          sudo apt-get update && sudo apt-get install -y redis
+      - run: uv venv && uv pip install --group dev "$TEMPORALIO"
+      - run: uv run --no-sync maturin develop
+      - run: uv run --no-sync ruff check .
+      - run: uv run --no-sync ruff format --check .
+      - run: uv run --no-sync pyright
+      - run: uv run --no-sync pytest
 
   fips:
     name: FIPS build takes no ring
@@ -59,47 +124,6 @@ jobs:
       - run: cargo build --workspace --no-default-features --features fips
       # Normal and build edges only, since the tests' own dependencies may depend on `ring`.
       - run: |
-          tree=$(cargo tree -e normal,build --no-default-features --features fips \
+          tree=$(cargo tree --workspace -e normal,build --no-default-features --features fips \
             -i ring --target all)
           if [ -n "$tree" ]; then echo "$tree"; exit 1; fi
-
-  redis:
-    name: Redis Store tests (standalone and cluster)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.94.0
-      - uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - uses: Swatinem/rust-cache@v2
-      - run: scripts/patch-sdk-rust.sh
-      - name: Install Redis from the Redis apt repo
-        run: |
-          curl -fsSL https://packages.redis.io/gpg \
-            | sudo gpg --dearmor -o /usr/share/keyrings/redis-archive-keyring.gpg
-          echo "deb [signed-by=/usr/share/keyrings/redis-archive-keyring.gpg]" \
-            "https://packages.redis.io/deb $(lsb_release -cs) main" \
-            | sudo tee /etc/apt/sources.list.d/redis.list
-          sudo apt-get update && sudo apt-get install -y redis
-      - run: crates/streams-redis/scripts/redis-test-servers.sh >> "$GITHUB_ENV"
-      - run: cargo test -p temporalio-streams-redis -- --include-ignored --test-threads=8
-
-  redis-7-0:
-    name: Redis 7.0 Store tests (standalone and cluster)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.94.0
-      - uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - uses: Swatinem/rust-cache@v2
-      - run: scripts/patch-sdk-rust.sh
-      # The script runs the servers in docker and needs only `redis-cli` on the host.
-      - run: sudo apt-get update && sudo apt-get install -y redis-tools
-      # The oldest Redis that `connect` accepts.
-      - run: crates/streams-redis/scripts/redis-test-servers.sh >> "$GITHUB_ENV"
-        env:
-          STREAMS_REDIS_IMAGE: redis:7.0
-      - run: cargo test -p temporalio-streams-redis -- --include-ignored --test-threads=8

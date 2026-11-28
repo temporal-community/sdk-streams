@@ -1,199 +1,185 @@
-//! The errors of the Redis Store. Each one becomes a Stream error at the `Store` trait, with the
-//! reason that lang turns into an error class, so a caller gets the same classes on every backend.
+//! Error reasons determine whether a caller retries or stops.
 
-use redis::{ErrorKind, RedisError, ServerErrorKind};
-use temporalio_streams::{Reason, StreamError};
+use redis::{ErrorKind, ParsingError, RedisError, ServerErrorKind};
+use temporalio_streams::{StreamError, WireReason, proto::StreamErrorReason};
 
-/// An error of the Redis Store or of its runtime.
+/// An error of the Redis Store.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum RedisStoreError {
-    /// Redis failed the call, or a Stream script refused it.
-    #[error(transparent)]
-    Redis(#[from] RedisError),
-    /// The options are wrong or Redis is too old, so a retry can't fix it.
+    /// An option or a request has a value that the Store can't use.
     #[error("{0}")]
     Invalid(String),
-    /// Redis or its replicas didn't take the call in time, so a retry may fix it.
+    /// Redis failed a call, or a script of the Store refused it.
+    #[error(transparent)]
+    Redis(#[from] RedisError),
+    /// Redis answered a script of the Store with a value that the Store can't convert.
+    #[error("The Store can't read an answer of Redis: {0}")]
+    UnreadableAnswer(#[from] ParsingError),
+    /// Redis or its replicas didn't take a call in time, so a later try may succeed.
     #[error("{0}")]
     Unavailable(String),
-    /// Redis keeps a value that isn't valid, or gave an answer that the Store can't decode. A
-    /// retry can't fix it.
-    #[error("{0}")]
-    Corrupt(String),
-    /// A rule of the Stream runtime refused a value that Redis keeps.
-    #[error(transparent)]
-    Stream(#[from] StreamError),
 }
 
-/// The result of a Redis Store call.
-pub type RedisStoreResult<T> = Result<T, RedisStoreError>;
+pub(crate) type RedisStoreResult<T> = Result<T, RedisStoreError>;
 
 impl RedisStoreError {
-    pub(crate) fn invalid(message: impl Into<String>) -> Self {
-        Self::Invalid(message.into())
-    }
-
-    pub(crate) fn unavailable(message: impl Into<String>) -> Self {
-        Self::Unavailable(message.into())
-    }
-
-    pub(crate) fn corrupt(message: impl Into<String>) -> Self {
-        Self::Corrupt(message.into())
+    /// Returns whether a later try of the same call may succeed with no change by an operator.
+    pub(crate) fn can_pass(&self) -> bool {
+        match self {
+            Self::Invalid(_) | Self::UnreadableAnswer(_) => false,
+            Self::Redis(error) => !matches!(error.retry_method(), redis::RetryMethod::NoRetry),
+            Self::Unavailable(_) => true,
+        }
     }
 }
 
-impl From<RedisStoreError> for StreamError {
+// Retrying cannot repair stored data. Setup failures can recover after an operator corrects them.
+impl<R: WireReason> From<RedisStoreError> for StreamError<R> {
     fn from(error: RedisStoreError) -> Self {
-        match error {
-            RedisStoreError::Redis(error) => from_redis(&error),
-            RedisStoreError::Invalid(message) => StreamError::invalid(message),
-            RedisStoreError::Unavailable(message) => StreamError::storage_unavailable(message),
-            RedisStoreError::Corrupt(message) => StreamError::storage_corrupt(message),
-            RedisStoreError::Stream(error) => error,
+        let error = match error {
+            RedisStoreError::Invalid(message) => return Self::invalid_argument(message),
+            RedisStoreError::Unavailable(message) => return Self::store_unavailable(message),
+            RedisStoreError::UnreadableAnswer(_) => return Self::store_corrupt(error.to_string()),
+            RedisStoreError::Redis(error) => error,
+        };
+        let detail = error.detail().unwrap_or_default();
+        if let Some(reason) = error.code().and_then(StreamErrorReason::from_str_name) {
+            return Self::from_wire(i32::from(reason), detail);
+        }
+        match error.kind() {
+            // Plain script errors need a cause check because Redis gives them no specific code.
+            ErrorKind::Server(ServerErrorKind::ResponseError)
+                if detail.contains("@user_script") && !stopped_by_redis(detail) =>
+            {
+                Self::store_corrupt(format!(
+                    "A script of the Store failed on what the Stream holds: {detail}"
+                ))
+            }
+            ErrorKind::Extension if error.code() == Some("WRONGTYPE") => Self::store_corrupt(
+                format!("A key of the Stream holds a value of another type: {detail}"),
+            ),
+            _ => Self::store_unavailable(outage(&error)),
         }
     }
 }
 
-/// The Stream error of a Redis error. Scripts mark their refusals with a `STREAM_` code. A refusal
-/// that a retry can't fix is invalid, a key of another type is corrupt, and any other failure is
-/// unavailable, so a retry may fix it.
-fn from_redis(error: &RedisError) -> StreamError {
-    let detail = error.detail().unwrap_or_default().to_string();
-    // A bad URL or bad credentials stay wrong on a retry. redis-rs gives some server codes as
-    // kinds, and the rest stay strings below.
+// Redis has no distinct code for ACL failures or `SCRIPT KILL` inside a script.
+fn stopped_by_redis(detail: &str) -> bool {
+    [
+        "ACL failure in script",
+        "The user executing the script",
+        "Script killed by user",
+    ]
+    .iter()
+    .any(|text| detail.contains(text))
+}
+
+fn outage(error: &RedisError) -> String {
     match error.kind() {
-        ErrorKind::InvalidClientConfig | ErrorKind::AuthenticationFailed => {
-            return StreamError::invalid(format!("The Redis config is wrong: {error}"));
-        }
-        ErrorKind::Server(ServerErrorKind::NoPerm) => {
-            return StreamError::invalid(format!(
-                "Redis refused the call for good: NOPERM {detail}"
-            ));
-        }
-        ErrorKind::Server(ServerErrorKind::ResponseError) if detail.contains("user_script") => {
-            return StreamError::invalid(format!("A Stream script failed: {detail}"));
-        }
-        ErrorKind::Server(ServerErrorKind::ResponseError) if detail.contains("unknown command") => {
-            return StreamError::invalid(format!("Redis is too old for the Store: {detail}"));
-        }
+        // Redis 7.0 added `EVALSHA_RO` and the flags of a script, which the Store's reads need.
         ErrorKind::Server(ServerErrorKind::ResponseError)
-            if detail.contains("cluster support disabled") =>
+            if error
+                .detail()
+                .is_some_and(|detail| detail.contains("unknown command")) =>
         {
-            return StreamError::invalid(format!(
-                "The server isn't a Redis Cluster, so don't set `cluster`: {detail}"
-            ));
+            format!("Redis doesn't know a command of the Store, which needs Redis 7.0: {error}")
         }
-        _ => {}
+        // Script results are decoded separately, so this is a protocol failure.
+        ErrorKind::Parse => format!(
+            "The server didn't answer as Redis does, so its URL may be of another service: {error}"
+        ),
+        // Cluster connections handle redirects, so this indicates standalone configuration.
+        ErrorKind::Server(ServerErrorKind::Moved | ServerErrorKind::Ask) => format!(
+            "A node of a Redis Cluster redirected the call, so the Store needs \
+             `RedisServers::Cluster`: {error}"
+        ),
+        // The message has the code as Redis writes it, and not the library's name for it.
+        _ => match (error.code(), error.detail()) {
+            (Some(code), Some(detail)) => format!("Redis failed: {code} {detail}"),
+            _ => format!("Redis failed: {error}"),
+        },
     }
-    let reason = match error.code() {
-        Some("STREAM_NOT_FOUND") => Reason::NotFound,
-        Some("STREAM_EXPIRED") => Reason::Expired,
-        Some("STREAM_CLOSED") => Reason::Closed,
-        Some("STREAM_FENCED") => Reason::Fenced,
-        Some("STREAM_SEQUENCE_TOO_LOW") => Reason::SequenceTooLow,
-        Some("STREAM_ALREADY_EXISTS") => Reason::AlreadyExists,
-        Some("STREAM_SEQ_DIVERGENT") => Reason::SeqDivergent,
-        Some("STREAM_NOT_OWNER") => Reason::NotOwner,
-        Some("STREAM_FORMAT_TOO_NEW") => Reason::FormatTooNew,
-        Some("STREAM_INVALID") => Reason::Invalid,
-        Some("STREAM_STORAGE_UNAVAILABLE") => Reason::StorageUnavailable,
-        Some("STREAM_STORAGE_CORRUPT") => Reason::StorageCorrupt,
-        Some("WRONGTYPE") => {
-            return StreamError::storage_corrupt(format!(
-                "A key of the Stream has another type: {detail}"
-            ));
-        }
-        Some(code @ ("NOAUTH" | "WRONGPASS")) => {
-            return StreamError::invalid(format!(
-                "Redis refused the call for good: {code} {detail}"
-            ));
-        }
-        // The code as the server wrote it, so the message has the code the Redis docs use.
-        Some(code) => {
-            return StreamError::storage_unavailable(format!(
-                "Redis refused the call: {code} {detail}"
-            ));
-        }
-        None => return StreamError::storage_unavailable(format!("Redis failed: {error}")),
-    };
-    StreamError::new(reason, detail)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use temporalio_streams::{AnyReason, AppendError, AppendReason, DescribeError, DescribeReason};
 
-    fn server(code: &str, detail: &str) -> StreamError {
-        // Parse it as a wire reply, so that the code and the detail split as in a real reply.
-        let error = redis::parse_redis_value(format!("-{code} {detail}\r\n").as_bytes())
+    /// Parses the error from its wire form, so its code and detail split as in a real reply.
+    fn reply(text: &str) -> RedisStoreError {
+        redis::parse_redis_value(format!("-{text}\r\n").as_bytes())
             .unwrap()
             .extract_error()
-            .unwrap_err();
-        RedisStoreError::from(error).into()
+            .unwrap_err()
+            .into()
     }
 
     #[test]
-    fn a_script_refusal_keeps_its_reason_and_a_server_refusal_gets_its_class() {
-        for (code, reason) in [
-            ("STREAM_NOT_FOUND", Reason::NotFound),
-            ("STREAM_EXPIRED", Reason::Expired),
-            ("STREAM_CLOSED", Reason::Closed),
-            ("STREAM_FENCED", Reason::Fenced),
-            ("STREAM_SEQUENCE_TOO_LOW", Reason::SequenceTooLow),
-            ("STREAM_ALREADY_EXISTS", Reason::AlreadyExists),
-            ("STREAM_SEQ_DIVERGENT", Reason::SeqDivergent),
-            ("STREAM_NOT_OWNER", Reason::NotOwner),
-            ("STREAM_FORMAT_TOO_NEW", Reason::FormatTooNew),
-            ("STREAM_INVALID", Reason::Invalid),
-            ("STREAM_STORAGE_UNAVAILABLE", Reason::StorageUnavailable),
-            ("STREAM_STORAGE_CORRUPT", Reason::StorageCorrupt),
-        ] {
-            let error = server(code, "why it refused");
+    fn a_redis_failure_gets_the_reason_of_its_class() {
+        let fenced = || reply("STREAM_ERROR_REASON_FENCED A later attempt wrote");
+        assert_eq!(
+            AppendError::from(fenced()),
+            AppendError::operation(AppendReason::Fenced, "A later attempt wrote")
+        );
+        // A describe can't fail with `FENCED`, so the answer isn't one of the describe script.
+        let error = DescribeError::from(fenced());
+        assert_eq!(error.reason, DescribeReason::Other(AnyReason::StoreCorrupt));
+        // A retry of these reads the same value again, so they must not look like an outage.
+        let unreadable = redis::from_redis_value::<i64>(redis::Value::Okay).unwrap_err();
+        let corrupt: [RedisStoreError; 3] = [
+            reply("WRONGTYPE Operation against a key holding the wrong kind of value"),
+            reply(
+                "ERR user_script:128: attempt to perform arithmetic on field 'ret' (a boolean \
+                 value) script: 4b32, on @user_script:128.",
+            ),
+            unreadable.into(),
+        ];
+        for error in corrupt {
+            let text = error.to_string();
+            let error = AppendError::from(error);
             assert_eq!(
-                (error.reason, error.message.as_str()),
-                (reason, "why it refused")
+                error.reason,
+                AppendReason::Other(AnyReason::StoreCorrupt),
+                "{text}"
             );
         }
-        // A script that a flush or a failover dropped again after its reload is a passing state,
-        // and so is a redirect that the cluster client gave up on.
-        for code in [
-            "READONLY", "OOM", "LOADING", "BUSY", "TRYAGAIN", "NOSCRIPT", "MOVED",
-        ] {
-            let error = server(code, "x");
-            assert_eq!(error.reason, Reason::StorageUnavailable, "{code}");
-            assert!(error.message.contains(code), "{error}");
-        }
-        for (code, detail) in [
-            (
-                "NOPERM",
-                "this user has no permissions to run the 'evalsha' command",
-            ),
-            (
-                "ERR",
-                "value is not an integer script: 86f9, on @user_script:59.",
-            ),
-            (
-                "ERR",
-                "unknown command 'EVALSHA_RO', with args beginning with:",
-            ),
-            ("ERR", "This instance has cluster support disabled"),
-        ] {
-            let error = server(code, detail);
-            assert_eq!(error.reason, Reason::Invalid, "{code}");
+        // The first four pass by themselves, and the others need an operator. Workflow code
+        // waits for either, so none of them may be a reason that fails the call for good.
+        let outages = [
+            "READONLY You can't write against a read only replica.",
+            "LOADING Redis is loading the dataset in memory",
+            "OOM command not allowed when used memory > 'maxmemory'.",
+            "TRYAGAIN Multiple keys request during rehashing of slot",
+            "NOPERM this user has no permissions to run the 'xadd' command",
+            "WRONGPASS invalid username-password pair or user is disabled.",
+            "ERR ACL failure in script: User u has no permissions to run the 'xadd' command \
+             script: 4b32, on @user_script:169.",
+            "ERR The user executing the script can't run this command or subcommand script: \
+             4b32, on @user_script:169.",
+            "ERR Script killed by user with SCRIPT KILL... script: 4b32, on @user_script:2.",
+            "OOM command not allowed when used memory > 'maxmemory'. script: 4b32, on \
+             @user_script:169.",
+            "MOVED 866 127.0.0.1:7001",
+        ];
+        for text in outages {
+            let error = AppendError::from(reply(text));
+            let unavailable = AppendReason::Other(AnyReason::StoreUnavailable);
+            assert_eq!(error.reason, unavailable, "{text}");
+            let (_, detail) = text.split_once(' ').unwrap();
             assert!(error.message.contains(detail), "{error}");
         }
-        let other = server("ERR", "max number of clients reached");
-        assert_eq!(other.reason, Reason::StorageUnavailable);
-        let wrong_type = server(
-            "WRONGTYPE",
-            "Operation against a key holding the wrong kind",
-        );
-        assert_eq!(wrong_type.reason, Reason::StorageCorrupt);
-        let url = RedisError::from((ErrorKind::InvalidClientConfig, "Redis URL did not parse"));
+        // Bytes that are no reply of Redis, as another service at the URL sends them.
+        let http = redis::parse_redis_value(b"HTTP/1.1 400 Bad Request\r\n\r\n").unwrap_err();
+        let not_redis = AppendError::from(RedisStoreError::from(http));
         assert_eq!(
-            StreamError::from(RedisStoreError::from(url)).reason,
-            Reason::Invalid
+            not_redis.reason,
+            AppendReason::Other(AnyReason::StoreUnavailable)
         );
+        assert!(not_redis.message.contains("another service"), "{not_redis}");
+        let old = AppendError::from(reply("ERR unknown command 'EVALSHA_RO', with args"));
+        assert_eq!(old.reason, AppendReason::Other(AnyReason::StoreUnavailable));
+        assert!(old.message.contains("needs Redis 7.0"), "{old}");
     }
 }

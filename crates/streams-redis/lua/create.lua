@@ -1,42 +1,36 @@
--- Creates the Stream's meta key, or finds it. On a Stream that exists, it refuses one that is
--- expired or closed, in that order. Then a retry of the create that made the Stream gets `created`
--- again. Any other create fails with `ALREADY_EXISTS`, unless it uses the existing Stream.
+-- Creates a Stream, or finds the one that has the id.
 --
--- ARGV: format version, Retention ms, safety TTL ms, Tombstone ms, the request id (empty for none),
--- `1` when the create uses an existing Stream, `1` when a `WAIT` runs after it.
+-- KEYS: the meta key.
+-- ARGV:
+-- 1. The request key of the create
+-- 2. The Retention, in ms
+-- 3. `1` to use an existing Stream
+-- 4. `1` when a `WAIT` comes after the script
 --
--- Returns {outcome, stored Retention ms}. The outcome is `created` or `exists`. A Stream that
--- exists keeps its own Retention.
-local meta, log, producers = KEYS[1], KEYS[2], KEYS[3]
-local version, retention = tonumber(ARGV[1]), ARGV[2]
-local safety, tombstone = tonumber(ARGV[3]), tonumber(ARGV[4])
-local request_id, use_existing, wait = ARGV[5], ARGV[6], ARGV[7]
+-- Returns 1 when this create made the Stream or is a retry of the create that made it, and 0
+-- for a Stream that another create made.
+local meta = KEYS[1]
+local request, retention, use_existing, wait = ARGV[1], ARGV[2], ARGV[3], ARGV[4]
 
 local now = now_ms()
-local stored = redis.call('HGET', meta, 'ret')
-if not stored then
-  redis.call('HSET', meta, 'v', version, 'ret', retention)
-  if request_id ~= '' then
-    redis.call('HSET', meta, 'rid', request_id)
-  end
-  refresh(meta, log, producers, nil, now, safety, tombstone)
-  return {'created', retention}
+local stream = load(meta)
+if not stream then
+  local expires = now + retention
+  check_expiry(meta, {}, expires)
+  redis.call('HSET', meta, 'v', FORMAT, 'rid', request, 'ret', retention)
+  expire_at(meta, {}, expires)
+  return 1
 end
-local refused = check_live(meta, version, now)
+local refused = unfit(stream, now)
 if refused then
   return refused
 end
-if redis.call('HGET', meta, 'closed') then
-  return refuse('CLOSED', 'the Stream is closed')
-end
--- A retry of the create that made the Stream gets its answer again, after a `WAIT` that covers
--- the first create's write.
-if request_id ~= '' and redis.call('HGET', meta, 'rid') == request_id then
+if stream.rid == request then
   touch(meta, wait)
-  return {'created', stored}
+  return 1
 end
 if use_existing ~= '1' then
-  return refuse('ALREADY_EXISTS', 'the Stream exists')
+  return refuse('ALREADY_EXISTS', 'The Stream already exists')
 end
 touch(meta, wait)
-return {'exists', stored}
+return 0

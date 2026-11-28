@@ -1,0 +1,36 @@
+[package]
+name = "temporalio-streams-redis-python"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88.0"
+authors = ["Temporal Technologies Inc. <sdk@temporal.io>"]
+license-file = { workspace = true }
+description = "The native module of the Python package of the Redis Store of Temporal Streams"
+homepage = "https://temporal.io/"
+repository = "https://github.com/temporal-community/sdk-streams"
+publish = false
+
+[lib]
+name = "temporalio_streams_redis_native"
+crate-type = ["cdylib"]
+
+[features]
+default = ["tls-ring"]
+# The TLS features of the Redis crate. A build has one of them.
+tls-ring = ["temporalio-streams-redis/tls-ring"]
+tls-aws-lc = ["temporalio-streams-redis/tls-aws-lc", "dep:rustls"]
+fips = ["tls-aws-lc", "temporalio-streams-redis/fips"]
+
+[dependencies]
+prost = { workspace = true }
+pyo3 = { version = "0.29", features = ["abi3-py311", "extension-module"] }
+pyo3-async-runtimes = { version = "0.29", features = ["tokio-runtime"] }
+# Only with `tls-aws-lc`. The module doesn't call it. Its feature makes `aws-lc-rs` the one TLS
+# provider of the build, which rustls then uses. A `tls-ring` build has `ring` as its one provider.
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"], optional = true }
+temporalio-streams = { workspace = true }
+temporalio-streams-redis = { path = "../crates/streams-redis", default-features = false }
+tokio = { version = "1.47", default-features = false, features = ["rt-multi-thread"] }
+
+[lints]
+workspace = true

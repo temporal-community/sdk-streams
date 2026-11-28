@@ -1,0 +1,46 @@
+[project]
+name = "temporalio-streams-redis"
+version = "0.1.0"
+description = "The Redis Store of Temporal Streams for the Python SDK"
+authors = [{ name = "Temporal Technologies Inc", email = "sdk@temporal.io" }]
+requires-python = ">=3.11"
+readme = "README.md"
+license = "MIT"
+keywords = ["temporal", "workflow", "streams", "redis"]
+# Publishing requires an SDK lower bound that includes Stream support.
+dependencies = ["temporalio"]
+
+[project.urls]
+Repository = "https://github.com/temporal-community/sdk-streams"
+
+[build-system]
+requires = ["maturin>=1.8,<2"]
+build-backend = "maturin"
+
+[tool.maturin]
+module-name = "temporalio_streams_redis._native"
+
+[dependency-groups]
+dev = [
+  "maturin>=1.8,<2",
+  "pyright==1.1.414",
+  # `pytest-asyncio` requires the collection API in `pytest <9.2`.
+  "pytest>=9.0,<9.2",
+  "pytest-asyncio>=0.21,<0.22",
+  "ruff>=0.15.12,<0.16",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
+[tool.pyright]
+include = ["temporalio_streams_redis", "tests"]
+strict = ["temporalio_streams_redis"]
+venvPath = "."
+venv = ".venv"
+
+[tool.ruff]
+target-version = "py311"
+
+[tool.ruff.lint]
+extend-select = ["I"]

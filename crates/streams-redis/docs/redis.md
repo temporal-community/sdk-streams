@@ -1,153 +1,218 @@
-# The Redis layout
+# Redis Store operations and format
 
-Every SDK that uses Streams on Redis must use this layout. The scripts in `lua/` are its canonical
-form, and the `testdata/` of `temporalio-streams` has its test vectors.
+The scripts in `lua/` define the stored format. An entry id below means Redis `<ms>-<seq>`.
+
+## Setup
+
+- Use Redis 7.0 or later. Reads need `EVALSHA_RO` and script flags.
+- Set `maxmemory-policy noeviction`. The Store does not read this setting.
+  Eviction can remove Record, resend or fencing state.
+- Set retention to fit available memory. It defaults to seven days after create or the last new batch.
+  With `noeviction`, memory exhaustion rejects writes across all Streams.
+- Configure persistence. Without AOF or RDB, restart removes all Streams.
+  AOF recovery can lose writes within the configured `appendfsync` interval.
+- Keep server clocks synchronized. Expiry and entry ids use Redis `TIME`.
+  A primary with a faster clock can expire Streams early. Failover that loses metadata can reuse offsets.
+- Set `maxclients` above the total connection count of all Stores. See [Connections](#connections).
+- Use `rediss://` for TLS with server certificate verification.
+  Set `SSL_CERT_FILE` for a private CA. Client certificates are not supported.
+- Configure the access rules below. Credentials and TLS settings come from the Redis URL.
 
 ## Keys
 
-```text
-<prefix>:{<namespace>:<stream id>}:meta
-<prefix>:{<namespace>:<stream id>}:log
-<prefix>:{<namespace>:<stream id>}:producers
-<prefix>:{<namespace>:<stream id>}:closed
-```
+Each Stream uses three keys in one Redis Cluster slot.
+`<prefix>` is `key_prefix`. `<id>` is the Stream id with `%` escaped as `%25` and `}` as `%7D`.
 
-- Each part is percent-encoded. The hash tag puts the four keys in one cluster slot.
-- The prefix has only letters, digits, `-`, `.`, `_` and `~`, so a key pattern shows it as written.
-- A create writes `:meta`. An append writes `:producers` and `:log`.
-- A close writes no log entry. It adds one entry to `:closed`, so a read that waits on the log and
-  on `:closed` wakes. `:closed` expires with the log.
-- The close script gets `:closed` as an argument, not in `KEYS`. While a slot migrates, a script
-  with a declared key that doesn't exist yet gets `TRYAGAIN`, so each close would fail. Redis
-  doesn't promise a script a key that `KEYS` doesn't name, but it allows one of the script's own
-  slot, and the slot migration case of `tests/acl.rs` checks it.
+| Key | Type | Content |
+|---|---|---|
+| `<prefix>:{<id>}:meta` | hash | Stream state |
+| `<prefix>:{<id>}:log` | stream | One entry per Record |
+| `<prefix>:{<id>}:producers` | hash | One field per Producer |
 
-## The meta hash
+Keys contain no Temporal namespace. Use a separate prefix or Redis deployment for each namespace.
 
-| Field | Value |
+Use a fresh `key_prefix` when replacing the namespace-based Store. Its `{namespace:id}` keys
+can match a current Stream ID containing `:`. Both layouts use format version `1`, so the
+Store cannot distinguish all old data. Keep the earlier Store and its prefix available for
+Workflows that replay those Records. This Store does not migrate that data.
+
+## Metadata
+
+Values in `:meta` are text except `rid`.
+
+| Field | Content |
 |---|---|
-| `v` | The format version, 1 |
-| `ret` | The Retention, in ms |
-| `exp` | When the Stream stops taking writes, in ms since 1970 |
-| `rid` | The request id of the create that made the Stream, absent when it gave none |
-| `closed` | Set by the close |
-| `closer` | The encoded Producer that closed the Stream, which a read builds the close item from |
-| `cstat` | The close status, `1` for CLOSED, which a Brook Store is the only one it sets |
-| `newest` | The entry id of the newest entry |
-| `trimmed` | The entry id of the newest entry that Retention or the log's expiry dropped |
-| `p\|<kind>\|<producer id>` | The Producer's fence and last batch, 88 bytes |
+| `v` | Format version, `1` |
+| `rid` | Create request key, 16 bytes |
+| `ret` | Retention in milliseconds |
+| `exp` | Expiry time in milliseconds since 1970 |
+| `newest` | Newest Record id, absent before the first append |
+| `lost` | Newest Record id lost with the log |
 
-`<kind>` is the `ProducerKind` number. The `p|` value has big-endian numbers in this order.
+The Stream retains its original `ret`, even when another Store uses different settings.
+A higher `v` returns `FORMAT_TOO_NEW`.
 
-| Bytes | Field |
+A request key is the first 16 bytes of SHA-256. Create hashes the request id.
+Append hashes the attempt key followed by the request id. An empty request id gets a random key.
+
+## Log and offsets
+
+One Lua script appends each batch without interleaving other commands. Records keep request order.
+Redis does not roll back script errors. The Store checks permissions and known invalid state before writing.
+
+The script assigns entry ids. It uses the greater of Redis time and the newest entry's `<ms>`.
+When `<ms>` is unchanged, `<seq>` starts after the newest entry. Otherwise it starts at zero.
+Ids increase while the metadata remains intact, even if the clock goes backward.
+
+Each entry has two fields in this order.
+
+- The first entry has `p`, the encoded `Producer`, followed by `r`, the encoded `Payload`.
+- Later entries have `b`, the first entry's `<seq>`, followed by `r`, the encoded `Payload`.
+  All entries in a batch share `<ms>`, so `b` identifies the batch's Producer entry.
+
+An offset is `<ms>` followed by `<seq>`, each an unsigned 64-bit big-endian integer.
+Unsigned byte order matches Record order. The Store never trims or changes entries.
+
+## Producers and resends
+
+Each Workflow run, Activity or client writer is a separate Producer.
+The `producer_key` function in `temporalio-streams` encodes its kind and ids.
+The Redis hash field contains that key unchanged.
+
+1. The kind's proto field number, one byte.
+2. Each id in proto field order. Each has a four-byte big-endian length followed by its bytes.
+   Text uses UTF-8. A nonzero Activity scheduled event id uses eight big-endian bytes.
+   Zero scheduled event ids are omitted.
+
+The value starts with the newest attempt key, 28 bytes, compared as unsigned bytes.
+Remembered batches follow, newest first. Each uses 40 bytes.
+
+| Field | Bytes |
 |---|---|
-| 40 | The fence, the Producer's newest epoch key. It is also the epoch of the last batch. |
-| 8 | The last batch's sequence |
-| 12 | The last batch's first entry id, the ms in 8 bytes and the seq in 4 |
-| 12 | The last batch's last entry id, in the same form |
-| 16 | The last batch's digest, which a resend must match |
+| Request key | 16 |
+| Entry `<ms>` | 8 |
+| First `<seq>` | 8 |
+| Last `<seq>` | 8 |
 
-- The ids are zero when the last batch wrote no entry. A real entry id is never `0-0`.
-- A call that finds a value of another length, or only one zero id, fails with
-  `stream_storage_corrupt`, since a later format may write it.
-- A task key is the started event id 8, the attempt 4, and the started seconds 8 and nanos 4.
-- An epoch key is the task key, then the attempt's scheduled seconds 8 and nanos 4 and the
-  attempt 4. A negative field is zero.
-- The scripts compare two keys byte by byte. Lua's `<` collates with the server's locale.
-- The digest is the first 16 bytes of the batch's SHA-256.
+An append checks expiry, then resend state, then fencing.
+A remembered resend returns the original offsets even after a later attempt writes.
+It adds no Records and does not extend retention.
 
-`:producers` scores each `<kind>|<producer id>` with the ms of its last append. An append drops the
-`p|` field of up to 64 Producers with no append for one Retention. A resend of such a Producer's
-last batch then writes the batch again, and a lower epoch of the Producer is accepted. So the fence
-lasts one Retention after the last append.
+The writing Store keeps its configured `resend_window`, which defaults to 16 batches per Producer.
+A forgotten request can write again. This also applies when the Redis cluster client retries a lost response.
+The stored attempt only increases, with fencing enabled or disabled.
+Producer fields remain until Stream expiry. Their count is not bounded.
 
-An append with sequence 0 takes the sequence after the last batch's when the fence is the batch's
-epoch key, and 1 otherwise. The script reads `p|` and writes the batch in one step, so two such
-batches never get the same sequence. Nothing dedupes such a batch, so its retry writes it again.
+A create checks expiry before its request key and conflict policy.
+The original request returns `created = true`. Another request with `USE_EXISTING` returns false.
+Another request with `FAIL` returns `ALREADY_EXISTS`.
 
-## Create
+## Memory and write cost
 
-A create of a Stream that exists refuses, in this order, an expired Stream (`stream_expired`) and a
-closed Stream (`stream_closed`). Then:
+Measurements on Redis 8 used a namespace, two UUIDs and a short Activity id.
+Actual costs depend on ids, payloads and Redis configuration.
 
-- A create with the `rid` of the create that made the Stream is its retry, so it gets `created`
-  again. With `WAIT`, it waits for the replicas to have the first create's write.
-- Any other create fails with `stream_already_exists`, unless it uses the existing Stream. Then it
-  gets `exists`, and the Stream keeps its Retention.
+| Data | Approximate cost |
+|---|---|
+| Producer with one remembered batch | 230 bytes |
+| Producer with the default resend window | 900 bytes |
+| 100-byte Record alone in a batch | 220 bytes |
+| 100-byte Record in a batch of 100 | 120 bytes |
 
-## Log entries
+An append rewrites its Producer value and updates key expiry.
+With the default window, one 100-byte Record adds about 1,570 bytes to AOF and replication.
+A batch of 100 such Records adds about 21,300 bytes.
 
-- `r` is the encoded `StreamRecord`, with no offset. A data Record has no Producer in it. An
-  append refuses a Record that isn't an encoded `StreamRecord`, since each read decodes it.
-- `p` is the encoded `Producer` of the batch, on the batch's first data entry. The Store sets it on
-  each data Record of the batch when it reads them.
-- `b` is the seq of the batch's first entry, on each later data entry, so a read that starts inside
-  a batch gets `p` with one lookup. An entry never has both `p` and `b`.
-- A batch's entries share one millisecond, and a trim drops whole milliseconds, so a batch keeps
-  its `p` entry for as long as it has any entry.
-- An offset is the entry id `<ms>-<seq>`, packed as `ms << 20 | seq`.
+## Reads and expiry
 
-## TTLs
+A read defaults to 1,000 Records and 4 MiB. Explicit limits stop the page before either is exceeded.
+One oversized Record is returned alone so the reader can make progress.
+The byte count includes each Record's encoded message envelope.
+Lua limits bytes read from Redis. Rust then applies the exact encoded size limit.
 
-- Each write sets `exp` to now plus the safety TTL for an open Stream, and to now plus the Retention
-  for a closed one.
-- `:producers` expires at `exp`. The meta key expires 30 days after `exp`, as the Tombstone.
-- The log expires at `exp`, or one Retention after the write if that is earlier.
-- Each append drops the Records older than the Retention. A read hides them too.
-- A write that finds the log gone sets `trimmed` to `newest`. Before that write, a read at or below
-  `newest` that finds no entry fails with `stream_expired`.
+Each Record retains its append Producer. A page's `last_offset` is its last Record's offset,
+or the request's `from_offset` when empty. A malformed offset returns `INVALID_ARGUMENT`.
+An offset above `newest` returns `OFFSET_TOO_HIGH`.
+
+A waiting read ends at its deadline or Stream expiry. Expiry returns `EXPIRED`.
+Redis supplies the remaining retention time so the client clock need not match it.
+
+Create starts retention. Only an append that writes a new batch restarts it.
+Reads, resends and creates of an existing Stream keep the expiry.
+`:log` and `:producers` expire together. `:meta` remains for another 30 days.
+During that period all calls, including create, return `EXPIRED`.
+After metadata expires, reads return `NOT_FOUND` and create can reuse the id.
+Durations above 2^52 milliseconds use that value, about 142,000 years.
+
+## Lost or corrupt state
+
+When `newest` is missing from `:log`, reads below that offset return `EXPIRED`.
+The next append records the lost offset in `lost` and writes after it.
+Reads at or above `lost` can continue.
+This detects a lost log. It does not detect arbitrary entry deletion.
+
+Loss of `:producers` or `:meta` is not detected. Stale attempts and duplicate batches can be accepted.
+Use `noeviction` and configure persistence and replication for the required loss tolerance.
+
+Malformed stored data returns `STORE_CORRUPT`. Retrying cannot repair the data.
+Bad credentials, missing permissions and unsupported Redis commands return `STORE_UNAVAILABLE`.
+Those calls can succeed after the operator corrects the setup.
 
 ## Access
 
-Redis checks the ACL of the script call and of each command in the script. `tests/acl.rs` checks
-these lists on a standalone server and on a cluster.
+Redis checks script access and each command inside the script.
+Before create or a new batch, the Store checks write permissions for every affected key.
+A rejected preflight leaves Records, resend state and expiry unchanged.
 
-- A Producer creates, appends and closes. It needs the keys `~<prefix>:{<namespace>:*` and the
-  commands `+evalsha +script|load +time +hget +hset +hdel +exists +pexpireat +xadd +xtrim
-  +xrevrange +zadd +zrangebyscore +zrem`. With `wait_replicas`, it also needs `+wait`.
-- A Reader reads and describes. It needs the keys `%R~<prefix>:{<namespace>:*` and the commands
-  `+evalsha_ro +script|load +time +hmget +xrange`. A read that waits also needs `+xread`, and a
-  read of the last Records needs `+xrevrange`.
-- A user that lacks a command of its list can fail a script after its first write, and that write
-  stays. `connect` checks `+wait`, since without it each write would fail its `WAIT` after the
-  write happened.
-- On a cluster, each role also needs `+cluster|slots +asking +ping`, on each node.
-- A process with both roles needs both sets.
-- `+info` and `+config|get` are optional. Without `+info`, the Store skips the version check.
-  Without `+config|get`, it warns that it can't read the eviction policy.
-- A user with write access can write as any Producer.
-- The ACLs don't limit CPU or memory, since `+script|load` lets a user run any Lua. A Reader with no
-  `+script|load` needs an admin to load the two read scripts on each primary, after each restart,
-  failover or `SCRIPT FLUSH`. A script's SHA is of its exact bytes, so load them with this command.
+`tests/store/acl.rs` checks these exact command lists.
 
-  ```sh
-  for script in read read_back; do
-    { printf '#!lua flags=no-writes\n'; cat lua/batch.lua "lua/$script.lua"; } |
-      redis-cli -x SCRIPT LOAD
-  done
-  ```
+- A Producer creates and appends. Its user needs the keys `~<prefix>:*` and the commands
+  `+evalsha +script|load +time +hmget +hget +hset +pexpireat +xadd +xrange`. With the `wait`
+  option it also needs `+wait`.
+- A Reader reads and describes. Its user needs the keys `%R~<prefix>:*` and the commands
+  `+evalsha_ro +script|load +time +hmget +xrange`. A read that waits also needs `+xread`.
+- On a Redis Cluster, each user also needs `+cluster|slots +asking` on every node.
 
-## Eviction and replication
+A missing permission returns `STORE_UNAVAILABLE`.
+The optional `WAIT` runs after the script. A denied or failed `WAIT` can leave the batch committed.
+Retry with the original request id while it remains in the resend window.
 
-- Use `maxmemory-policy noeviction`. Another policy can evict the meta and keep the log, which loses
-  the fence, the dedupe and the close. The Store warns about it on connect.
-- A failover can lose a write that Redis acknowledged. With `wait_replicas`, each write waits for
-  that many replicas with `WAIT`. A write that they don't have after `wait_timeout` fails with
-  `stream_storage_unavailable`, and its retry with the same sequence writes it once.
-- `WAIT` protects only the writer's answer. A Reader can see a write before its `WAIT` ends, and
-  a failover can then lose that write.
-- On a cluster, the client sends a write again after it loses the reply. A batch with sequence 0
-  then gets two copies.
-- With `WAIT`, a call that finds its write done, such as a resend, writes `v` again. Then its
-  `WAIT` covers the earlier write.
-- A failover can still promote a replica that doesn't have an acknowledged write.
+Any user with write access can impersonate a Producer. Fencing is not access control.
+Use separate credentials and key prefixes for applications that must not share Streams.
 
-## Known limits
+## Cluster migration
 
-- An open Stream stays until its safety TTL passes after its last write, even with a short
-  Retention. A closed Stream expires one Retention after the close.
-- Any Producer closes a Stream, since the Store doesn't track an owner.
-- A cluster with `cluster-preferred-endpoint-type unknown-endpoint` gives no hosts in
-  `CLUSTER SLOTS` and in its redirects. A blocking read then finds a slot's node only through the
-  seeds and `MOVED`. redis-rs doesn't follow an `ASK` with no host, so a call fails with
-  `stream_storage_unavailable` while its slot migrates.
+Every script declares all its keys. During migration, a script with only some keys present returns `TRYAGAIN`.
+This includes a first append, and a read before the first Record exists.
+The Store reports `STORE_UNAVAILABLE` until migration permits the call. The rejected script writes nothing.
+A Stream whose keys all exist on one node remains available.
+
+Waiting reads locate their primary through `CLUSTER SLOTS`. During migration they poll every 100 ms.
+Reads use primaries. Replica reads, Sentinel and client TLS certificates are not supported.
+
+## Connections
+
+A Store retains idle connections for reuse. Plan `maxclients` for its highest concurrent load.
+
+- Nonblocking calls share one connection, or one per primary in a cluster.
+- Waiting reads use at most `max_blocking_connections` per node, 256 by default.
+- Writes with `WAIT` use a separate pool with the same limit.
+  Each cluster connection in that pool can connect to every primary.
+
+Extra reads poll once per second. Extra writes wait for a connection until `response_timeout`.
+A cancelled blocking call closes its connection so later calls cannot queue behind it.
+A stale idle connection is retried only for a waiting read. Writes return an error for the caller to retry.
+The Redis cluster client can retry writes itself, using the same request key.
+
+## Replication
+
+Without `wait`, Redis can acknowledge a write before its replicas receive it.
+A failover can lose that write. Reads beyond the recovered newest offset return `OFFSET_TOO_HIGH`.
+They can continue once new writes reach that offset.
+
+With `wait`, create and append pipeline their script and `WAIT` on a dedicated connection.
+Too few acknowledgements return `STORE_UNAVAILABLE` after the write.
+A remembered resend writes `v` again so `WAIT` covers the original batch on this connection.
+
+`WAIT` confirms replication, not disk persistence. It does not prevent every failover loss.
+A reader can observe a Record before its append finishes `WAIT`.

@@ -1,99 +1,88 @@
 -- Appends one batch of one Producer.
 --
--- ARGV: format version, kind, Producer id, the 40-byte epoch key, sequence (0 takes the next one),
--- safety TTL ms, Tombstone ms, the 16-byte batch digest, `1` when a `WAIT` runs after it, the
--- encoded Producer, then one Record with no Producer per argument.
+-- KEYS: the meta key, the log, the Producers.
+-- ARGV:
+-- 1. The field of the Producer
+-- 2. The attempt key of the batch (28 bytes)
+-- 3. The request key of the batch (16 bytes)
+-- 4. `1` when the Store fences
+-- 5. The number of batches that the Store remembers for a Producer
+-- 6. `1` when a `WAIT` comes after the script
+-- 7. The encoded Producer
+-- 8. The encoded body of each Record, one argument each. A batch has one Record or more.
 --
--- Returns {'ok' or 'resend', first id, last id}. A batch that wrote no entry gives '' for both ids.
+-- Returns the `<ms>` of the batch's Records, and the `<seq>` of the first one and of the last one.
 local meta, log, producers = KEYS[1], KEYS[2], KEYS[3]
-local version, kind, producer = tonumber(ARGV[1]), ARGV[2], ARGV[3]
-local epoch, sequence_text = ARGV[4], ARGV[5]
-local sequence = tonumber(sequence_text)
-local safety, tombstone = tonumber(ARGV[6]), tonumber(ARGV[7])
-local digest, wait, encoded_producer = ARGV[8], ARGV[9], ARGV[10]
-local records = #ARGV - 10
-local field = 'p|' .. kind .. '|' .. producer
+local field, attempt, request = ARGV[1], ARGV[2], ARGV[3]
+local fence, window, wait, producer = ARGV[4], tonumber(ARGV[5]), ARGV[6], ARGV[7]
+local FIRST_RECORD = 8
+-- A remembered batch is its request key and the three numbers of its answer, 8 bytes each.
+local REQUEST, BATCH = 16, 40
 
-if #epoch ~= EPOCH_KEY_LEN or #digest ~= DIGEST_LEN then
-  return refuse('INVALID', 'the epoch key and the digest must be 40 and 16 bytes')
-end
--- The format version comes first, since a newer format can change how the Producer field reads.
 local now = now_ms()
-local refused = check_live(meta, version, now)
+local stream, refused = live(meta, now)
 if refused then
   return refused
 end
-local stored, unknown = read_producer(meta, field)
-if unknown then
-  return unknown
+-- The Store writes a positive whole number of milliseconds up to 2^52. Reject damaged
+-- metadata before passing the expiry to PEXPIREAT, which accepts only integers.
+local retention = tonumber(stream.ret)
+if not retention or retention < 1 or retention > 2^52 or retention ~= math.floor(retention) then
+  return refuse('STORE_CORRUPT', 'Invalid Stream retention')
 end
--- Each append sets the fence to its epoch, so the fence is also the epoch of the last batch.
-local previous = nil
-if stored and stored.fence == epoch then
-  previous = stored
-end
--- The script reads the last batch and writes this one in one step, so no other batch takes the
--- same number.
-if sequence_text == '0' then
-  sequence = 1
-  if previous then
-    sequence = previous.sequence + 1
-  end
-  sequence_text = string.format('%.0f', sequence)
-end
--- A Lua number past 2^53 - 1 loses digits.
-if not string.match(sequence_text, '^[1-9]%d*$') or sequence > 9007199254740991 then
-  return refuse('INVALID', 'the sequence must be from 1 to 2^53 - 1')
-end
--- Check the last batch before the close status, so that a resend gets its entry ids after a close.
-if previous then
-  if sequence == previous.sequence then
-    if previous.digest ~= digest then
-      return refuse('SEQ_DIVERGENT', 'sequence ' .. sequence_text ..
-        ' has other content than the batch the Store has')
-    end
+local expires = now + retention
+local state = redis.call('HGET', producers, field) or ''
+local newest_attempt, batches = string.sub(state, 1, ATTEMPT), string.sub(state, ATTEMPT + 1)
+-- A resend comes before the fence, so that a retry gets its answer after a later attempt wrote.
+for at = 1, #batches, BATCH do
+  if string.sub(batches, at, at + REQUEST - 1) == request then
+    local batch_ms, first_seq, last_seq = struct.unpack('>I8I8I8', batches, at + REQUEST)
     touch(meta, wait)
-    return {'resend', previous.first, previous.last}
-  end
-  if sequence < previous.sequence then
-    return refuse('SEQUENCE_TOO_LOW', 'sequence ' .. sequence_text .. ' is below the last one, ' ..
-      string.format('%.0f', previous.sequence))
+    return {batch_ms, first_seq, last_seq}
   end
 end
-if redis.call('HGET', meta, 'closed') then
-  return refuse('CLOSED', 'the Stream is closed')
-end
-if stored and bytes_below(epoch, stored.fence) then
-  return refuse('FENCED', 'the epoch is lower than the newest one of the Producer')
+if fence == '1' and below(attempt, newest_attempt) then
+  return refuse('FENCED', 'A later attempt of the Producer already wrote to the Stream')
 end
 
-refused = check_ids_fit(meta, log, now, records)
-if refused then
-  return refused
+local lost = lost_mark(stream, log)
+-- The ids of a batch have one `<ms>`. They start after `newest`, so they never go down when
+-- the clock steps back or the log is lost.
+local ms, seq = id_parts(stream.newest)
+if now > ms then
+  ms, seq = now, 0
+else
+  seq = seq + 1
 end
-
--- `prune` reads `:producers` first, so a key of another type there fails before any write.
-prune(meta, producers, now)
-trim(meta, log, now)
-local first_id, last_id = '', ''
--- Only the batch's first Record keeps the Producer. Each later one keeps the seq of that first
--- entry, so a read that starts inside the batch finds the Producer with one lookup.
-local first_seq = next_seq
-for i = 11, #ARGV do
-  local fields = {'r', ARGV[i], 'b', first_seq}
-  if i == 11 then
-    fields = {'r', ARGV[i], 'p', encoded_producer}
-  end
-  last_id = add(log, fields)
-  if first_id == '' then
-    first_id = last_id
-  end
+local function id(entry_seq)
+  return string.format('%.0f-%.0f', ms, entry_seq)
 end
-
-redis.call('HSET', meta, field, producer_value(epoch, sequence, first_id, last_id, digest))
-if last_id ~= '' then
-  redis.call('HSET', meta, 'newest', last_id)
+local first_seq, last_seq = seq, seq + (#ARGV - FIRST_RECORD)
+-- Above this range Lua can round two consecutive ids to the same number.
+if ms > 2^53 - 1 or last_seq > 2^53 - 1 then
+  return refuse('STORE_CORRUPT', 'Stream entry id exceeds the supported range')
 end
-redis.call('ZADD', producers, next_ms, kind .. '|' .. producer)
-refresh(meta, log, producers, nil, now, safety, tombstone)
-return {'ok', first_id, last_id}
+if below(newest_attempt, attempt) then
+  newest_attempt = attempt
+end
+local batch = request .. struct.pack('>I8I8I8', ms, first_seq, last_seq)
+local remembered = newest_attempt .. batch .. string.sub(batches, 1, (window - 1) * BATCH)
+local keys = {log, producers}
+check_expiry(meta, keys, expires)
+require_write('XADD', log, id(first_seq), 'p', producer, 'r', ARGV[FIRST_RECORD])
+require_write('HSET', producers, field, remembered)
+-- The first XADD can still reject a wrong-type log or a stale id. Do it before
+-- updating the metadata, including the mark of a previously lost log.
+redis.call('XADD', log, id(first_seq), 'p', producer, 'r', ARGV[FIRST_RECORD])
+for i = FIRST_RECORD + 1, #ARGV do
+  seq = seq + 1
+  redis.call('XADD', log, id(seq), 'b', first_seq, 'r', ARGV[i])
+end
+if lost and lost ~= stream.lost then
+  redis.call('HSET', meta, 'lost', lost)
+end
+redis.call('HSET', meta, 'newest', id(last_seq))
+redis.call('HSET', producers, field, remembered)
+-- A resend writes no batch, so only this path starts the Retention again.
+expire_at(meta, keys, expires)
+return {ms, first_seq, seq}
