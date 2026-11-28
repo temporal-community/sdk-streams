@@ -3,17 +3,13 @@
 use crate::{
     reads::until_blocked,
     support::{
-        NoRequestId, Redis, Rng, append, create, describe, keys, made, read, reason, runtime,
-        seeds, standalone,
+        NoRequestId, Redis, append, create, describe, keys, made, read, reason, runtime, standalone,
     },
 };
 use redis::aio::MultiplexedConnection;
 use std::time::Duration;
-use temporalio_streams::{
-    StreamRuntime,
-    proto::{
-        ReadRecordsResponse, StreamErrorReason, StreamIdConflictPolicy, sdk::CreateStreamRequest,
-    },
+use temporalio_streams::proto::{
+    ReadRecordsResponse, StreamErrorReason, StreamIdConflictPolicy, sdk::CreateStreamRequest,
 };
 
 /// How long the meta key stays after its Stream expired, in ms.
@@ -42,6 +38,17 @@ async fn expiry(admin: &mut MultiplexedConnection, keys: &[String; 3]) -> (i64, 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs Redis"]
 async fn the_retention_starts_again_at_each_append() {
+    #[derive(Debug)]
+    enum Call {
+        Create,
+        Append,
+        Resend,
+        RetryCreate,
+        UseExisting,
+        Read,
+        Describe,
+    }
+
     let redis = Redis::start(&[]);
     let mut admin = redis.admin().await;
     let ttls = [
@@ -51,64 +58,65 @@ async fn the_retention_starts_again_at_each_append() {
         // A million years, which is longer than a script can add to the time.
         Duration::from_secs(1_000_000 * 365 * 24 * 60 * 60),
     ];
-    for seed in seeds(40) {
-        let mut rng = Rng::new(seed);
-        let prefix = format!("time-{seed}");
-        // Two Stores of one Redis with their own Retention, as two Workers can have.
-        let retentions = [(); 2].map(|()| rng.pick(&ttls));
-        let stores: Vec<StreamRuntime> = (retentions.iter())
-            .map(|retention| {
-                let mut options = standalone(redis.url());
-                options.key_prefix = prefix.parse().unwrap();
-                options.retention = *retention;
-                runtime(options)
-            })
-            .collect();
+    for (case, ttl) in ttls.into_iter().enumerate() {
+        let prefix = format!("time-{case}");
+        // A later writer's configuration must not change the Stream's retention.
+        let stores = [ttl, Duration::from_secs(3600)].map(|retention| {
+            let mut options = standalone(redis.url());
+            options.key_prefix = prefix.parse().unwrap();
+            options.retention = retention;
+            runtime(options)
+        });
         let keys = keys(&prefix, "s");
-        // The Stream keeps the Retention of the Store that creates it.
-        let creator = rng.below(2);
-        let retention = retentions[creator].as_millis().min(MAX_TTL) as i64;
-        // The times of Redis around the last create or append, which the Retention counts from.
+        let retention = ttl.as_millis().min(MAX_TTL) as i64;
         let mut wrote = (0, 0);
         let mut appends = 0;
-        for step in 0..2 + rng.below(8) {
-            let store = match step {
-                0 => &stores[creator],
-                _ => &stores[rng.below(2)],
-            };
-            let context = format!("seed {seed}, step {step}");
-            // A call that wrongly starts the Retention again then moves `exp` by a millisecond.
+        for (call, via) in [
+            (Call::Create, 0),
+            (Call::Read, 1),
+            (Call::Describe, 1),
+            (Call::RetryCreate, 1),
+            (Call::UseExisting, 1),
+            (Call::Append, 1),
+            (Call::Resend, 0),
+            (Call::RetryCreate, 1),
+            (Call::UseExisting, 1),
+            (Call::Read, 1),
+            (Call::Describe, 1),
+            (Call::Append, 0),
+        ] {
+            let store = &stores[via];
+            let context = format!("case {case}, {call:?}");
+            // Expiry changes must be visible at Redis's millisecond precision.
             tokio::time::sleep(Duration::from_millis(2)).await;
             let before = time_ms(&mut admin).await;
-            let writes = match (step, rng.below(10)) {
-                (0, _) => {
+            let writes = match call {
+                Call::Create => {
                     let created = store.create_stream(create("s"), "c".to_string()).await;
                     assert_eq!(created, Ok(made(&create("s"))), "{context}");
                     true
                 }
-                (_, 0..5) => {
+                Call::Append => {
                     appends += 1;
-                    let records: Vec<&[u8]> = vec![b"x"; 1 + rng.below(2)];
                     let request_id = format!("a{appends}");
                     store
-                        .append_records(append("s", &records), request_id)
+                        .append_records(append("s", &[b"x", b"y"]), request_id)
                         .await
                         .unwrap();
                     true
                 }
-                // A resend and a retry of the create write nothing, so the Retention goes on.
-                (_, 5) if appends > 0 => {
+                Call::Resend => {
                     let request_id = format!("a{appends}");
                     let resend = append("s", &[b"x"]);
                     store.append_records(resend, request_id).await.unwrap();
                     false
                 }
-                (_, 6) => {
+                Call::RetryCreate => {
                     let retry = store.create_stream(create("s"), "c".to_string()).await;
                     assert_eq!(retry, Ok(made(&create("s"))), "{context}");
                     false
                 }
-                (_, 7) => {
+                Call::UseExisting => {
                     let again = CreateStreamRequest {
                         id_conflict_policy: StreamIdConflictPolicy::UseExisting as i32,
                         ..create("s")
@@ -117,8 +125,11 @@ async fn the_retention_starts_again_at_each_append() {
                     assert!(!found.created, "{context}");
                     false
                 }
-                _ => {
+                Call::Read => {
                     store.read_records(read("s", &[])).await.unwrap();
+                    false
+                }
+                Call::Describe => {
                     store.describe_stream(describe("s")).await.unwrap();
                     false
                 }
@@ -161,7 +172,7 @@ async fn an_expired_stream_answers_expired_until_the_store_forgets_it() {
         .query_async(&mut admin)
         .await
         .unwrap();
-    // A read that waits ends at the expiry, also one whose wait is too long to have a deadline.
+    // Even the longest valid protobuf wait must end when the Stream expires.
     let waiting = |seconds| {
         let mut request = read("s", &appended.last_offset);
         request.wait = Some(Default::default());
@@ -169,7 +180,13 @@ async fn an_expired_stream_answers_expired_until_the_store_forgets_it() {
         store.read_records(request)
     };
     let url = redis.url();
-    let reads = async { tokio::join!(waiting(60), waiting(i64::MAX), until_blocked(&url, 2)) };
+    let reads = async {
+        tokio::join!(
+            waiting(60),
+            waiting(315_576_000_000),
+            until_blocked(&url, 2)
+        )
+    };
     let (bounded, unbounded, ()) = tokio::time::timeout(Duration::from_secs(30), reads)
         .await
         .expect("a read that waits didn't end at the expiry");

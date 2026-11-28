@@ -31,6 +31,11 @@ Each Stream uses three keys in one Redis Cluster slot.
 
 Keys contain no Temporal namespace. Use a separate prefix or Redis deployment for each namespace.
 
+Use a fresh `key_prefix` when replacing the namespace-based Store. Its `{namespace:id}` keys
+can match a current Stream ID containing `:`. Both layouts use format version `1`, so the
+Store cannot distinguish all old data. Keep the earlier Store and its prefix available for
+Workflows that replay those Records. This Store does not migrate that data.
+
 ## Metadata
 
 Values in `:meta` are text except `rid`.

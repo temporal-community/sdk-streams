@@ -95,34 +95,18 @@ mod tests {
             u64::MAX - 1,
             u64::MAX,
         ];
-        let seed = 0x9e37_79b9_7f4a_7c15_u64;
-        let mut state = seed;
-        let mut next = || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            match state % 3 {
-                0 => edges[(state >> 8) as usize % edges.len()],
-                _ => state >> (state % 64),
-            }
-        };
-        let ids: Vec<EntryId> = (0..400)
-            .map(|_| EntryId {
-                ms: next(),
-                seq: next(),
-            })
+        let ids: Vec<EntryId> = edges
+            .iter()
+            .flat_map(|&ms| edges.iter().map(move |&seq| EntryId { ms, seq }))
             .collect();
         for id in &ids {
             let offset = id.offset();
-            assert_eq!(EntryId::try_from(&offset[..]), Ok(*id), "seed {seed}");
-            assert_eq!(id.to_string().parse(), Ok(*id), "seed {seed}");
-            for other in &ids {
-                assert_eq!(
-                    offset.cmp(&other.offset()),
-                    (id.ms, id.seq).cmp(&(other.ms, other.seq)),
-                    "seed {seed}, {id} and {other}"
-                );
-            }
+            assert_eq!(EntryId::try_from(&offset[..]), Ok(*id), "{id}");
+            assert_eq!(id.to_string().parse(), Ok(*id), "{id}");
+        }
+        for pair in ids.windows(2) {
+            let (id, other) = (pair[0], pair[1]);
+            assert!(id.offset() < other.offset(), "{id} and {other}");
         }
         for length in [1, 8, 15, 17] {
             let bytes = vec![1; length];

@@ -8,6 +8,9 @@ Experimental.
 
 The unreleased [Python package](python/README.md) exposes `RedisStreamStore`.
 
+Use a fresh `key_prefix` when replacing the namespace-based Store. See the
+[storage format](crates/streams-redis/docs/redis.md#keys) before using an existing Redis deployment.
+
 ## Using the Store
 
 ```rust

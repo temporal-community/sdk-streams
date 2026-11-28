@@ -239,6 +239,7 @@ async fn connect(servers: &RedisServers, response_timeout: Duration) -> RedisRes
         RedisServers::Standalone(server) => {
             // Other Store calls wait for this connection, so fail fast and let them retry.
             let config = ConnectionManagerConfig::new()
+                .set_connection_timeout(Some(response_timeout))
                 .set_response_timeout(Some(response_timeout))
                 .set_number_of_retries(0);
             let client = Client::open(server.info().clone())?;
@@ -250,6 +251,7 @@ async fn connect(servers: &RedisServers, response_timeout: Duration) -> RedisRes
             // Bound retry delays so migration errors return to the caller.
             let pause = u64::try_from(response_timeout.as_millis() / 20).unwrap_or(u64::MAX);
             let client = ClusterClient::builder(nodes.map(|node| node.info().clone()))
+                .connection_timeout(response_timeout)
                 .response_timeout(response_timeout)
                 .retries(16)
                 .min_retry_wait(pause / 2)
@@ -389,7 +391,9 @@ impl Connections {
         let pool = self.pool(node.addr().to_string());
         let open = || async {
             // The read bounds its own wait, so the connection has no response timeout.
-            let config = AsyncConnectionConfig::new().set_response_timeout(None);
+            let config = AsyncConnectionConfig::new()
+                .set_connection_timeout(Some(self.response_timeout))
+                .set_response_timeout(None);
             let client = Client::open(node)?;
             client
                 .get_multiplexed_async_connection_with_config(&config)
@@ -491,10 +495,41 @@ async fn until(deadline: Option<Instant>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{RedisStore, RedisStoreOptions};
     use std::{
         future::{pending, ready},
         io,
     };
+    use temporalio_streams::{AnyReason, CreateReason, StreamStore, proto::CreateStreamRequest};
+    use tokio::{io::AsyncReadExt, net::TcpListener, time::timeout};
+
+    #[tokio::test]
+    async fn the_first_create_times_out_during_the_redis_handshake() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("redis://{}", listener.local_addr().unwrap());
+        let mut options = RedisStoreOptions::new(RedisServers::Standalone(url.parse().unwrap()));
+        options.response_timeout = Duration::from_millis(50);
+        let store = RedisStore::new(options).unwrap();
+        let request = CreateStreamRequest {
+            stream_id: "s".to_string(),
+            ..Default::default()
+        };
+
+        let handshake = async {
+            let (mut peer, _) = listener.accept().await.unwrap();
+            assert_eq!(peer.read_u8().await.unwrap(), b'*');
+            peer
+        };
+        let (result, _peer) = timeout(Duration::from_millis(500), async {
+            tokio::join!(store.create_stream(request, String::new()), handshake)
+        })
+        .await
+        .expect("the first create must use the configured timeout");
+        assert_eq!(
+            result.unwrap_err().reason,
+            CreateReason::Other(AnyReason::StoreUnavailable)
+        );
+    }
 
     // Numeric connections keep pool tests independent of Redis.
     struct Fake<F>(F, Mutex<Vec<u8>>);

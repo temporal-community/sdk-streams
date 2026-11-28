@@ -7,11 +7,34 @@ use crate::support::{
 };
 use std::{future::Future, time::Duration};
 use temporalio_streams::{AnyReason, StreamError, proto::StreamErrorReason};
+use temporalio_streams_redis::RedisStoreError;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
     time::Instant,
 };
+
+#[tokio::test]
+#[ignore = "needs Redis"]
+async fn missing_acl_checks_are_an_outage_before_any_write() {
+    let redis = Redis::start(&[]);
+    let mut admin = redis.admin().await;
+    // Redis 6.2 lacks the helper. Hide it so this check also runs on supported servers.
+    let legacy = "local redis = {call = redis.call, error_reply = redis.error_reply}\n";
+    let state = include_str!("../../lua/state.lua");
+    let write = include_str!("../../lua/write.lua");
+    for body in [
+        include_str!("../../lua/create.lua"),
+        include_str!("../../lua/append.lua"),
+    ] {
+        let script = redis::Script::new(&[legacy, state, write, body].concat());
+        let error = script.invoke_async::<_, ()>(&mut admin).await.unwrap_err();
+        let error = temporalio_streams::AppendError::from(RedisStoreError::from(error));
+        assert!(outage(error).contains("needs Redis 7.0"));
+    }
+    let keys: usize = redis::cmd("DBSIZE").query_async(&mut admin).await.unwrap();
+    assert_eq!(keys, 0);
+}
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs Redis"]

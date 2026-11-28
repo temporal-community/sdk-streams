@@ -1,4 +1,7 @@
 -- Redis does not roll back script errors, so reject known failures before writing.
+if not redis.acl_check_cmd then
+  return refuse('STORE_UNAVAILABLE', 'The Store needs Redis 7.0 or later')
+end
 
 -- How long the meta key stays after its Stream expired, so that a call can tell an expired
 -- Stream from one that nobody created.

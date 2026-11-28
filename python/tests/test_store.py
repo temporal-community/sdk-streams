@@ -164,9 +164,16 @@ async def test_a_cancelled_read_frees_its_connection(redis: Redis):
     waits = ReadRecordsRequest(stream_id="s", wait=Duration(seconds=60))
     before = blocked_reads(redis)
     read = asyncio.create_task(store.read_records(waits))
-    while blocked_reads(redis) == before:
-        await asyncio.sleep(0.01)
-    read.cancel()
+    try:
+        async with asyncio.timeout(20):
+            while blocked_reads(redis) == before:
+                if read.done():
+                    await read
+                    pytest.fail("The read ended before blocking on Redis")
+                await asyncio.sleep(0.01)
+    finally:
+        read.cancel()
+        await asyncio.gather(read, return_exceptions=True)
     with pytest.raises(asyncio.CancelledError):
         await read
     deadline = time.monotonic() + 20
